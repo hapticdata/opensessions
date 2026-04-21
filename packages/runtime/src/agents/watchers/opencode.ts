@@ -221,7 +221,8 @@ export class OpenCodeAgentWatcher implements AgentWatcher {
   private emitStatus(sessionId: string, snapshot: SessionSnapshot): boolean {
     if (!this.ctx || !snapshot.directory || snapshot.status === "idle") return false;
 
-    const session = this.ctx.resolveSession(snapshot.directory);
+    const session = this.ctx.resolveThreadOwner?.("opencode", sessionId, snapshot.title)?.session
+      ?? this.ctx.resolveSession(snapshot.directory);
     if (!session) return false;
 
     this.ctx.emit({

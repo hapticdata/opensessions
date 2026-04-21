@@ -1,7 +1,7 @@
 import type { AgentEvent } from "../contracts/agent";
 import type { AgentThreadOwner } from "../contracts/agent-watcher";
 
-export type ResolveThreadOwner = (agent: string, threadId?: string) => AgentThreadOwner | null;
+export type ResolveThreadOwner = (agent: string, threadId?: string, threadName?: string) => AgentThreadOwner | null;
 
 export function canonicalizeAgentEvent(
   event: AgentEvent,
@@ -9,7 +9,7 @@ export function canonicalizeAgentEvent(
 ): AgentEvent {
   if (!event.threadId || !resolveThreadOwner) return event;
 
-  const owner = resolveThreadOwner(event.agent, event.threadId);
+  const owner = resolveThreadOwner(event.agent, event.threadId, event.threadName);
   if (!owner) return event;
 
   if (owner.session === event.session) {

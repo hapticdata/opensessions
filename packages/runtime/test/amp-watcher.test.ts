@@ -306,6 +306,26 @@ describe("AmpAgentWatcher", () => {
     expect(ws.protocols).toEqual(["amp", "my-secret-token"]);
   });
 
+  test("uses live thread ownership when project-dir matching is ambiguous", async () => {
+    mockState.dtwTokens.set("T-live-001", "token-live-001");
+    setThread("T-live-001", { title: "Live thread", env: mkEnv("/projects/myapp") });
+    ctx.resolveSession = () => null;
+    ctx.resolveThreadOwner = (agent, threadId, threadName) =>
+      agent === "amp" && threadId === "T-live-001" && threadName === "Live thread"
+        ? { session: "live-session", paneId: "%9" }
+        : null;
+
+    await startWatcher();
+
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateAgentState("working", "T-live-001");
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.session).toBe("live-session");
+    expect(events[0]!.threadId).toBe("T-live-001");
+    expect(events[0]!.status).toBe("running");
+  });
+
   test("does not connect WebSocket for threads outside local sessions", async () => {
     mockState.dtwTokens.set("T-other", "token-other");
     setThread("T-other", { env: mkEnv("/projects/other") });

@@ -432,7 +432,8 @@ export class CodexAgentWatcher implements AgentWatcher {
   /** Emit a status change event if we have a valid session mapping */
   private emitStatus(threadId: string, snapshot: SessionSnapshot): void {
     if (!this.ctx || !this.seeded || !snapshot.projectDir) return;
-    const session = this.ctx.resolveSession(snapshot.projectDir);
+    const session = this.ctx.resolveThreadOwner?.("codex", threadId, snapshot.threadName)?.session
+      ?? this.ctx.resolveSession(snapshot.projectDir);
     if (!session) return;
     this.ctx.emit({
       agent: "codex",

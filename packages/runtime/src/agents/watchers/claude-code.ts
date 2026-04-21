@@ -287,7 +287,8 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
   /** Emit a status change event if we have a valid session mapping */
   private emitStatus(threadId: string, state: SessionState): void {
     if (!this.ctx || !this.seeded || !state.projectDir) return;
-    const session = this.ctx.resolveSession(state.projectDir);
+    const session = this.ctx.resolveThreadOwner?.("claude-code", threadId, state.threadName)?.session
+      ?? this.ctx.resolveSession(state.projectDir);
     if (!session) return;
     this.ctx.emit({
       agent: "claude-code",
@@ -449,7 +450,8 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
         this.seeded = true;
         for (const [threadId, state] of this.sessions) {
           if (state.status === "idle" || !state.projectDir) continue;
-          const session = this.ctx?.resolveSession(state.projectDir);
+          const session = this.ctx?.resolveThreadOwner?.("claude-code", threadId, state.threadName)?.session
+            ?? this.ctx?.resolveSession(state.projectDir);
           if (!session) continue;
           this.ctx?.emit({
             agent: "claude-code",

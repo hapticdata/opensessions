@@ -11,6 +11,7 @@ import { SessionMetadataStore } from "./metadata-store";
 import { canonicalizeAgentEvent } from "./agent-ownership";
 import { PiLiveResolver } from "./pi-live-resolver";
 import { parsePiRuntimeInfo } from "./pi-runtime-registry";
+import { buildDirSessionMap, resolveSessionForProjectDir } from "./project-dir-session";
 import { buildLocalLinks, loadPortlessState } from "./portless";
 import {
   applySidebarWidthReport,
@@ -328,20 +329,21 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   // --- Agent watcher context ---
 
-  // Cache for dir→session resolution (rebuilt per scan cycle)
-  let dirSessionCache: Map<string, string> | null = null;
+  // Cache for dir→sessions resolution (rebuilt per scan cycle)
+  let dirSessionCache: Map<string, string[]> | null = null;
   let dirSessionCacheTs = 0;
   const DIR_CACHE_TTL = 5000;
 
-  function getDirSessionMap(): Map<string, string> {
+  function getDirSessionMap(): Map<string, string[]> {
     const now = Date.now();
     if (dirSessionCache && now - dirSessionCacheTs < DIR_CACHE_TTL) return dirSessionCache;
-    const map = new Map<string, string>();
+    const sessions: Array<{ dir: string; name: string }> = [];
     for (const p of allProviders) {
       for (const s of p.listSessions()) {
-        if (s.dir) map.set(s.dir, s.name);
+        if (s.dir) sessions.push({ dir: s.dir, name: s.name });
       }
     }
+    const map = buildDirSessionMap(sessions);
     dirSessionCache = map;
     dirSessionCacheTs = now;
     return map;
@@ -375,12 +377,29 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     buildProcessTree,
   });
 
-  function resolveThreadOwner(agent: string, threadId?: string): AgentThreadOwner | null {
+  function resolveThreadOwner(agent: string, threadId?: string, threadName?: string): AgentThreadOwner | null {
     if (agent === "pi" && threadId) {
       const owner = piLiveResolver.resolveThreadOwner(threadId);
       return owner ? { session: owner.session, paneId: owner.paneId } : null;
     }
-    return null;
+
+    const panes = listNonSidebarTmuxPanes();
+    if (panes.length === 0) return null;
+
+    let paneId: string | undefined;
+    if (agent === "claude-code" && threadId) {
+      paneId = resolveClaudeCodePane(panes, threadId);
+    } else if (agent === "codex" && threadId) {
+      paneId = resolveCodexPane(panes, threadId);
+    } else if (agent === "opencode" && threadId) {
+      paneId = resolveOpenCodePane(panes, threadId);
+    } else if (agent === "amp" && threadName) {
+      paneId = resolveAmpPane(panes, threadName);
+    }
+
+    if (!paneId) return null;
+    const pane = panes.find((entry) => entry.id === paneId);
+    return pane ? { session: pane.session, paneId } : null;
   }
 
   function canonicalizeOwnedEvent(event: AgentEvent): AgentEvent {
@@ -401,24 +420,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   const watcherCtx: AgentWatcherContext = {
     resolveSession(projectDir: string): string | null {
-      const map = getDirSessionMap();
-      // Direct path match
-      const direct = map.get(projectDir);
-      if (direct) return direct;
-      // Substring match (parent/child directories)
-      for (const [dir, name] of map) {
-        if (projectDir.startsWith(dir + "/") || dir.startsWith(projectDir + "/")) return name;
-      }
-      // Encoded match: the watcher couldn't decode the path unambiguously,
-      // so try encoding each session dir and comparing against the encoded form.
-      // Claude Code encodes /, ., and _ as - in project directory names.
-      if (projectDir.startsWith("__encoded__:")) {
-        const encoded = projectDir.slice("__encoded__:".length);
-        for (const [dir, name] of map) {
-          if (dir.replace(/[/._]/g, "-") === encoded) return name;
-        }
-      }
-      return null;
+      return resolveSessionForProjectDir(projectDir, getDirSessionMap());
     },
     resolveThreadOwner,
     emit(event: AgentEvent) {
@@ -1377,23 +1379,51 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }, CLIENT_RESIZE_SETTLE_MS);
   }
 
+  let quitting = false;
   function quitAll(): void {
+    // Re-entrancy guard: the TUI sends both a WS "quit" command and an
+    // HTTP POST /quit as a belt-and-suspenders fallback; either can land
+    // first. Without this, the second call restarts the teardown mid-way
+    // through the first and we sometimes end up leaking the process.
+    if (quitting) {
+      log("quit", "already quitting — forcing exit");
+      process.exit(0);
+    }
+    quitting = true;
     log("quit", "killing all sidebar panes");
-    for (const p of getProvidersWithSidebar()) {
-      const panes = p.listSidebarPanes();
-      log("quit", "found panes to kill", { provider: p.name, count: panes.length });
-      for (const pane of panes) {
-        p.killSidebarPane(pane.paneId);
+    // Wrap every teardown step so a single throw (tmux command failure,
+    // watcher.stop(), xstate send on a stopped actor, etc.) doesn't skip
+    // process.exit and leave a zombie server behind — which is exactly
+    // what the "q doesn't kill server" reports have been.
+    try {
+      for (const p of getProvidersWithSidebar()) {
+        try {
+          const panes = p.listSidebarPanes();
+          log("quit", "found panes to kill", { provider: p.name, count: panes.length });
+          for (const pane of panes) {
+            try { p.killSidebarPane(pane.paneId); } catch (err) {
+              log("quit", "killSidebarPane failed", { paneId: pane.paneId, error: String(err) });
+            }
+          }
+        } catch (err) {
+          log("quit", "listSidebarPanes failed", { provider: p.name, error: String(err) });
+        }
       }
+      for (const p of getProvidersWithSidebar()) {
+        try { p.cleanupSidebar(); } catch (err) {
+          log("quit", "cleanupSidebar failed", { provider: p.name, error: String(err) });
+        }
+      }
+      try { server.publish("sidebar", JSON.stringify({ type: "quit" })); } catch {}
+      try { hideSidebarLifecycle(); } catch (err) {
+        log("quit", "hideSidebarLifecycle failed", { error: String(err) });
+      }
+      try { cleanup(); } catch (err) {
+        log("quit", "cleanup failed", { error: String(err) });
+      }
+    } finally {
+      process.exit(0);
     }
-    // Provider-specific cleanup (uses type guard)
-    for (const p of getProvidersWithSidebar()) {
-      p.cleanupSidebar();
-    }
-    server.publish("sidebar", JSON.stringify({ type: "quit" }));
-    hideSidebarLifecycle();
-    cleanup();
-    process.exit(0);
   }
 
   function startIdleTimerIfNeeded(reason: string): void {
@@ -1481,6 +1511,41 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   }
 
   type PaneEntry = { id: string; pid: string; cmd: string; title: string };
+  type SessionPaneEntry = PaneEntry & { session: string };
+
+  function listNonSidebarTmuxPanes(): SessionPaneEntry[] {
+    const hasTmux = allProviders.some((provider) => provider.name === "tmux");
+    if (!hasTmux) return [];
+
+    const raw = shell([
+      "tmux", "list-panes", "-a",
+      "-F", "#{session_name}|#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_title}",
+    ]);
+    if (!raw) return [];
+
+    const panes = raw.split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const idx1 = line.indexOf("|");
+        const idx2 = line.indexOf("|", idx1 + 1);
+        const idx3 = line.indexOf("|", idx2 + 1);
+        const idx4 = line.indexOf("|", idx3 + 1);
+        return {
+          session: line.slice(0, idx1),
+          id: line.slice(idx1 + 1, idx2),
+          pid: line.slice(idx2 + 1, idx3),
+          cmd: line.slice(idx3 + 1, idx4),
+          title: line.slice(idx4 + 1),
+        };
+      });
+
+    const sidebarPaneIds = new Set<string>();
+    for (const { panes: sidebarPanes } of listSidebarPanesByProvider()) {
+      for (const sidebarPane of sidebarPanes) sidebarPaneIds.add(sidebarPane.paneId);
+    }
+
+    return panes.filter((pane) => !sidebarPaneIds.has(pane.id));
+  }
 
   /** Claude Code: ~/.claude/sessions/<pid>.json → sessionId */
   function resolveClaudeCodePane(panes: PaneEntry[], threadId: string): string | undefined {
@@ -1494,6 +1559,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       } catch {}
     }
     return undefined;
+  }
+
+  function resolveAmpPane(panes: PaneEntry[], threadName: string): string | undefined {
+    const matches = panes
+      .filter((pane) => pane.title.toLowerCase().startsWith("amp - ") && pane.title.includes(threadName));
+    return matches.length === 1 ? matches[0]!.id : undefined;
   }
 
   /** Codex: logs_1.sqlite process_uuid='pid:<PID>:*' → thread_id */
@@ -1593,9 +1664,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       targetPaneId = resolveClaudeCodePane(nonSidebar, threadId);
     }
     if (!targetPaneId && agentName === "amp" && threadName) {
-      targetPaneId = nonSidebar
-        .find((p) => p.title.toLowerCase().startsWith("amp - ") && p.title.includes(threadName))
-        ?.id;
+      targetPaneId = resolveAmpPane(nonSidebar, threadName);
     }
     if (!targetPaneId && agentName === "codex" && threadId) {
       targetPaneId = resolveCodexPane(nonSidebar, threadId);
@@ -2281,6 +2350,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
               for (const s of p.listSessions()) known.add(s.name);
             }
             if (known.has(body.tmuxSession)) session = body.tmuxSession;
+          }
+          if (!session && body.threadId) {
+            session = resolveThreadOwner(body.agent, body.threadId, body.threadName)?.session ?? null;
           }
           if (!session && body.projectDir && typeof body.projectDir === "string") {
             session = watcherCtx.resolveSession(body.projectDir);
