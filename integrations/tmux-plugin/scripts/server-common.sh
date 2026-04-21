@@ -47,6 +47,18 @@ PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
 SERVER_ENTRY="$PLUGIN_DIR/apps/server/src/main.ts"
+SERVER_LOG="/tmp/opensessions-server.log"
+
+show_startup_error() {
+  message="$1"
+  tmux display-message "$message" >/dev/null 2>&1 || true
+  printf '%s\n' "$message" >&2
+}
+
+deps_installed() {
+  [ -f "$PLUGIN_DIR/node_modules/@opensessions/runtime/package.json" ] \
+    && [ -f "$PLUGIN_DIR/node_modules/@opensessions/mux-tmux/package.json" ]
+}
 
 server_alive() {
   curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
@@ -57,7 +69,17 @@ ensure_server() {
     return 0
   fi
 
-  "$BUN_PATH" run "$SERVER_ENTRY" >/dev/null 2>&1 &
+  if [ ! -x "$BUN_PATH" ]; then
+    show_startup_error "opensessions: bun not found. Install bun and retry."
+    return 1
+  fi
+
+  if ! deps_installed; then
+    show_startup_error "opensessions: bun install has not completed for $PLUGIN_DIR. Run: cd $PLUGIN_DIR && $BUN_PATH install --frozen-lockfile"
+    return 1
+  fi
+
+  "$BUN_PATH" run "$SERVER_ENTRY" >"$SERVER_LOG" 2>&1 &
 
   attempt=0
   while [ "$attempt" -lt 30 ]; do
@@ -67,6 +89,8 @@ ensure_server() {
     fi
     attempt=$((attempt + 1))
   done
+
+  show_startup_error "opensessions: server failed to start. See $SERVER_LOG"
 
   return 1
 }
