@@ -55,11 +55,6 @@ show_startup_error() {
   printf '%s\n' "$message" >&2
 }
 
-deps_installed() {
-  [ -f "$PLUGIN_DIR/node_modules/@opensessions/runtime/package.json" ] \
-    && [ -f "$PLUGIN_DIR/node_modules/@opensessions/mux-tmux/package.json" ]
-}
-
 server_alive() {
   curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
 }
@@ -74,11 +69,6 @@ ensure_server() {
     return 1
   fi
 
-  if ! deps_installed; then
-    show_startup_error "opensessions: bun install has not completed for $PLUGIN_DIR. Run: cd $PLUGIN_DIR && $BUN_PATH install --frozen-lockfile"
-    return 1
-  fi
-
   "$BUN_PATH" run "$SERVER_ENTRY" >"$SERVER_LOG" 2>&1 &
 
   attempt=0
@@ -89,6 +79,11 @@ ensure_server() {
     fi
     attempt=$((attempt + 1))
   done
+
+  if grep -Eq "Cannot find module '@opensessions/|Cannot find package '@opensessions/|Cannot find module 'xstate'|Cannot find package 'xstate'" "$SERVER_LOG" 2>/dev/null; then
+    show_startup_error "opensessions: server dependencies are missing. Run: cd $PLUGIN_DIR && $BUN_PATH install --frozen-lockfile"
+    return 1
+  fi
 
   show_startup_error "opensessions: server failed to start. See $SERVER_LOG"
 
