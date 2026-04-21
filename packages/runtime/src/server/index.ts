@@ -879,10 +879,18 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
     if (!lastState) return;
 
-    const idx = index - 1;
-    if (idx < 0 || idx >= lastState.sessions.length) return;
+    const sessions = lastState.sessions.filter((s) => {
+      if (!currentFilter || currentFilter === "all") return true;
+      if (currentFilter === "active") return s.agents.length > 0 || s.agentState !== null;
+      // "running" — only sessions where an agent is currently running
+      const st = s.agentState?.status;
+      return st === "running" || st === "tool-running" || st === "waiting";
+    });
 
-    const name = lastState.sessions[idx]!.name;
+    const idx = index - 1;
+    if (idx < 0 || idx >= sessions.length) return;
+
+    const name = sessions[idx]!.name;
     const p = sessionProviders.get(name) ?? mux;
     adoptSidebarWidthFromWindow(sourceCtx?.session, sourceCtx?.windowId, "switch-index");
     p.switchSession(name, clientTty);
