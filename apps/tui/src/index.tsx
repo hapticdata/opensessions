@@ -745,8 +745,17 @@ function App() {
 
     switch (key.name) {
       case "q":
+        // Primary path: WebSocket "quit" command. This can lose the frame if
+        // the TUI process tears down before Bun's WS buffer flushes to TCP.
         send({ type: "quit" });
-        renderer.destroy();
+        // Fallback path: a separate HTTP request on its own TCP connection.
+        // Whichever arrives first triggers quitAll → process.exit(0) on the
+        // server, which closes our WebSocket → socket.onclose → renderer.destroy.
+        // Not awaited — we're fire-and-forget.
+        fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" }).catch(() => {});
+        // Last-resort timeout: if the server never responds, still tear down
+        // so the user isn't stuck in a dead TUI.
+        setTimeout(() => renderer.destroy(), 500);
         break;
       case "escape":
         if (panelFocus() === "agents") {

@@ -171,11 +171,23 @@ export class AgentTracker {
     const sessionInstances = this.instances.get(session);
     if (!sessionInstances) return false;
 
-    const key = instanceKey(agent, threadId);
-    const removed = sessionInstances.delete(key);
-    if (!removed) return false;
+    const exactKey = instanceKey(agent, threadId);
+    let removed = sessionInstances.delete(exactKey);
+    if (removed) this.unseenInstances.delete(this.unseenKey(session, exactKey));
 
-    this.unseenInstances.delete(this.unseenKey(session, key));
+    // Also remove any synthetic pane-backed entries matching (agent, threadId).
+    // These have keys like `agent:threadId:pane:paneId` (or `agent:pane:paneId`
+    // when no threadId) and are invisible to instanceKey-based lookup.
+    for (const [k, event] of [...sessionInstances.entries()]) {
+      if (!isSyntheticPaneKey(k)) continue;
+      if (event.agent !== agent) continue;
+      if (event.threadId !== threadId) continue;
+      sessionInstances.delete(k);
+      this.unseenInstances.delete(this.unseenKey(session, k));
+      removed = true;
+    }
+
+    if (!removed) return false;
     if (sessionInstances.size === 0) {
       this.instances.delete(session);
     }
@@ -293,18 +305,41 @@ export class AgentTracker {
     let changed = false;
     let sessionInstances = this.instances.get(session);
 
-    // Index incoming pane IDs for fast lookup
+    // Index incoming pane IDs and (agent, threadId) tuples for fast lookup.
+    // When the scanner can resolve threadIds for an agent (currently only Pi),
+    // we use exact (agent, threadId) matching so that a pane hosting one live
+    // instance doesn't keep stale sibling instances marked alive.
     const activePaneIds = new Set<string>();
-    for (const pa of paneAgents) activePaneIds.add(pa.paneId);
+    const agentsWithThreadIds = new Set<string>();
+    const aliveAgentThreads = new Set<string>(); // `${agent}\0${threadId}`
+    for (const pa of paneAgents) {
+      activePaneIds.add(pa.paneId);
+      if (pa.threadId) {
+        agentsWithThreadIds.add(pa.agent);
+        aliveAgentThreads.add(`${pa.agent}\0${pa.threadId}`);
+      }
+    }
 
-    // 1. Transition previously-alive entries whose pane disappeared → "exited"
+    // 1. Transition previously-alive entries whose pane (or thread) disappeared → "exited".
+    //    Synthetic pane-backed entries (no watcher event) are removed outright on exit,
+    //    since they exist only as a presence marker for a live process.
     if (sessionInstances) {
-      for (const [, event] of sessionInstances) {
-        if (event.liveness === "alive" && event.paneId && !activePaneIds.has(event.paneId)) {
+      for (const [k, event] of [...sessionInstances.entries()]) {
+        if (event.liveness !== "alive" || !event.paneId) continue;
+
+        const isAlive = event.threadId && agentsWithThreadIds.has(event.agent)
+          ? aliveAgentThreads.has(`${event.agent}\0${event.threadId}`)
+          : activePaneIds.has(event.paneId);
+        if (isAlive) continue;
+
+        if (isSyntheticPaneKey(k)) {
+          sessionInstances.delete(k);
+          this.unseenInstances.delete(this.unseenKey(session, k));
+        } else {
           event.liveness = "exited";
           event.paneId = undefined;
-          changed = true;
         }
+        changed = true;
       }
     }
 
