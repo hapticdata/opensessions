@@ -292,8 +292,13 @@ export class AmpAgentWatcher implements AgentWatcher {
     return !this.stopped && this.ctx !== null && this.lifecycle === lifecycle;
   }
 
-  private resolveMuxSession(projectDir?: string): string | null {
-    if (!this.ctx || !projectDir) return null;
+  private resolveMuxSession(projectDir?: string, threadId?: string, threadName?: string): string | null {
+    if (!this.ctx) return null;
+
+    const ownerSession = this.ctx.resolveThreadOwner?.("amp", threadId, threadName)?.session;
+    if (ownerSession) return ownerSession;
+    if (!projectDir) return null;
+
     const session = this.ctx.resolveSession(projectDir);
     return session && session !== "unknown" ? session : null;
   }
@@ -371,7 +376,7 @@ export class AmpAgentWatcher implements AgentWatcher {
   private emitStatus(threadId: string, snapshot: ThreadSnapshot): boolean {
     if (!this.ctx || snapshot.status === "idle") return false;
 
-    const session = this.resolveMuxSession(snapshot.projectDir);
+    const session = this.resolveMuxSession(snapshot.projectDir, threadId, snapshot.title);
     if (!session) return false;
 
     this.ctx.emit({
@@ -407,7 +412,7 @@ export class AmpAgentWatcher implements AgentWatcher {
         if (this.isPluginOwned(thread.id, now)) continue;
 
         const projectDir = extractProjectDir(thread);
-        const session = this.resolveMuxSession(projectDir);
+        const session = this.resolveMuxSession(projectDir, thread.id, thread.title || undefined);
         if (!session) continue;
 
         const title = thread.title || undefined;
@@ -483,7 +488,7 @@ export class AmpAgentWatcher implements AgentWatcher {
     if (!this.shouldRetry(threadId)) return;
 
     const snapshot = this.threads.get(threadId);
-    if (!snapshot || !this.resolveMuxSession(snapshot.projectDir)) return;
+    if (!snapshot || !this.resolveMuxSession(snapshot.projectDir, threadId, snapshot.title)) return;
 
     const gen = ++this.wsGeneration;
     this.wsConnections.set(threadId, { gen, phase: "connecting", ws: null });
@@ -507,7 +512,7 @@ export class AmpAgentWatcher implements AgentWatcher {
     }
 
     const latestSnapshot = this.threads.get(threadId);
-    if (!latestSnapshot || !this.resolveMuxSession(latestSnapshot.projectDir)) {
+    if (!latestSnapshot || !this.resolveMuxSession(latestSnapshot.projectDir, threadId, latestSnapshot.title)) {
       this.wsConnections.delete(threadId);
       this.clearRetry(threadId);
       return;

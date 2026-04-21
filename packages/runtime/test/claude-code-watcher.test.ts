@@ -254,6 +254,28 @@ describe("ClaudeCodeAgentWatcher", () => {
     expect(events.length).toBe(0);
   });
 
+  test("uses live thread ownership when project-dir matching is ambiguous", async () => {
+    const projDir = join(tmpDir, "-projects-myapp");
+    mkdirSync(projDir, { recursive: true });
+
+    const filePath = join(projDir, "session-live.jsonl");
+    writeFileSync(filePath, JSON.stringify({ message: { role: "user", content: "hello" } }) + "\n");
+
+    ctx.resolveSession = () => null;
+    ctx.resolveThreadOwner = (agent, threadId) =>
+      agent === "claude-code" && threadId === "session-live"
+        ? { session: "web-session", paneId: "%7" }
+        : null;
+
+    watcher.start(ctx);
+    await watcher.flush();
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.session).toBe("web-session");
+    expect(events[0]!.threadId).toBe("session-live");
+    expect(events[0]!.status).toBe("running");
+  });
+
   test("detects status transition after seed", async () => {
     const projDir = join(tmpDir, "-projects-myapp");
     mkdirSync(projDir, { recursive: true });

@@ -203,11 +203,11 @@ export class PiAgentWatcher implements AgentWatcher {
 
   private resolveEventSession(threadId: string, snapshot: SessionSnapshot): string | null {
     if (!this.ctx) return null;
-    const byProjectDir = snapshot.projectDir
+    const byOwner = this.ctx.resolveThreadOwner?.("pi", threadId, snapshot.threadName)?.session;
+    if (byOwner) return byOwner;
+    return snapshot.projectDir
       ? this.ctx.resolveSession(snapshot.projectDir)
       : null;
-    if (byProjectDir) return byProjectDir;
-    return this.ctx.resolveThreadOwner?.("pi", threadId)?.session ?? null;
   }
 
   private async processFile(filePath: string): Promise<void> {

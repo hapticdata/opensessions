@@ -283,6 +283,22 @@ describe("CodexAgentWatcher", () => {
     expect(events[0]!.threadName).toBe("Fix auth bug");
   });
 
+  test("uses live thread ownership when cwd matching is ambiguous", async () => {
+    ctx.resolveSession = () => null;
+    ctx.resolveThreadOwner = (agent, id) =>
+      agent === "codex" && id === threadId
+        ? { session: "api-session", paneId: "%11" }
+        : null;
+
+    watcher.start(ctx);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.session).toBe("api-session");
+    expect(events[0]!.threadId).toBe(threadId);
+    expect(events[0]!.status).toBe("running");
+  });
+
   test("emits done when Codex writes a final answer", async () => {
     watcher.start(ctx);
     await new Promise((resolve) => setTimeout(resolve, 200));

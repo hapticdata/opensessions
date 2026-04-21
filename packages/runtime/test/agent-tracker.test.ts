@@ -127,6 +127,23 @@ describe("AgentTracker", () => {
     expect(tracker.getUnseen()).not.toContain("sess-1");
   });
 
+  test("dismiss removes synthetic pane-backed Pi entries", () => {
+    // Pi synthetic entries are keyed `pi:<threadId>:pane:<paneId>`, which the
+    // old dismiss missed entirely.
+    tracker.applyPanePresence("sess-1", [
+      { agent: "pi", paneId: "%1", threadId: "dead" },
+      { agent: "pi", paneId: "%1", threadId: "live" },
+    ]);
+    expect(tracker.getAgents("sess-1")).toHaveLength(2);
+
+    const dismissed = tracker.dismiss("sess-1", "pi", "dead");
+
+    expect(dismissed).toBe(true);
+    const remaining = tracker.getAgents("sess-1");
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.threadId).toBe("live");
+  });
+
   test("dedupeInstanceToSession removes duplicate watcher instance from other sessions", () => {
     tracker.applyEvent(event({ session: "sess-1", agent: "pi", threadId: "shared", status: "running" }));
     tracker.applyEvent(event({ session: "sess-2", agent: "pi", threadId: "shared", status: "running" }));
@@ -283,8 +300,9 @@ describe("AgentTracker", () => {
       expect(agents[0]!.threadId).toBeUndefined(); // scanner doesn't resolve threadId
     });
 
-    test("transitions previously-alive agent to exited when missing from scan", () => {
-      // First: apply presence to make it alive
+    test("transitions previously-alive watcher entry to exited when missing from scan", () => {
+      // Watcher entry first, then enrich via pane presence
+      tracker.applyEvent(event({ session: "sess-1", agent: "claude-code", threadId: "abc", status: "running" }));
       tracker.applyPanePresence("sess-1", [
         { agent: "claude-code", paneId: "%1" },
       ]);
@@ -293,7 +311,7 @@ describe("AgentTracker", () => {
       let agents = tracker.getAgents("sess-1");
       expect(agents[0]!.liveness).toBe("alive");
 
-      // Second: empty scan — agent disappeared
+      // Empty scan — agent disappeared
       const changed = tracker.applyPanePresence("sess-1", []);
 
       expect(changed).toBe(true);
@@ -301,6 +319,43 @@ describe("AgentTracker", () => {
       expect(agents.length).toBe(1);
       expect(agents[0]!.liveness).toBe("exited");
       expect(agents[0]!.paneId).toBeUndefined();
+    });
+
+    test("drops synthetic pane entry (no watcher) when it disappears from scan", () => {
+      // Synthetic-only entry (no prior applyEvent)
+      tracker.applyPanePresence("sess-1", [
+        { agent: "claude-code", paneId: "%1" },
+      ]);
+      expect(tracker.getAgents("sess-1").length).toBe(1);
+
+      // Empty scan — synthetic presence markers have nothing left to represent
+      const changed = tracker.applyPanePresence("sess-1", []);
+
+      expect(changed).toBe(true);
+      expect(tracker.getAgents("sess-1")).toHaveLength(0);
+    });
+
+    test("thread-aware liveness: live sibling in same pane does not keep dead Pi thread alive", () => {
+      // Two Pi threads started in the same pane over time
+      tracker.applyPanePresence("sess-1", [
+        { agent: "pi", paneId: "%1", threadId: "old-dead" },
+      ]);
+      tracker.applyPanePresence("sess-1", [
+        { agent: "pi", paneId: "%1", threadId: "old-dead" },
+        { agent: "pi", paneId: "%1", threadId: "live" },
+      ]);
+      expect(tracker.getAgents("sess-1")).toHaveLength(2);
+
+      // Next scan: only the live thread remains in the pane
+      const changed = tracker.applyPanePresence("sess-1", [
+        { agent: "pi", paneId: "%1", threadId: "live" },
+      ]);
+
+      expect(changed).toBe(true);
+      const agents = tracker.getAgents("sess-1");
+      expect(agents).toHaveLength(1);
+      expect(agents[0]!.threadId).toBe("live");
+      expect(agents[0]!.liveness).toBe("alive");
     });
 
     test("does not transition unknown-liveness agents to exited", () => {
