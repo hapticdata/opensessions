@@ -137,6 +137,7 @@ All other tmux options fall back to the defaults shown in the table above.
 | `OPENSESSIONS_HOST` | helper shell scripts | Script-level override only; the app runtime still uses `127.0.0.1` |
 | `OPENSESSIONS_PORT` | helper shell scripts | Script-level override only; the app runtime still uses `7391` |
 | `SESSIONIZER_DIR` | tmux sessionizer popup | Colon-separated directories searched for new-session candidates (e.g. `$HOME/Code:$HOME/.config`). Also checked via `tmux show-environment -g` when the shell variable is unset. Defaults to `$HOME/Documents` |
+| `SESSIONIZER_MAXDEPTH` | tmux sessionizer popup | Maximum `find` depth when collecting new-session candidates. Also checked via `tmux show-environment -g` when the shell variable is unset. Defaults to `3` |
 | `BUN_PATH` | helper scripts | Explicit Bun binary path for helper scripts |
 
 ## Related Files Written By The Runtime
