@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -8,18 +8,22 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_sidebar::app::{App, PanelFocus};
 use opensessions_sidebar::cli::Args;
 use opensessions_sidebar::client::{
-    connect_ws, decode_server_message, encode_client_command, validate_hello,
+    connect_ws, connect_ws_path, decode_server_message, encode_client_command, validate_hello,
 };
 use opensessions_sidebar::generated::protocol::ServerMessage;
 use opensessions_sidebar::renderer::render_app;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io;
+use std::io::{self, Write};
 use tokio_websockets::Message;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if try_rendered_sidebar(&args).await? {
+        return Ok(());
+    }
+
     let mut ws = connect_ws(&args.server_host, args.server_port)
         .await
         .with_context(|| format!("connect ws://{}:{}/", args.server_host, args.server_port))?;
@@ -105,6 +109,99 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn try_rendered_sidebar(args: &Args) -> Result<bool> {
+    let (width, height) = terminal::size().unwrap_or((35, 56));
+    let path = format!("/rendered-sidebar?width={width}&height={height}");
+    let Ok(mut ws) = connect_ws_path(&args.server_host, args.server_port, &path).await else {
+        return Ok(false);
+    };
+
+    let Some(first) = ws.next().await else {
+        return Ok(false);
+    };
+    let first = first?;
+    if !first.is_text() {
+        return Ok(false);
+    }
+    let first_payload = first.as_text().unwrap_or_default();
+    if first_payload.trim_start().starts_with('{') {
+        return Ok(false);
+    }
+
+    let mut terminal = RawTerminalGuard::enter()?;
+    terminal.write_frame(first_payload)?;
+    let mut events = EventStream::new();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            event = events.next() => {
+                let Some(event) = event else {
+                    return Ok(true);
+                };
+                match event? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c'))
+                        {
+                            return Ok(true);
+                        }
+                        if let Some(command) = render_key_command(key) {
+                            ws.send(Message::text(command)).await?;
+                        }
+                    }
+                    Event::Resize(width, height) => {
+                        ws.send(Message::text(format!(
+                            r#"{{"type":"render-resize","width":{width},"height":{height}}}"#
+                        ))).await?;
+                    }
+                    _ => {}
+                }
+            }
+
+            message = ws.next() => {
+                let Some(message) = message else {
+                    return Ok(true);
+                };
+                let message = message?;
+                if message.is_close() {
+                    return Ok(true);
+                }
+                if message.is_text() {
+                    let payload = message.as_text().unwrap_or_default();
+                    if matches!(serde_json::from_str::<ServerMessage>(payload), Ok(ServerMessage::Quit)) {
+                        return Ok(true);
+                    }
+                    terminal.write_frame(payload)?;
+                }
+            }
+        }
+    }
+}
+
+fn render_key_command(key: KeyEvent) -> Option<String> {
+    let key_name = match key.code {
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "tab".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        _ => return None,
+    };
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT) || matches!(key.code, KeyCode::BackTab);
+    let command = serde_json::json!({
+        "type": "render-key",
+        "key": key_name,
+        "alt": key.modifiers.contains(KeyModifiers::ALT),
+        "ctrl": key.modifiers.contains(KeyModifiers::CONTROL),
+        "shift": shift,
+    });
+    Some(command.to_string())
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::ALT) {
         match key.code {
@@ -146,6 +243,38 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+struct RawTerminalGuard {
+    stdout: io::Stdout,
+}
+
+impl RawTerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        Ok(Self { stdout })
+    }
+
+    fn write_frame(&mut self, frame: &str) -> Result<()> {
+        self.stdout.write_all(b"\x1b[H")?;
+        for line in frame.split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            self.stdout.write_all(line.as_bytes())?;
+            self.stdout.write_all(b"\x1b[K\r\n")?;
+        }
+        self.stdout.write_all(b"\x1b[J")?;
+        self.stdout.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 impl TerminalGuard {

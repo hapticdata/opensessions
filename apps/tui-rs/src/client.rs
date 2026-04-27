@@ -34,7 +34,15 @@ pub async fn connect_ws(
     host: &str,
     port: u16,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    let uri: Uri = format!("ws://{host}:{port}/").parse()?;
+    connect_ws_path(host, port, "/").await
+}
+
+pub async fn connect_ws_path(
+    host: &str,
+    port: u16,
+    path_and_query: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let uri: Uri = format!("ws://{host}:{port}{path_and_query}").parse()?;
     let (ws, _) = ClientBuilder::from_uri(uri).connect().await?;
     Ok(ws)
 }

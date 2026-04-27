@@ -25,12 +25,18 @@ use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidth
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::AgentTracker;
+use opensessions_sidebar::app::{App as SidebarApp, PanelFocus as SidebarPanelFocus};
+use opensessions_sidebar::generated::protocol::{
+    ClientCommand as SidebarClientCommand, ServerMessage as SidebarServerMessage,
+};
+use opensessions_sidebar::snapshot::{buffer_to_ansi, render_to_buffer};
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
 
 pub const SERVER_VERSION: &str = "0.2.0-alpha.5";
@@ -43,6 +49,7 @@ const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
+const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 
 pub trait StateSource: Send + Sync + 'static {
     fn snapshot_json(&self) -> String;
@@ -1495,6 +1502,17 @@ async fn handle_connection(
         return Ok(());
     }
 
+    if parsed.is_websocket_upgrade() && parsed.path == "/rendered-sidebar" {
+        return handle_rendered_sidebar_connection(
+            stream,
+            parsed,
+            shutdown,
+            state_source,
+            state_updates,
+        )
+        .await;
+    }
+
     if parsed.is_websocket_upgrade() {
         let Some(key) = parsed.header("sec-websocket-key") else {
             stream
@@ -1577,6 +1595,237 @@ async fn handle_connection(
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nopensessions server")
         .await?;
     Ok(())
+}
+
+async fn handle_rendered_sidebar_connection(
+    mut stream: TcpStream,
+    parsed: HttpRequest,
+    shutdown: broadcast::Sender<()>,
+    state_source: Option<Arc<dyn StateSource>>,
+    state_updates: broadcast::Sender<String>,
+) -> Result<(), ServerError> {
+    let Some(key) = parsed.header("sec-websocket-key") else {
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await?;
+        return Ok(());
+    };
+    let accept = websocket_accept(key);
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let mut websocket = ServerBuilder::new().serve(stream);
+    let mut width = parsed
+        .query_param("width")
+        .and_then(|width| width.parse::<u16>().ok())
+        .unwrap_or(35);
+    let mut height = parsed
+        .query_param("height")
+        .and_then(|height| height.parse::<u16>().ok())
+        .unwrap_or(56);
+
+    let mut app = state_source
+        .as_ref()
+        .and_then(|state_source| app_from_state_json(&state_source.snapshot_json()));
+    if let Some(app) = &mut app {
+        websocket
+            .send(Message::text(render_sidebar_frame(app, width, height)))
+            .await?;
+    }
+
+    let mut connection_shutdown = shutdown.subscribe();
+    let mut state_rx = state_updates.subscribe();
+    let mut render_tick = tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
+    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut dirty = false;
+    loop {
+        tokio::select! {
+            _ = connection_shutdown.recv() => {
+                let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                return Ok(());
+            }
+            _ = render_tick.tick(), if dirty => {
+                if let Some(app) = &mut app {
+                    websocket.send(Message::text(render_sidebar_frame(app, width, height))).await?;
+                }
+                dirty = false;
+            }
+            state = state_rx.recv() => {
+                match state {
+                    Ok(state) => {
+                        if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&state) {
+                            if matches!(message, SidebarServerMessage::Quit) {
+                                let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                                return Ok(());
+                            }
+                            apply_sidebar_server_message(&mut app, message);
+                            dirty = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+            message = websocket.next() => {
+                match message {
+                    Some(Ok(message)) if message.is_close() => return Ok(()),
+                    Some(Ok(message)) => {
+                        if is_quit_command(&message) {
+                            let _ = state_updates.send(QUIT_JSON.to_string());
+                            let _ = shutdown.send(());
+                            return Ok(());
+                        }
+
+                        if let Some(command) = parse_command(&message) {
+                            if command.get("type").and_then(Value::as_str) == Some("render-resize") {
+                                width = command
+                                    .get("width")
+                                    .and_then(Value::as_u64)
+                                    .map(|width| width.min(u16::MAX as u64) as u16)
+                                    .unwrap_or(width);
+                                height = command
+                                    .get("height")
+                                    .and_then(Value::as_u64)
+                                    .map(|height| height.min(u16::MAX as u64) as u16)
+                                    .unwrap_or(height);
+                                dirty = true;
+                                continue;
+                            }
+
+                            if command.get("type").and_then(Value::as_str) == Some("render-key") {
+                                if let Some(app) = &mut app {
+                                    apply_render_key(app, &command);
+                                    for command in app.drain_commands() {
+                                        if matches!(command, SidebarClientCommand::Quit) {
+                                            let _ = state_updates.send(QUIT_JSON.to_string());
+                                            let _ = shutdown.send(());
+                                            return Ok(());
+                                        }
+                                        if let Ok(command) = serde_json::to_value(command) {
+                                            if let Some(payload) = state_source
+                                                .as_ref()
+                                                .and_then(|state_source| state_source.handle_client_command(&command))
+                                            {
+                                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                                    app.apply_server_message(message);
+                                                }
+                                                let _ = state_updates.send(payload);
+                                            }
+                                        }
+                                    }
+                                    dirty = true;
+                                }
+                                continue;
+                            }
+
+                            if let Some(payload) = state_source
+                                .as_ref()
+                                .and_then(|state_source| state_source.handle_client_command(&command))
+                            {
+                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                    apply_sidebar_server_message(&mut app, message);
+                                }
+                                let _ = state_updates.send(payload);
+                            }
+                            dirty = true;
+                        }
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
+    let SidebarServerMessage::State(state) =
+        serde_json::from_str::<SidebarServerMessage>(state_json).ok()?
+    else {
+        return None;
+    };
+    Some(SidebarApp::from_state(state))
+}
+
+fn apply_sidebar_server_message(app: &mut Option<SidebarApp>, message: SidebarServerMessage) {
+    match (app, message) {
+        (slot @ None, SidebarServerMessage::State(state)) => {
+            *slot = Some(SidebarApp::from_state(state))
+        }
+        (Some(app), message) => app.apply_server_message(message),
+        (None, _) => {}
+    }
+}
+
+fn render_sidebar_frame(app: &mut SidebarApp, width: u16, height: u16) -> String {
+    let buffer = render_to_buffer(app, width, height);
+    buffer_to_ansi(&buffer)
+}
+
+fn apply_render_key(app: &mut SidebarApp, command: &Value) {
+    let key = command
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let alt = command.get("alt").and_then(Value::as_bool).unwrap_or(false);
+    let ctrl = command
+        .get("ctrl")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let shift = command
+        .get("shift")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if alt {
+        match key {
+            "up" => app.reorder_focused_session(-1),
+            "down" => app.reorder_focused_session(1),
+            _ => {}
+        }
+        return;
+    }
+
+    if ctrl {
+        match key {
+            "j" => app.focus_agents_panel(),
+            "k" => app.focus_sessions_panel(),
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        "j" | "down" => {
+            if app.panel_focus == SidebarPanelFocus::Agents {
+                app.move_agent_focus(1);
+            } else {
+                app.move_focus(1);
+            }
+        }
+        "k" | "up" => {
+            if app.panel_focus == SidebarPanelFocus::Agents {
+                app.move_agent_focus(-1);
+            } else {
+                app.move_focus(-1);
+            }
+        }
+        "tab" => app.handle_tab(shift),
+        "enter" => app.activate_focused_item(),
+        "esc" => app.focus_sessions_panel(),
+        key if key.chars().count() == 1 => {
+            if let Some(ch) = key.chars().next() {
+                app.handle_key_char(ch);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>, ServerError> {

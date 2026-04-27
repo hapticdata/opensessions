@@ -467,6 +467,7 @@ dependencies = [
  "futures-util",
  "http",
  "opensessions-runtime",
+ "opensessions-sidebar",
  "serde_json",
  "sha1_smol",
  "tokio",
