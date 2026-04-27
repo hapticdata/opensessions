@@ -14,7 +14,7 @@ Legend:
 | Feature | Verdict | Notes |
 |---|---|---|
 | Server-mediated state daemon | ✅ | Already exists; protocol unchanged |
-| WS client | ✅ | `fastwebsockets` is faster + smaller than `tokio-tungstenite` |
+| WS client | ✅ | `tokio-websockets` is strict, Tokio-native, small, and avoids dependency duplication; `fastwebsockets` remains viable |
 | JSON parsing | ✅ | `serde_json` |
 | Single-threaded event loop | ✅ | `tokio` current-thread runtime + `EventStream` |
 | Auto-reconnect on WS close | ✅ | Manual reconnect loop; ~30 LOC |

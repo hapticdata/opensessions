@@ -32,6 +32,7 @@ import {
   type SessionData,
   type ClientCommand,
   type FocusUpdate,
+  PROTOCOL_VERSION,
   SERVER_PORT,
   SERVER_HOST,
   LOCAL_CLIENT_HOST,
@@ -2502,6 +2503,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         ws.subscribe("sidebar");
         clientCount++;
         log("ws", "client connected", { clientCount });
+        ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, serverVersion: "0.2.0-alpha.5" }));
         if (idleTimer) {
           clearTimeout(idleTimer);
           idleTimer = null;

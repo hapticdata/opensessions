@@ -54,6 +54,13 @@ export const LOCAL_CLIENT_HOST = "127.0.0.1";
 export const PID_FILE = resolvePidFile(SERVER_KEY);
 export const SERVER_IDLE_TIMEOUT_MS = 30_000;
 export const STUCK_RUNNING_TIMEOUT_MS = 3 * 60 * 1000;
+export const PROTOCOL_VERSION = 1;
+
+export interface ProtocolHello {
+  type: "hello";
+  protocol: typeof PROTOCOL_VERSION;
+  serverVersion: string;
+}
 
 export interface LocalLink {
   kind: "direct" | "portless";
@@ -119,7 +126,7 @@ export interface ReIdentify {
   type: "re-identify";
 }
 
-export type ServerMessage = ServerState | FocusUpdate | ResizeNotify | QuitNotify | YourSession | ReIdentify;
+export type ServerMessage = ProtocolHello | ServerState | FocusUpdate | ResizeNotify | QuitNotify | YourSession | ReIdentify;
 
 // --- Programmatic metadata (agent/script-pushed) ---
 

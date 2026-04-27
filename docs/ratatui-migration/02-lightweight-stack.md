@@ -26,11 +26,9 @@ tokio              = { version = "1", default-features = false, features = ["rt"
 tokio-util         = { version = "0.7", default-features = false, features = [] }
 
 # --- WebSocket client (fastest + smallest) ---
-fastwebsockets     = { version = "0.10", default-features = false, features = ["upgrade", "simd"] }
-# fastwebsockets requires hyper for the upgrade handshake; keep features tight
-hyper              = { version = "1",   default-features = false, features = ["client", "http1"] }
-hyper-util         = { version = "0.1", default-features = false, features = ["tokio"] }
-http-body-util     = "0.1"
+tokio-websockets   = { version = "0.13", default-features = false, features = ["client", "sha1_smol", "fastrand"] }
+futures-util       = { version = "0.3", default-features = false }
+http               = "1"
 
 # --- JSON (the WS messages are small + protocol-stable) ---
 serde              = { version = "1", default-features = false, features = ["derive"] }
@@ -68,11 +66,28 @@ clap               = { version = "4", default-features = false, features = ["std
 - Termion is Unix-only (we may want Windows in the future) and has fewer modern features.
 - Termwiz is built for Wezterm and pulls megabytes of rendering code we won't touch.
 
-### WebSocket client: `fastwebsockets` (Deno's), not `tokio-tungstenite`
+### WebSocket client: `tokio-websockets`, not `tokio-tungstenite`
+
+**Implementation update (Phase 1):** after checking current crate docs and
+benchmarks, the Rust client uses `tokio-websockets` instead of
+`fastwebsockets`. It is Tokio-native, strict by default, actively maintained,
+supports a tiny plaintext client feature set, and satisfies
+`cargo tree --duplicates` with no vendored patch. `fastwebsockets` remains a
+good high-performance crate, but version `0.10` pulls a `thiserror` version
+that duplicates Ratatui's dependency graph unless patched locally.
+
+The production dependency is:
+
+```toml
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "sha1_smol", "fastrand"] }
+```
+
+Historical comparison from the original stack selection:
 
 | Candidate | Throughput rel. to fastwebsockets | Allocs | Verdict |
 |---|---|---|---|
-| **fastwebsockets** | 1.0× (baseline) | minimal, optional `simd` | ✅ chosen |
+| fastwebsockets | 1.0× (baseline) | minimal, optional `simd` | ✅ viable, replaced to avoid vendoring |
+| **tokio-websockets** | competitive | `Bytes` payloads, strict | ✅ chosen |
 | websocket.rs (`web-socket`) | ~1.05× | smaller still | ❌ less mature, smaller community |
 | tokio-tungstenite | ~0.5× | allocates per frame | ❌ ~2× slower, default frame allocations |
 | soketto | ~0.7× | depends | ❌ less active |
