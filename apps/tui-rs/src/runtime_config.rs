@@ -9,7 +9,10 @@ pub fn hash_server_key(input: &str) -> u16 {
 }
 
 pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u16 {
-    if let Some(port) = explicit.and_then(|value| value.parse::<u16>().ok()).filter(|port| *port > 0) {
+    if let Some(port) = explicit
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+    {
         return port;
     }
 

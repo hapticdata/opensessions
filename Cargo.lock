@@ -124,6 +124,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -274,6 +275,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-sink",
  "futures-task",
  "pin-project-lite",
 ]
@@ -447,6 +449,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "opensessions-runtime"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "opensessions-server"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures-util",
+ "http",
+ "opensessions-runtime",
+ "serde_json",
+ "sha1_smol",
+ "tokio",
+ "tokio-websockets",
 ]
 
 [[package]]

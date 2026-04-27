@@ -1,10 +1,21 @@
-use opensessions_sidebar::generated::protocol::{ClientCommand, ProtocolHello, ServerMessage, SessionFilterMode};
+use opensessions_sidebar::client::encode_client_command;
+use opensessions_sidebar::generated::protocol::{
+    ClientCommand, ProtocolHello, ServerMessage, SessionFilterMode,
+};
 use opensessions_sidebar::runtime_config::{hash_server_key, resolve_server_port};
 
 #[test]
 fn parses_protocol_hello_as_first_class_server_message() {
-    let msg: ServerMessage = serde_json::from_str(r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.5"}"#).unwrap();
-    assert_eq!(msg, ServerMessage::Hello(ProtocolHello { protocol: 1, server_version: "0.2.0-alpha.5".into() }));
+    let msg: ServerMessage =
+        serde_json::from_str(r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.5"}"#)
+            .unwrap();
+    assert_eq!(
+        msg,
+        ServerMessage::Hello(ProtocolHello {
+            protocol: 1,
+            server_version: "0.2.0-alpha.5".into()
+        })
+    );
 }
 
 #[test]
@@ -18,6 +29,14 @@ fn serializes_client_commands_with_kebab_tags_and_camel_fields() {
     assert_eq!(
         serde_json::to_string(&cmd).unwrap(),
         r#"{"type":"identify-pane","paneId":"%42","sessionName":"opensessions"}"#,
+    );
+}
+
+#[test]
+fn encodes_client_commands_as_compact_wire_json() {
+    assert_eq!(
+        encode_client_command(&ClientCommand::SwitchIndex { index: 2 }).unwrap(),
+        r#"{"type":"switch-index","index":2}"#,
     );
 }
 
@@ -38,9 +57,19 @@ fn parses_state_with_nested_agent_and_filter() {
     }"#;
 
     let msg: ServerMessage = serde_json::from_str(json).unwrap();
-    let ServerMessage::State(state) = msg else { panic!("expected state") };
+    let ServerMessage::State(state) = msg else {
+        panic!("expected state")
+    };
     assert_eq!(state.session_filter, Some(SessionFilterMode::Running));
-    assert_eq!(state.sessions[0].agent_state.as_ref().unwrap().status.to_string(), "tool-running");
+    assert_eq!(
+        state.sessions[0]
+            .agent_state
+            .as_ref()
+            .unwrap()
+            .status
+            .to_string(),
+        "tool-running"
+    );
 }
 
 #[test]

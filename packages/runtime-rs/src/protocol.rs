@@ -2,14 +2,14 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolHello {
     pub protocol: u16,
     pub server_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "kebab-case",
@@ -30,29 +30,32 @@ pub enum ServerMessage {
     ReIdentify,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerState {
     pub sessions: Vec<SessionData>,
     pub focused_session: Option<String>,
     pub current_session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
     pub sidebar_width: u32,
     pub initializing: bool,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub init_label: Option<String>,
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FocusUpdate {
     pub focused_session: Option<String>,
     pub current_session: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionData {
     pub name: String,
@@ -71,10 +74,11 @@ pub struct SessionData {
     pub agents: Vec<AgentEvent>,
     pub event_timestamps: Vec<u64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SessionMetadata>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LocalLink {
     pub kind: LocalLinkKind,
     pub port: u32,
@@ -82,7 +86,7 @@ pub struct LocalLink {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocalLinkKind {
     Direct,
@@ -104,7 +108,7 @@ pub enum AgentStatus {
 
 impl fmt::Display for AgentStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = match self {
+        f.write_str(match self {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::ToolRunning => "tool-running",
@@ -113,12 +117,11 @@ impl fmt::Display for AgentStatus {
             Self::Waiting => "waiting",
             Self::Interrupted => "interrupted",
             Self::Stale => "stale",
-        };
-        f.write_str(status)
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentLiveness {
     Alive,
@@ -126,7 +129,7 @@ pub enum AgentLiveness {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEvent {
     pub agent: String,
@@ -134,18 +137,23 @@ pub struct AgentEvent {
     pub status: AgentStatus,
     pub ts: u64,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unseen: Option<bool>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub liveness: Option<AgentLiveness>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MetadataTone {
     Neutral,
@@ -155,38 +163,45 @@ pub enum MetadataTone {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct MetadataStatus {
     pub text: String,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tone: Option<MetadataTone>,
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct MetadataProgress {
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<u64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<f64>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct MetadataLogEntry {
     pub message: String,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tone: Option<MetadataTone>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 pub struct SessionMetadata {
     #[serde(default)]
     pub status: Option<MetadataStatus>,
@@ -205,7 +220,7 @@ pub enum SessionFilterMode {
     Running,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(
     tag = "type",
     rename_all = "kebab-case",

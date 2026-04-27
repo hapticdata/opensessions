@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/tui-rs"]
+members = ["apps/tui-rs", "apps/server-rs", "packages/runtime-rs"]
 resolver = "2"
 
 [profile.release]
