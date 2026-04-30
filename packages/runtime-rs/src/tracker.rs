@@ -11,6 +11,7 @@ pub struct PanePresenceInput {
     pub agent: String,
     pub pane_id: String,
     pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -384,10 +385,10 @@ impl AgentTracker {
                 let synthetic = AgentEvent {
                     agent: pane.agent,
                     session: session.to_string(),
-                    status: AgentStatus::Idle,
+                    status: AgentStatus::Running,
                     ts: now_ms(),
                     thread_id: Some(thread_id.to_string()),
-                    thread_name: None,
+                    thread_name: pane.thread_name,
                     unseen: None,
                     pane_id: Some(pane.pane_id),
                     liveness: Some(AgentLiveness::Alive),
@@ -435,10 +436,10 @@ impl AgentTracker {
                         AgentEvent {
                             agent: pane.agent,
                             session: session.to_string(),
-                            status: AgentStatus::Idle,
+                            status: AgentStatus::Running,
                             ts: now_ms(),
                             thread_id: None,
-                            thread_name: None,
+                            thread_name: pane.thread_name,
                             unseen: None,
                             pane_id: Some(pane.pane_id),
                             liveness: Some(AgentLiveness::Alive),

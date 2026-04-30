@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use http::Uri;
 use opensessions_runtime::mux::{
-    ActiveWindow, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
+    ActiveWindow, AgentPane, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
 use opensessions_server::{
     GitCommandRunner, PortCommandRunner, ReadOnlyMuxStateSource, StateSource,
@@ -2235,6 +2235,34 @@ fn state_source_reports_warmup_after_ensure_sidebar_spawns() {
     assert_eq!(parsed["initLabel"], "warming up…");
 }
 
+#[test]
+fn state_source_streams_agent_panes_for_all_sessions() {
+    let source = ReadOnlyMuxStateSource::new(vec![Arc::new(AgentPaneListMux)]);
+
+    let state = source.snapshot_json();
+    let parsed = serde_json::from_str::<serde_json::Value>(&state).unwrap();
+    let api = parsed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["name"] == "api")
+        .expect("api session should exist");
+    let worker = parsed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["name"] == "worker")
+        .expect("worker session should exist");
+
+    assert_eq!(api["agentState"]["agent"], "amp");
+    assert_eq!(api["agentState"]["status"], "running");
+    assert_eq!(api["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(api["agents"][0]["paneId"], "%api-agent");
+    assert_eq!(api["agents"][0]["liveness"], "alive");
+    assert_eq!(worker["agentState"]["agent"], "codex");
+    assert_eq!(worker["agents"][0]["paneId"], "%worker-agent");
+}
+
 #[derive(Debug)]
 struct ServerMux {
     current: Option<String>,
@@ -2243,6 +2271,76 @@ struct ServerMux {
     create_calls: Mutex<usize>,
     switch_calls: Mutex<Vec<(String, Option<String>)>>,
     kill_calls: Mutex<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct AgentPaneListMux;
+
+impl MuxProvider for AgentPaneListMux {
+    fn name(&self) -> &str {
+        "agent-pane-list-mux"
+    }
+
+    fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+        vec![
+            MuxSessionInfo {
+                name: "api".to_string(),
+                created_at: 1,
+                dir: "/repo/api".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "worker".to_string(),
+                created_at: 2,
+                dir: "/repo/worker".to_string(),
+                windows: 1,
+            },
+        ]
+    }
+
+    fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
+    fn get_current_session(&self) -> Option<String> {
+        Some("api".to_string())
+    }
+
+    fn get_session_dir(&self, name: &str) -> String {
+        format!("/repo/{name}")
+    }
+
+    fn get_pane_count(&self, _name: &str) -> u32 {
+        1
+    }
+
+    fn get_client_tty(&self) -> String {
+        "/dev/ttys-test".to_string()
+    }
+
+    fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+
+    fn kill_session(&self, _name: &str) {}
+
+    fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+    fn cleanup_hooks(&self) {}
+
+    fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
+        match session_name {
+            "api" => vec![AgentPane {
+                agent: "amp".to_string(),
+                pane_id: "%api-agent".to_string(),
+                thread_id: Some("T-api".to_string()),
+                thread_name: Some("Implement API".to_string()),
+            }],
+            "worker" => vec![AgentPane {
+                agent: "codex".to_string(),
+                pane_id: "%worker-agent".to_string(),
+                thread_id: None,
+                thread_name: None,
+            }],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl MuxProvider for ServerMux {

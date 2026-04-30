@@ -1,7 +1,6 @@
-pub mod app;
 pub mod cli;
 pub mod client;
-pub mod generated;
-pub mod renderer;
 pub mod runtime_config;
-pub mod snapshot;
+pub mod runtime_context;
+
+pub use opensessions_sidebar_core::{app, frame, generated, input, renderer, snapshot};

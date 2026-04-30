@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::mux::{ActiveWindow, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition};
+use crate::mux::{
+    ActiveWindow, AgentPane, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
+};
 
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
@@ -501,6 +503,21 @@ impl MuxProvider for TmuxProvider {
             .collect()
     }
 
+    fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
+        self.client
+            .list_panes(PaneScope::Session(session_name))
+            .into_iter()
+            .filter(|pane| pane.title != "opensessions-sidebar")
+            .filter_map(|pane| agent_from_pane(&pane).map(|agent| (pane, agent)))
+            .map(|(pane, agent)| AgentPane {
+                thread_name: thread_name_from_pane(&pane, &agent),
+                agent,
+                pane_id: pane.id,
+                thread_id: None,
+            })
+            .collect()
+    }
+
     fn hide_sidebar(&self, pane_id: &str) {
         self.client.kill_pane(pane_id);
     }
@@ -616,7 +633,14 @@ impl MuxProvider for TmuxProvider {
             SidebarPosition::Left => panes.iter().min_by_key(|pane| pane.left),
             SidebarPosition::Right => panes.iter().max_by_key(|pane| pane.right),
         }?;
-        let command = format!("REFOCUS_WINDOW={window_id} exec {scripts_dir}/start.sh");
+        // Resolve the script path against `$OPENSESSIONS_DIR` so the spawned
+        // pane works even when the parent pane's cwd is unrelated to the
+        // workspace (e.g. tmux sessions whose default cwd is `$HOME`). Falls
+        // back to the literal path if the env is unset.
+        let command = format!(
+            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
+            target.session_name,
+        );
         let new_pane = self.client.split_sidebar_pane(
             &target.id,
             position == SidebarPosition::Left,
@@ -647,6 +671,37 @@ fn client_format() -> &'static str {
 
 fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+}
+
+fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
+    let title = pane.title.to_lowercase();
+    let command = pane.command.to_lowercase();
+    if title.starts_with("amp") || command.contains("amp") {
+        return Some("amp".to_string());
+    }
+    if title.contains("claude") || command.contains("claude") {
+        return Some("claude-code".to_string());
+    }
+    if title.contains("codex") || command.contains("codex") {
+        return Some("codex".to_string());
+    }
+    if title.contains("opencode") || command.contains("opencode") {
+        return Some("opencode".to_string());
+    }
+    None
+}
+
+fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
+    let title = pane.title.trim();
+    if agent == "amp"
+        && let Some((_, thread_name)) = title.split_once(" - ")
+    {
+        let thread_name = thread_name.trim();
+        if !thread_name.is_empty() {
+            return Some(thread_name.to_string());
+        }
+    }
+    None
 }
 
 fn parse_sessions(raw: &str) -> Vec<SessionInfo> {

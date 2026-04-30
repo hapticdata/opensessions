@@ -59,6 +59,7 @@ pub struct SidebarCoordinator {
     drag_owner_session: Option<String>,
     drag_owner_window_id: Option<String>,
     last_width_report_decision: Option<SidebarWidthReportDecision>,
+    last_user_drag_at: Option<u64>,
 }
 
 impl SidebarCoordinator {
@@ -73,6 +74,7 @@ impl SidebarCoordinator {
             drag_owner_session: None,
             drag_owner_window_id: None,
             last_width_report_decision: None,
+            last_user_drag_at: None,
         }
     }
 
@@ -164,6 +166,7 @@ impl SidebarCoordinator {
         if self.authority == SidebarResizeAuthority::UserDrag {
             self.authority = SidebarResizeAuthority::None;
         }
+        self.last_user_drag_at = None;
         self.clear_drag_owner();
     }
 
@@ -194,9 +197,30 @@ impl SidebarCoordinator {
                 .max(report.now.saturating_add(report.suppress_ms));
             self.drag_owner_session = report.session;
             self.drag_owner_window_id = report.window_id;
+            self.last_user_drag_at = Some(report.now);
         }
         self.last_width_report_decision = Some(decision.clone());
         decision
+    }
+
+    /// Clear the UserDrag authority when no further width reports have arrived
+    /// for `settle_ms` after the most recent accepted drag report. Mirrors
+    /// `startTransientSidebarResize` + the FINISH_USER_DRAG `setTimeout` in
+    /// `packages/runtime/src/server/index.ts` so the sidebar does not get
+    /// stuck showing "adjusting…" forever once the user stops resizing.
+    pub fn tick_user_drag_settle(&mut self, now: u64, settle_ms: u64) {
+        if self.authority != SidebarResizeAuthority::UserDrag {
+            return;
+        }
+        let Some(last) = self.last_user_drag_at else {
+            return;
+        };
+        if now < last.saturating_add(settle_ms) {
+            return;
+        }
+        self.authority = SidebarResizeAuthority::None;
+        self.last_user_drag_at = None;
+        self.clear_drag_owner();
     }
 
     fn decide_width_report(&self, report: &SidebarWidthReportInput) -> SidebarWidthReportDecision {

@@ -33,6 +33,48 @@ fn resolves_server_settings_from_tmux_socket_and_env_overrides() {
 }
 
 #[test]
+fn resolve_server_settings_uses_rust_port_base_when_opensessions_rust_set() {
+    // When OPENSESSIONS_RUST=1 the Rust server stack must bind a different
+    // port range (22000+server_key) so it can coexist with the TS bun server
+    // (17000+server_key) on the same tmux socket. Mirrors the PORT_BASE
+    // branch in integrations/tmux-plugin/scripts/server-common.sh.
+    let settings = resolve_server_settings(|key| match key {
+        "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
+        "OPENSESSIONS_RUST" => Some("1".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(settings.server_key.as_deref(), Some("8011"));
+    assert_eq!(
+        settings.port, 30_011,
+        "OPENSESSIONS_RUST=1 must use base 22000 (got {})",
+        settings.port
+    );
+}
+
+#[test]
+fn resolve_server_settings_keeps_ts_port_base_when_opensessions_rust_unset() {
+    let settings = resolve_server_settings(|key| match key {
+        "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(settings.port, 25_011);
+}
+
+#[test]
+fn resolve_server_settings_explicit_port_overrides_rust_base() {
+    let settings = resolve_server_settings(|key| match key {
+        "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
+        "OPENSESSIONS_RUST" => Some("1".to_string()),
+        "OPENSESSIONS_PORT" => Some("42424".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(settings.port, 42_424);
+}
+
+#[test]
 fn resolves_defaults_and_explicit_pid_file_like_typescript() {
     assert_eq!(resolve_server_key(|_| None), None);
     assert_eq!(

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use http::Uri;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_websockets::{ClientBuilder, MaybeTlsStream, WebSocketStream};
 
@@ -28,6 +29,31 @@ pub fn decode_server_message(payload: &[u8]) -> serde_json::Result<ServerMessage
 
 pub fn encode_client_command(command: &ClientCommand) -> serde_json::Result<String> {
     serde_json::to_string(command)
+}
+
+/// Build the raw HTTP/1.1 request the sidebar fires at `http://host:port/quit`
+/// when the user presses 'q'. Mirrors the TypeScript fallback in
+/// `apps/tui/src/index.tsx`:
+///   `fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" })`
+/// This is fire-and-forget — the server replies, then closes the WS, which
+/// tears down the renderer.
+pub fn build_quit_http_request(host: &str, port: u16) -> String {
+    format!(
+        "POST /quit HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// Fire-and-forget HTTP POST to `/quit`. Errors are intentionally swallowed:
+/// this is a fallback for when the WS Quit frame might be lost while the TUI
+/// is tearing down.
+pub async fn fire_quit_http(host: &str, port: u16) {
+    let Ok(mut stream) = TcpStream::connect((host, port)).await else {
+        return;
+    };
+    let _ = stream
+        .write_all(build_quit_http_request(host, port).as_bytes())
+        .await;
+    let _ = stream.shutdown().await;
 }
 
 pub async fn connect_ws(

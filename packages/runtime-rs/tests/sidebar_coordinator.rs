@@ -223,6 +223,53 @@ fn sidebar_coordinator_focus_context_change_preserves_drag_tail() {
     assert_eq!(coordinator.state().width, 32);
 }
 
+#[test]
+fn sidebar_coordinator_user_drag_settles_after_grace_period() {
+    // Mirrors apps/server-rs's setTimeout(USER_DRAG_SETTLE_MS) behavior in TS:
+    // once a width report is accepted, authority becomes UserDrag and the
+    // sidebar shows "adjusting…". After the settle window passes with no
+    // further reports, the next tick must clear the drag so callers see
+    // mode="ready" again. Without this the sidebar is permanently stuck in
+    // "adjusting…" because nothing else fires FINISH_USER_DRAG.
+    let mut coordinator = SidebarCoordinator::new(26);
+    coordinator.mark_ready();
+    let accept_at = 1_000;
+    let settle_ms = 600;
+
+    let decision = coordinator.apply_width_report(SidebarWidthReportInput {
+        width: 30,
+        session: Some("alpha".to_string()),
+        window_id: Some("@1".to_string()),
+        is_active_session: true,
+        is_foreground_client: true,
+        is_current_window: true,
+        now: accept_at,
+        suppress_ms: 500,
+    });
+    assert!(decision.accepted);
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::UserDrag
+    );
+
+    // Within the settle window, drag must remain.
+    coordinator.tick_user_drag_settle(accept_at + settle_ms - 1, settle_ms);
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::UserDrag,
+        "drag must persist while still within USER_DRAG_SETTLE_MS",
+    );
+
+    // After the settle window the next tick must finish the drag so callers
+    // see mode=ready / initializing=false again.
+    coordinator.tick_user_drag_settle(accept_at + settle_ms, settle_ms);
+    let settled = coordinator.state();
+    assert_eq!(settled.resize_authority, SidebarResizeAuthority::None);
+    assert_eq!(settled.mode, "ready");
+    assert!(!settled.initializing);
+    assert_eq!(settled.init_label, "");
+}
+
 fn width_report(width: u32, now: u64) -> SidebarWidthReportInput {
     SidebarWidthReportInput {
         width,

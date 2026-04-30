@@ -4,6 +4,44 @@ use opensessions_sidebar::generated::protocol::{
 };
 
 #[test]
+fn re_identify_message_resends_identify_pane_command() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.identify_pane(
+        "%99".to_string(),
+        "opensessions".to_string(),
+        Some("@7".to_string()),
+    );
+    // Drain the initial IdentifyPane queued by identify_pane().
+    let initial = app.drain_commands();
+    assert_eq!(
+        initial,
+        vec![ClientCommand::IdentifyPane {
+            pane_id: "%99".to_string(),
+            session_name: "opensessions".to_string(),
+            window_id: Some("@7".to_string()),
+        }]
+    );
+
+    app.apply_server_message(ServerMessage::ReIdentify);
+
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::IdentifyPane {
+            pane_id: "%99".to_string(),
+            session_name: "opensessions".to_string(),
+            window_id: Some("@7".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn re_identify_without_stored_identity_emits_no_command() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.apply_server_message(ServerMessage::ReIdentify);
+    assert!(app.drain_commands().is_empty());
+}
+
+#[test]
 fn resolve_synced_focus_keeps_background_sidebar_pinned_to_local_session() {
     assert_eq!(
         App::resolve_synced_focus(Some("alpha"), Some("alpha"), Some("beta")),

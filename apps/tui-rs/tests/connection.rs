@@ -1,5 +1,5 @@
 use opensessions_sidebar::client::{
-    EXPECTED_PROTOCOL_VERSION, decode_server_message, validate_hello,
+    EXPECTED_PROTOCOL_VERSION, build_quit_http_request, decode_server_message, validate_hello,
 };
 use opensessions_sidebar::generated::protocol::{ProtocolHello, ServerMessage};
 
@@ -26,6 +26,37 @@ fn rejects_mismatched_protocol_hello() {
 fn rejects_non_hello_first_message() {
     let err = validate_hello(&ServerMessage::Quit).unwrap_err();
     assert!(err.contains("expected hello"));
+}
+
+#[test]
+fn build_quit_http_request_matches_typescript_fallback() {
+    // Mirrors the TypeScript fallback in apps/tui/src/index.tsx:
+    //   fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" })
+    // The Rust client has no fetch, so it sends a minimal HTTP/1.1 POST over a
+    // raw TCP connection. The wire format must be a complete request with
+    // Host, zero-length body, and Connection: close so the server side can
+    // drop the socket immediately after replying.
+    let request = build_quit_http_request("127.0.0.1", 7391);
+    assert!(
+        request.starts_with("POST /quit HTTP/1.1\r\n"),
+        "request line must POST /quit; got: {request:?}"
+    );
+    assert!(
+        request.contains("Host: 127.0.0.1:7391\r\n"),
+        "Host header must include host:port; got: {request:?}"
+    );
+    assert!(
+        request.contains("Content-Length: 0\r\n"),
+        "Content-Length must be 0; got: {request:?}"
+    );
+    assert!(
+        request.contains("Connection: close\r\n"),
+        "Connection: close lets the server tear down promptly; got: {request:?}"
+    );
+    assert!(
+        request.ends_with("\r\n\r\n"),
+        "request must end with the empty-line terminator; got: {request:?}"
+    );
 }
 
 #[test]

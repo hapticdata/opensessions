@@ -467,7 +467,8 @@ dependencies = [
  "futures-util",
  "http",
  "opensessions-runtime",
- "opensessions-sidebar",
+ "opensessions-sidebar-core",
+ "opensessions-sidebar-protocol",
  "serde_json",
  "sha1_smol",
  "tokio",
@@ -483,6 +484,8 @@ dependencies = [
  "crossterm",
  "futures-util",
  "http",
+ "opensessions-sidebar-core",
+ "opensessions-sidebar-protocol",
  "ratatui",
  "serde",
  "serde_json",
@@ -490,6 +493,29 @@ dependencies = [
  "tokio-util",
  "tokio-websockets",
  "unicode-width",
+]
+
+[[package]]
+name = "opensessions-sidebar-core"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
+ "serde",
+ "unicode-width",
+]
+
+[[package]]
+name = "opensessions-sidebar-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "opensessions-sidebar-shim"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures-util",
+ "opensessions-sidebar-protocol",
+ "tokio",
 ]
 
 [[package]]

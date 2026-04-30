@@ -25,6 +25,14 @@ pub struct SidebarPane {
     pub window_width: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPane {
+    pub agent: String,
+    pub pane_id: String,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarPosition {
     Left,
@@ -76,6 +84,10 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn list_sidebar_panes(&self, _session_name: Option<&str>) -> Vec<SidebarPane> {
+        Vec::new()
+    }
+
+    fn list_agent_panes(&self, _session_name: &str) -> Vec<AgentPane> {
         Vec::new()
     }
 

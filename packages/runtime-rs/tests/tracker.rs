@@ -79,11 +79,13 @@ fn dismiss_removes_target_instance_and_synthetic_matches() {
                 agent: "pi".to_string(),
                 pane_id: "%1".to_string(),
                 thread_id: Some("dead".to_string()),
+                thread_name: None,
             },
             PanePresenceInput {
                 agent: "pi".to_string(),
                 pane_id: "%1".to_string(),
                 thread_id: Some("live".to_string()),
+                thread_name: None,
             },
         ],
     );
@@ -137,6 +139,7 @@ fn prune_stuck_removes_old_running_unless_alive() {
             agent: "claude-code".to_string(),
             pane_id: "%1".to_string(),
             thread_id: None,
+            thread_name: None,
         }],
     );
     tracker.prune_stuck(180_000);
@@ -155,7 +158,8 @@ fn pane_presence_enriches_exact_thread_and_drops_missing_synthetic_threads() {
         vec![PanePresenceInput {
             agent: "pi".to_string(),
             pane_id: "%31".to_string(),
-            thread_id: Some("thread-b".to_string())
+            thread_id: Some("thread-b".to_string()),
+            thread_name: None,
         }]
     ));
     let agents = tracker.get_agents("sess-1");
@@ -184,11 +188,13 @@ fn pane_presence_enriches_exact_thread_and_drops_missing_synthetic_threads() {
                 agent: "pi".to_string(),
                 pane_id: "%1".to_string(),
                 thread_id: Some("old-dead".to_string()),
+                thread_name: None,
             },
             PanePresenceInput {
                 agent: "pi".to_string(),
                 pane_id: "%1".to_string(),
                 thread_id: Some("live".to_string()),
+                thread_name: None,
             },
         ],
     );
@@ -197,7 +203,8 @@ fn pane_presence_enriches_exact_thread_and_drops_missing_synthetic_threads() {
         vec![PanePresenceInput {
             agent: "pi".to_string(),
             pane_id: "%1".to_string(),
-            thread_id: Some("live".to_string())
+            thread_id: Some("live".to_string()),
+            thread_name: None,
         }]
     ));
     let remaining = tracker.get_agents("sess-2");
@@ -216,6 +223,7 @@ fn synthetic_pane_entry_merges_when_watcher_event_arrives_for_same_thread() {
             agent: "pi".to_string(),
             pane_id: "%21".to_string(),
             thread_id: Some("abc".to_string()),
+            thread_name: None,
         }],
     );
     tracker.apply_event(event("sess-1", "pi", AgentStatus::Running).with_thread("abc"));
