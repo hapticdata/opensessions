@@ -114,7 +114,7 @@ fn tmux_provider_lists_active_windows_and_filters_stash_session() {
 fn tmux_provider_lists_sidebar_panes_with_window_widths() {
     let runner = RecordingRunner::new(HashMap::from([(
         "list-panes".to_string(),
-        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\tmain\t94\t24\t26\t119\n%2\talpha\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%3\t_os_stash\t@2\t0\t0\t1\t/dev/ttys3\t125\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25"
+        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\tmain\t94\t24\t26\t119\n%2\talpha\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\talpha-2\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%3\t_os_stash\t@2\t0\t0\t1\t/dev/ttys3\t125\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25"
             .to_string(),
     )]));
     let provider = TmuxProvider::new(Arc::new(runner));
@@ -126,6 +126,23 @@ fn tmux_provider_lists_sidebar_panes_with_window_widths() {
     assert_eq!(panes[0].window_id, "@1");
     assert_eq!(panes[0].width, Some(26));
     assert_eq!(panes[0].window_width, Some(120));
+}
+
+#[test]
+fn tmux_provider_deduplicates_grouped_session_windows_by_window_id() {
+    let runner = RecordingRunner::new(HashMap::from([(
+        "list-windows".to_string(),
+        "@1\t$1\talpha\t0\tmain\t0\t2\n@1\t$2\talpha-2\t0\tmain\t1\t2\n@2\t$1\talpha\t1\tworker\t0\t1"
+            .to_string(),
+    )]));
+    let provider = TmuxProvider::new(Arc::new(runner));
+
+    let windows = provider.list_active_windows();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].id, "@1");
+    assert_eq!(windows[0].session_name, "alpha-2");
+    assert!(windows[0].active);
+    assert_eq!(windows[1].id, "@2");
 }
 
 #[test]
@@ -231,7 +248,7 @@ fn tmux_provider_resolves_focuses_and_kills_agent_panes() {
 fn tmux_provider_kills_orphaned_and_duplicate_sidebar_panes() {
     let runner = Arc::new(RecordingRunner::new(HashMap::from([(
         "list-panes".to_string(),
-        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\tbeta\t@2\t0\t0\t1\t/dev/ttys2\t124\t/repo\tbash\tmain\t94\t24\t26\t119\n%3\tbeta\t@2\t0\t1\t0\t/dev/ttys3\t125\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%4\tbeta\t@2\t0\t2\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%5\t_os_stash\t@3\t0\t0\t1\t/dev/ttys5\t127\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25"
+        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%1\talpha-2\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\tbeta\t@2\t0\t0\t1\t/dev/ttys2\t124\t/repo\tbash\tmain\t94\t24\t26\t119\n%3\tbeta\t@2\t0\t1\t0\t/dev/ttys3\t125\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%4\tbeta\t@2\t0\t2\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%5\t_os_stash\t@3\t0\t0\t1\t/dev/ttys5\t127\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25"
             .to_string(),
     )])));
     let provider = TmuxProvider::new(runner.clone());
