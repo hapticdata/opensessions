@@ -1,14 +1,18 @@
-use crate::app::{App, PanelFocus};
-use crate::renderer::{HitTarget, compute_hit_map};
+use crate::app::{App, Modal, PanelFocus};
+use crate::generated::protocol::ClientCommand;
+use crate::renderer::{HitTarget, THEME_NAMES, compute_hit_map};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiKey {
     Char(char),
     Up,
     Down,
+    Left,
+    Right,
     Tab { shift: bool },
     Enter,
     Esc,
+    Backspace,
     CtrlJ,
     CtrlK,
     AltUp,
@@ -20,9 +24,16 @@ pub enum UiMouse {
     ScrollUp { x: u16, y: u16 },
     ScrollDown { x: u16, y: u16 },
     Click { x: u16, y: u16, width: u16, height: u16 },
+    Drag { y: u16 },
+    DragEnd,
 }
 
 pub fn apply_ui_key(app: &mut App, key: UiKey) {
+    if app.is_modal_open() {
+        apply_modal_key(app, key);
+        return;
+    }
+
     match key {
         UiKey::AltUp => app.reorder_focused_session(-1),
         UiKey::AltDown => app.reorder_focused_session(1),
@@ -42,10 +53,128 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
                 app.move_focus(-1);
             }
         }
+        UiKey::Left => {
+            if app.panel_focus == PanelFocus::Sessions {
+                app.resize_detail_panel(-1);
+            } else {
+                app.focus_sessions_panel();
+            }
+        }
+        UiKey::Right => {
+            if app.panel_focus == PanelFocus::Sessions {
+                let agent_count = app
+                    .focused_session
+                    .as_deref()
+                    .and_then(|name| app.sessions.iter().find(|s| s.name == name))
+                    .map(|s| s.agents.len())
+                    .unwrap_or(0);
+                if agent_count > 0 {
+                    app.focus_agents_panel();
+                } else {
+                    app.resize_detail_panel(1);
+                }
+            }
+        }
         UiKey::Tab { shift } => app.handle_tab(shift),
         UiKey::Enter => app.activate_focused_item(),
         UiKey::Esc => app.focus_sessions_panel(),
+        UiKey::Backspace => {}
         UiKey::Char(ch) => app.handle_key_char(ch),
+    }
+}
+
+fn apply_modal_key(app: &mut App, key: UiKey) {
+    match &app.modal {
+        Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
+        Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
+        Modal::None => {}
+    }
+}
+
+fn filtered_theme_names(query: &str) -> Vec<&'static str> {
+    let query_lower = query.to_lowercase();
+    THEME_NAMES
+        .iter()
+        .copied()
+        .filter(|name| query_lower.is_empty() || name.contains(&query_lower))
+        .collect()
+}
+
+fn apply_theme_picker_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Esc => {
+            app.close_theme_picker();
+        }
+        UiKey::Enter => {
+            app.confirm_theme_picker();
+        }
+        UiKey::Up => {
+            if let Modal::ThemePicker {
+                query, selected, ..
+            } = &mut app.modal
+            {
+                let names = filtered_theme_names(query);
+                if !names.is_empty() && *selected > 0 {
+                    *selected -= 1;
+                    app.theme = Some(names[*selected].to_string());
+                }
+            }
+        }
+        UiKey::Down => {
+            if let Modal::ThemePicker {
+                query, selected, ..
+            } = &mut app.modal
+            {
+                let names = filtered_theme_names(query);
+                if !names.is_empty() && *selected + 1 < names.len() {
+                    *selected += 1;
+                    app.theme = Some(names[*selected].to_string());
+                }
+            }
+        }
+        UiKey::Backspace => {
+            if let Modal::ThemePicker {
+                query, selected, ..
+            } = &mut app.modal
+            {
+                query.pop();
+                let names = filtered_theme_names(query);
+                *selected = (*selected).min(names.len().saturating_sub(1));
+                if let Some(name) = names.get(*selected) {
+                    app.theme = Some(name.to_string());
+                }
+            }
+        }
+        UiKey::Char(ch) => {
+            if let Modal::ThemePicker {
+                query, selected, ..
+            } = &mut app.modal
+            {
+                query.push(ch);
+                let names = filtered_theme_names(query);
+                *selected = 0;
+                if let Some(name) = names.first() {
+                    app.theme = Some(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Char('y') => {
+            if let Modal::KillConfirm { session_name } = app.modal.clone() {
+                app.modal = Modal::None;
+                app.commands_push(ClientCommand::KillSession {
+                    name: session_name,
+                });
+            }
+        }
+        _ => {
+            app.modal = Modal::None;
+        }
     }
 }
 
@@ -66,6 +195,13 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             }
         }
         UiMouse::Click { x: _, y, width, height } => {
+            // Check if clicking on the separator row to start a drag resize
+            let sep_row = (height as usize).saturating_sub(3 + app.detail_panel_height);
+            if y as usize == sep_row {
+                app.resize_drag_state = Some((y, app.detail_panel_height));
+                return;
+            }
+
             let hits = compute_hit_map(app, width, height);
             let target = hits.get(y as usize).cloned().flatten();
             match target {
@@ -77,6 +213,16 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
                 }
                 None => {}
             }
+        }
+        UiMouse::Drag { y } => {
+            if let Some((start_y, start_height)) = app.resize_drag_state {
+                let delta = start_y as i16 - y as i16;
+                let new_height = (start_height as i16 + delta).max(4) as usize;
+                app.detail_panel_height = new_height;
+            }
+        }
+        UiMouse::DragEnd => {
+            app.resize_drag_state = None;
         }
     }
 }

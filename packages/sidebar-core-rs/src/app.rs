@@ -12,6 +12,19 @@ pub enum PanelFocus {
     Agents,
 }
 
+#[derive(Debug, Clone)]
+pub enum Modal {
+    None,
+    ThemePicker {
+        query: String,
+        selected: usize,
+        original_theme: Option<String>,
+    },
+    KillConfirm {
+        session_name: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct App {
     pub sessions: Vec<SessionData>,
@@ -33,6 +46,9 @@ pub struct App {
     pub quit_deadline: Option<Instant>,
     pub flash_target: Option<HitTarget>,
     pub flash_deadline: Option<Instant>,
+    pub modal: Modal,
+    pub detail_panel_height: usize,
+    pub resize_drag_state: Option<(u16, usize)>,
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
@@ -64,6 +80,9 @@ impl App {
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
+            modal: Modal::None,
+            detail_panel_height: 10,
+            resize_drag_state: None,
             fixture_name: None,
             terminal_width: None,
             pane_identity: None,
@@ -177,6 +196,9 @@ impl App {
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
+            modal: Modal::None,
+            detail_panel_height: 10,
+            resize_drag_state: None,
             fixture_name: fixture_static_name(name),
             terminal_width: None,
             pane_identity: None,
@@ -249,9 +271,12 @@ impl App {
                 if self.panel_focus == PanelFocus::Agents {
                     self.kill_focused_agent_pane();
                 } else if let Some(name) = self.focused_session.clone() {
-                    self.commands.push(ClientCommand::KillSession { name });
+                    self.modal = Modal::KillConfirm {
+                        session_name: name,
+                    };
                 }
             }
+            't' => self.open_theme_picker(),
             'f' => self.cycle_filter(),
             _ => {}
         }
@@ -280,6 +305,10 @@ impl App {
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {
         self.commands.drain(..).collect()
+    }
+
+    pub fn commands_push(&mut self, command: ClientCommand) {
+        self.commands.push(command);
     }
 
     pub fn move_focus(&mut self, delta: i8) {
@@ -384,6 +413,37 @@ impl App {
             return None;
         }
         self.flash_target.as_ref()
+    }
+
+    pub fn is_modal_open(&self) -> bool {
+        !matches!(self.modal, Modal::None)
+    }
+
+    pub fn open_theme_picker(&mut self) {
+        self.modal = Modal::ThemePicker {
+            query: String::new(),
+            selected: 0,
+            original_theme: self.theme.clone(),
+        };
+    }
+
+    pub fn close_theme_picker(&mut self) {
+        if let Modal::ThemePicker { original_theme, .. } = &self.modal {
+            self.theme = original_theme.clone();
+        }
+        self.modal = Modal::None;
+    }
+
+    pub fn confirm_theme_picker(&mut self) {
+        if let Some(name) = self.theme.clone() {
+            self.commands.push(ClientCommand::SetTheme { theme: name });
+        }
+        self.modal = Modal::None;
+    }
+
+    pub fn resize_detail_panel(&mut self, delta: i8) {
+        let new_height = (self.detail_panel_height as i16 + delta as i16).max(4) as usize;
+        self.detail_panel_height = new_height;
     }
 
     pub fn activate_focused_agent(&mut self) {

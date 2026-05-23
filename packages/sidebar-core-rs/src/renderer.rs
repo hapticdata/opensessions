@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::App;
-use crate::generated::protocol::{AgentEvent, AgentStatus, SessionData};
+use crate::app::{App, Modal};
+use crate::generated::protocol::{AgentEvent, AgentStatus, MetadataTone, SessionData};
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -51,7 +51,10 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     let detail_sep_line = match app.fixture_name {
         Some("pane-opensessions-self") => 39,
         Some("pane-multi-window") => 36,
-        _ => 44,
+        Some(_) => 44,
+        None => height
+            .saturating_sub(3 + app.detail_panel_height)
+            .max(4),
     };
     render_sessions(app, &palette, &mut lines, detail_sep_line - 1, width);
 
@@ -61,7 +64,8 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     lines.push(separator(&palette, width));
     let footer_sep_line = match app.fixture_name {
         Some("pane-opensessions-self") => 52,
-        _ => 53,
+        Some(_) => 53,
+        None => height.saturating_sub(2).max(detail_sep_line + 1),
     };
     render_detail(app, &palette, &mut lines, footer_sep_line - 1);
 
@@ -75,6 +79,11 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
         lines.push(StyledLine::blank());
     }
     lines.truncate(height);
+
+    if app.is_modal_open() {
+        render_modal_overlay(app, &palette, &mut lines, width, height);
+    }
+
     RenderModel { lines }
 }
 
@@ -354,15 +363,35 @@ fn build_session_block(
             .with_hit(hit.clone()),
         );
     }
-    if !session.branch.is_empty() {
-        let color = if focused {
+    let has_ports = !session.ports.is_empty();
+    if !session.branch.is_empty() || has_ports {
+        let branch_color = if focused {
             palette.pink
+        } else {
+            palette.overlay0
+        };
+        let port_color = if focused {
+            palette.sky
         } else {
             palette.overlay0
         };
         let mut line = StyledLine::with_bg(bg);
         line.push("     ", palette.white);
-        line.push(&session.branch, color);
+        if !session.branch.is_empty() {
+            line.push(&session.branch, branch_color);
+        }
+        if has_ports {
+            let port_text = if session.ports.len() == 1 {
+                format!("  ⌁{}", session.ports[0])
+            } else {
+                format!(
+                    "  ⌁{}+{}",
+                    session.ports[0],
+                    session.ports.len() - 1
+                )
+            };
+            line.push(port_text, port_color);
+        }
         block.push(
             line.end(CellStyle {
                 fg: palette.white,
@@ -370,6 +399,55 @@ fn build_session_block(
             })
             .with_hit(hit.clone()),
         );
+    }
+
+    if let Some(metadata) = &session.metadata {
+        let mut summary_parts: Vec<(String, Rgb)> = Vec::new();
+        if let Some(status) = &metadata.status {
+            summary_parts.push((
+                status.text.clone(),
+                tone_color(palette, status.tone),
+            ));
+        }
+        if let Some(progress) = &metadata.progress {
+            let progress_text = if let (Some(current), Some(total)) =
+                (progress.current, progress.total)
+            {
+                format!("{current}/{total}")
+            } else if let Some(percent) = progress.percent {
+                format!("{percent:.0}%")
+            } else {
+                String::new()
+            };
+            if !progress_text.is_empty() {
+                summary_parts.push((progress_text, palette.sky));
+            }
+        }
+        if !summary_parts.is_empty() {
+            let mut line = StyledLine::with_bg(bg);
+            line.push("     ", palette.white);
+            for (i, (text, color)) in summary_parts.iter().enumerate() {
+                if i > 0 {
+                    line.push(" · ", palette.overlay0);
+                }
+                let max_text_len = width.saturating_sub(line.width() + 1);
+                if text.width() > max_text_len {
+                    let truncated: String =
+                        text.chars().take(max_text_len.saturating_sub(1)).collect();
+                    line.push(format!("{truncated}…"), *color);
+                    break;
+                } else {
+                    line.push(text, *color);
+                }
+            }
+            block.push(
+                line.end(CellStyle {
+                    fg: palette.white,
+                    bg,
+                })
+                .with_hit(hit.clone()),
+            );
+        }
     }
 
     if focused {
@@ -435,6 +513,26 @@ fn render_detail(
     path.push(" ", palette.white);
     path.push(truncate_left(&session.dir, 24), palette.overlay0);
     lines.push(path.end(CellStyle::fg(palette.white)));
+
+    for (i, link) in session.local_links.iter().enumerate() {
+        if lines.len() >= max_lines {
+            break;
+        }
+        let mut line = StyledLine::blank();
+        line.push(" ", palette.white);
+        if i == 0 {
+            line.push("local ", palette.overlay0);
+        } else {
+            line.push("      ", palette.white);
+        }
+        let label = if link.label.is_empty() {
+            &link.url
+        } else {
+            &link.label
+        };
+        line.push(label, palette.sky);
+        lines.push(line.end(CellStyle::fg(palette.white)));
+    }
 
     if session.agents.is_empty() {
         return;
@@ -505,10 +603,318 @@ fn render_detail(
         }
         for line in block {
             if consumed >= agents_available {
-                return;
+                break;
             }
             lines.push(line.clone());
             consumed += 1;
+        }
+    }
+
+    render_metadata(session, palette, lines, max_lines);
+}
+
+fn render_metadata(
+    session: &SessionData,
+    palette: &Palette,
+    lines: &mut Vec<StyledLine>,
+    max_lines: usize,
+) {
+    let Some(metadata) = &session.metadata else {
+        return;
+    };
+    let has_status = metadata.status.is_some();
+    let has_progress = metadata.progress.is_some();
+    let has_logs = !metadata.logs.is_empty();
+    if !has_status && !has_progress && !has_logs {
+        return;
+    }
+
+    if lines.len() >= max_lines {
+        return;
+    }
+    lines.push(StyledLine::blank());
+
+    if let Some(status) = &metadata.status {
+        if lines.len() >= max_lines {
+            return;
+        }
+        let tone = status.tone;
+        let mut line = StyledLine::blank();
+        line.push("  ", palette.white);
+        line.push(tone_icon(tone), tone_color(palette, tone));
+        line.push(format!(" {}", status.text), tone_color(palette, tone));
+        if let Some(progress) = &metadata.progress {
+            if let (Some(current), Some(total)) = (progress.current, progress.total) {
+                line.push(format!(" · {current}/{total}"), palette.sky);
+            } else if let Some(percent) = progress.percent {
+                line.push(format!(" · {percent:.0}%"), palette.sky);
+            }
+        }
+        lines.push(line.end(CellStyle::fg(palette.white)));
+    } else if let Some(progress) = &metadata.progress {
+        if lines.len() >= max_lines {
+            return;
+        }
+        let mut line = StyledLine::blank();
+        line.push("  ", palette.white);
+        if let (Some(current), Some(total)) = (progress.current, progress.total) {
+            line.push(format!("{current}/{total}"), palette.sky);
+        } else if let Some(percent) = progress.percent {
+            line.push(format!("{percent:.0}%"), palette.sky);
+        }
+        lines.push(line.end(CellStyle::fg(palette.white)));
+    }
+
+    let log_start = metadata.logs.len().saturating_sub(8);
+    for entry in &metadata.logs[log_start..] {
+        if lines.len() >= max_lines {
+            return;
+        }
+        let tone = entry.tone;
+        let mut line = StyledLine::blank();
+        line.push("  ", palette.white);
+        line.push(tone_icon(tone), tone_color(palette, tone));
+        if let Some(source) = &entry.source {
+            line.push(format!(" [{source}]"), palette.surface2);
+        }
+        line.push(format!(" {}", entry.message), palette.overlay0);
+        lines.push(line.end(CellStyle::fg(palette.white)));
+    }
+}
+
+fn render_modal_overlay(
+    app: &App,
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+) {
+    match &app.modal {
+        Modal::ThemePicker {
+            query, selected, ..
+        } => render_theme_picker_overlay(palette, lines, width, height, query, *selected),
+        Modal::KillConfirm { session_name } => {
+            render_kill_confirm_overlay(palette, lines, width, height, session_name)
+        }
+        Modal::None => {}
+    }
+}
+
+fn render_theme_picker_overlay(
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+    query: &str,
+    selected: usize,
+) {
+    let box_width: usize = 28;
+    let visible_items: usize = 12;
+    // title + search + blank + items + blank + footer
+    let box_height = 4 + visible_items + 1;
+    if height < box_height + 2 || width < box_width + 2 {
+        return;
+    }
+
+    let filtered: Vec<&str> = THEME_NAMES
+        .iter()
+        .copied()
+        .filter(|name| query.is_empty() || name.contains(&query.to_lowercase()))
+        .collect();
+
+    let start_y = (height.saturating_sub(box_height)) / 2;
+    let start_x = (width.saturating_sub(box_width)) / 2;
+    let border_color = palette.blue;
+    let inner_width = box_width - 2;
+
+    // Top border
+    let mut top = StyledLine::blank();
+    top.push(" ".repeat(start_x), palette.white);
+    top.push("╭", border_color);
+    top.push("─".repeat(inner_width), border_color);
+    top.push("╮", border_color);
+    if start_y < lines.len() {
+        lines[start_y] = top;
+    }
+
+    let mut row = start_y + 1;
+
+    // Title row
+    let title = "Select Theme";
+    let title_pad = inner_width.saturating_sub(title.width());
+    let left_pad = title_pad / 2;
+    let right_pad = title_pad - left_pad;
+    let mut title_line = StyledLine::blank();
+    title_line.push(" ".repeat(start_x), palette.white);
+    title_line.push("│", border_color);
+    title_line.push(" ".repeat(left_pad), palette.white);
+    title_line.push(title, palette.blue);
+    title_line.push(" ".repeat(right_pad), palette.white);
+    title_line.push("│", border_color);
+    if row < lines.len() {
+        lines[row] = title_line;
+    }
+    row += 1;
+
+    // Search row
+    let search_display = if query.is_empty() {
+        "search…".to_string()
+    } else {
+        query.to_string()
+    };
+    let search_color = if query.is_empty() {
+        palette.overlay0
+    } else {
+        palette.text
+    };
+    let search_pad = inner_width.saturating_sub(search_display.width() + 2);
+    let mut search_line = StyledLine::blank();
+    search_line.push(" ".repeat(start_x), palette.white);
+    search_line.push("│", border_color);
+    search_line.push(" ", palette.white);
+    search_line.push(&search_display, search_color);
+    search_line.push(" ".repeat(search_pad + 1), palette.white);
+    search_line.push("│", border_color);
+    if row < lines.len() {
+        lines[row] = search_line;
+    }
+    row += 1;
+
+    // Blank separator
+    let mut blank = StyledLine::blank();
+    blank.push(" ".repeat(start_x), palette.white);
+    blank.push("│", border_color);
+    blank.push(" ".repeat(inner_width), palette.white);
+    blank.push("│", border_color);
+    if row < lines.len() {
+        lines[row] = blank;
+    }
+    row += 1;
+
+    // Items
+    let total = filtered.len();
+    let scroll_offset = if selected >= visible_items {
+        selected - visible_items + 1
+    } else {
+        0
+    };
+    let visible_end = (scroll_offset + visible_items).min(total);
+
+    for i in 0..visible_items {
+        let idx = scroll_offset + i;
+        let mut item_line = StyledLine::blank();
+        item_line.push(" ".repeat(start_x), palette.white);
+        item_line.push("│", border_color);
+        if idx < total {
+            let name = filtered[idx];
+            let is_selected = idx == selected;
+            let prefix = if is_selected { "▸ " } else { "  " };
+            let name_color = if is_selected {
+                palette.text
+            } else {
+                palette.subtext0
+            };
+            let display = format!("{prefix}{name}");
+            let pad = inner_width.saturating_sub(display.width());
+            item_line.push(display, name_color);
+            item_line.push(" ".repeat(pad), palette.white);
+        } else {
+            item_line.push(" ".repeat(inner_width), palette.white);
+        }
+        item_line.push("│", border_color);
+        if row < lines.len() {
+            lines[row] = item_line;
+        }
+        row += 1;
+    }
+
+    // More indicator / blank
+    let mut more_line = StyledLine::blank();
+    more_line.push(" ".repeat(start_x), palette.white);
+    more_line.push("│", border_color);
+    let hidden_above = scroll_offset;
+    let hidden_below = total.saturating_sub(visible_end);
+    if hidden_above > 0 || hidden_below > 0 {
+        let indicator = format!("↕ {} more", hidden_above + hidden_below);
+        let pad = inner_width.saturating_sub(indicator.width() + 1);
+        more_line.push(" ", palette.white);
+        more_line.push(indicator, palette.overlay0);
+        more_line.push(" ".repeat(pad), palette.white);
+    } else {
+        more_line.push(" ".repeat(inner_width), palette.white);
+    }
+    more_line.push("│", border_color);
+    if row < lines.len() {
+        lines[row] = more_line;
+    }
+    row += 1;
+
+    // Bottom border
+    let mut bottom = StyledLine::blank();
+    bottom.push(" ".repeat(start_x), palette.white);
+    bottom.push("╰", border_color);
+    bottom.push("─".repeat(inner_width), border_color);
+    bottom.push("╯", border_color);
+    if row < lines.len() {
+        lines[row] = bottom;
+    }
+}
+
+fn render_kill_confirm_overlay(
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+    session_name: &str,
+) {
+    let box_width: usize = 30.max(session_name.width() + 6);
+    let box_height: usize = 5;
+    if height < box_height + 2 || width < box_width + 2 {
+        return;
+    }
+
+    let start_y = (height.saturating_sub(box_height)) / 2;
+    let start_x = (width.saturating_sub(box_width)) / 2;
+    let border_color = palette.red;
+    let inner_width = box_width - 2;
+
+    let make_inner = |content: &str, color: Rgb| -> StyledLine {
+        let pad = inner_width.saturating_sub(content.width());
+        let left = pad / 2;
+        let right = pad - left;
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push("│", border_color);
+        line.push(" ".repeat(left), palette.white);
+        line.push(content, color);
+        line.push(" ".repeat(right), palette.white);
+        line.push("│", border_color);
+        line
+    };
+
+    // Top border
+    let mut top = StyledLine::blank();
+    top.push(" ".repeat(start_x), palette.white);
+    top.push("╭", border_color);
+    top.push("─".repeat(inner_width), border_color);
+    top.push("╮", border_color);
+
+    let title_line = make_inner("Kill session?", palette.red);
+    let name_line = make_inner(session_name, palette.text);
+    let hint_line = make_inner("y / n", palette.overlay0);
+
+    // Bottom border
+    let mut bottom = StyledLine::blank();
+    bottom.push(" ".repeat(start_x), palette.white);
+    bottom.push("╰", border_color);
+    bottom.push("─".repeat(inner_width), border_color);
+    bottom.push("╯", border_color);
+
+    let rows = [top, title_line, name_line, hint_line, bottom];
+    for (i, row) in rows.into_iter().enumerate() {
+        let y = start_y + i;
+        if y < lines.len() {
+            lines[y] = row;
         }
     }
 }
@@ -822,6 +1228,26 @@ fn truncate_left(value: &str, max_cols: usize) -> String {
     format!("…{}", chars.iter().collect::<String>())
 }
 
+fn tone_icon(tone: Option<MetadataTone>) -> &'static str {
+    match tone {
+        Some(MetadataTone::Info) => "ℹ",
+        Some(MetadataTone::Success) => "✓",
+        Some(MetadataTone::Warn) => "⚠",
+        Some(MetadataTone::Error) => "✗",
+        _ => "·",
+    }
+}
+
+fn tone_color(palette: &Palette, tone: Option<MetadataTone>) -> Rgb {
+    match tone {
+        Some(MetadataTone::Success) => palette.green,
+        Some(MetadataTone::Error) => palette.red,
+        Some(MetadataTone::Warn) => palette.yellow,
+        Some(MetadataTone::Info) => palette.blue,
+        _ => palette.overlay0,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StyledLine {
     parts: Vec<StyledPart>,
@@ -1022,12 +1448,434 @@ const CATPPUCCIN_LATTE: Palette = Palette {
     surface2: Rgb::new(172, 176, 190),
 };
 
+const CATPPUCCIN_FRAPPE: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(141, 164, 226),
+    lavender: Rgb::new(186, 187, 241),
+    pink: Rgb::new(244, 184, 228),
+    yellow: Rgb::new(229, 200, 144),
+    green: Rgb::new(166, 209, 137),
+    red: Rgb::new(231, 130, 132),
+    peach: Rgb::new(239, 159, 118),
+    teal: Rgb::new(129, 200, 190),
+    sky: Rgb::new(153, 209, 219),
+    text: Rgb::new(198, 208, 245),
+    subtext0: Rgb::new(165, 173, 206),
+    subtext1: Rgb::new(181, 191, 226),
+    overlay0: Rgb::new(98, 104, 128),
+    overlay1: Rgb::new(81, 87, 109),
+    surface1: Rgb::new(81, 87, 109),
+    surface2: Rgb::new(98, 104, 128),
+};
+
+const CATPPUCCIN_MACCHIATO: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(138, 173, 244),
+    lavender: Rgb::new(183, 189, 248),
+    pink: Rgb::new(245, 189, 230),
+    yellow: Rgb::new(238, 212, 159),
+    green: Rgb::new(166, 218, 149),
+    red: Rgb::new(237, 135, 150),
+    peach: Rgb::new(245, 169, 127),
+    teal: Rgb::new(139, 213, 202),
+    sky: Rgb::new(145, 215, 227),
+    text: Rgb::new(202, 211, 245),
+    subtext0: Rgb::new(165, 173, 203),
+    subtext1: Rgb::new(184, 192, 224),
+    overlay0: Rgb::new(91, 96, 120),
+    overlay1: Rgb::new(73, 77, 100),
+    surface1: Rgb::new(73, 77, 100),
+    surface2: Rgb::new(91, 96, 120),
+};
+
+const TOKYO_NIGHT: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(122, 162, 247),
+    lavender: Rgb::new(187, 154, 247),
+    pink: Rgb::new(187, 154, 247),
+    yellow: Rgb::new(224, 175, 104),
+    green: Rgb::new(158, 206, 106),
+    red: Rgb::new(247, 118, 142),
+    peach: Rgb::new(255, 158, 100),
+    teal: Rgb::new(115, 218, 202),
+    sky: Rgb::new(125, 207, 255),
+    text: Rgb::new(192, 202, 245),
+    subtext0: Rgb::new(169, 177, 214),
+    subtext1: Rgb::new(154, 165, 206),
+    overlay0: Rgb::new(86, 95, 137),
+    overlay1: Rgb::new(65, 72, 104),
+    surface1: Rgb::new(41, 46, 66),
+    surface2: Rgb::new(52, 58, 82),
+};
+
+const GRUVBOX_DARK: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(131, 165, 152),
+    lavender: Rgb::new(211, 134, 155),
+    pink: Rgb::new(211, 134, 155),
+    yellow: Rgb::new(250, 189, 47),
+    green: Rgb::new(184, 187, 38),
+    red: Rgb::new(251, 73, 52),
+    peach: Rgb::new(254, 128, 25),
+    teal: Rgb::new(142, 192, 124),
+    sky: Rgb::new(131, 165, 152),
+    text: Rgb::new(235, 219, 178),
+    subtext0: Rgb::new(213, 196, 161),
+    subtext1: Rgb::new(189, 174, 147),
+    overlay0: Rgb::new(102, 92, 84),
+    overlay1: Rgb::new(124, 111, 100),
+    surface1: Rgb::new(80, 73, 69),
+    surface2: Rgb::new(102, 92, 84),
+};
+
+const NORD: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(129, 161, 193),
+    lavender: Rgb::new(180, 142, 173),
+    pink: Rgb::new(180, 142, 173),
+    yellow: Rgb::new(235, 203, 139),
+    green: Rgb::new(163, 190, 140),
+    red: Rgb::new(191, 97, 106),
+    peach: Rgb::new(208, 135, 112),
+    teal: Rgb::new(143, 188, 187),
+    sky: Rgb::new(136, 192, 208),
+    text: Rgb::new(236, 239, 244),
+    subtext0: Rgb::new(216, 222, 233),
+    subtext1: Rgb::new(229, 233, 240),
+    overlay0: Rgb::new(76, 86, 106),
+    overlay1: Rgb::new(67, 76, 94),
+    surface1: Rgb::new(67, 76, 94),
+    surface2: Rgb::new(76, 86, 106),
+};
+
+const DRACULA: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(139, 233, 253),
+    lavender: Rgb::new(189, 147, 249),
+    pink: Rgb::new(255, 121, 198),
+    yellow: Rgb::new(241, 250, 140),
+    green: Rgb::new(80, 250, 123),
+    red: Rgb::new(255, 85, 85),
+    peach: Rgb::new(255, 184, 108),
+    teal: Rgb::new(139, 233, 253),
+    sky: Rgb::new(139, 233, 253),
+    text: Rgb::new(248, 248, 242),
+    subtext0: Rgb::new(191, 191, 191),
+    subtext1: Rgb::new(98, 114, 164),
+    overlay0: Rgb::new(98, 114, 164),
+    overlay1: Rgb::new(86, 87, 97),
+    surface1: Rgb::new(68, 71, 90),
+    surface2: Rgb::new(98, 114, 164),
+};
+
+const GITHUB_DARK: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(88, 166, 255),
+    lavender: Rgb::new(188, 140, 255),
+    pink: Rgb::new(188, 140, 255),
+    yellow: Rgb::new(227, 179, 65),
+    green: Rgb::new(63, 185, 80),
+    red: Rgb::new(248, 81, 73),
+    peach: Rgb::new(210, 153, 34),
+    teal: Rgb::new(57, 197, 207),
+    sky: Rgb::new(88, 166, 255),
+    text: Rgb::new(201, 209, 217),
+    subtext0: Rgb::new(139, 148, 158),
+    subtext1: Rgb::new(177, 186, 196),
+    overlay0: Rgb::new(72, 79, 88),
+    overlay1: Rgb::new(48, 54, 61),
+    surface1: Rgb::new(33, 38, 45),
+    surface2: Rgb::new(48, 54, 61),
+};
+
+const ONE_DARK: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(97, 175, 239),
+    lavender: Rgb::new(198, 120, 221),
+    pink: Rgb::new(198, 120, 221),
+    yellow: Rgb::new(229, 192, 123),
+    green: Rgb::new(152, 195, 121),
+    red: Rgb::new(224, 108, 117),
+    peach: Rgb::new(209, 154, 102),
+    teal: Rgb::new(86, 182, 194),
+    sky: Rgb::new(97, 175, 239),
+    text: Rgb::new(171, 178, 191),
+    subtext0: Rgb::new(130, 137, 151),
+    subtext1: Rgb::new(92, 99, 112),
+    overlay0: Rgb::new(92, 99, 112),
+    overlay1: Rgb::new(75, 82, 99),
+    surface1: Rgb::new(75, 82, 99),
+    surface2: Rgb::new(92, 99, 112),
+};
+
+const KANAGAWA: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(126, 156, 216),
+    lavender: Rgb::new(149, 127, 184),
+    pink: Rgb::new(210, 126, 153),
+    yellow: Rgb::new(215, 166, 87),
+    green: Rgb::new(152, 187, 108),
+    red: Rgb::new(232, 36, 36),
+    peach: Rgb::new(255, 160, 102),
+    teal: Rgb::new(122, 168, 159),
+    sky: Rgb::new(127, 180, 202),
+    text: Rgb::new(220, 215, 186),
+    subtext0: Rgb::new(200, 192, 147),
+    subtext1: Rgb::new(114, 113, 105),
+    overlay0: Rgb::new(114, 113, 105),
+    overlay1: Rgb::new(84, 84, 109),
+    surface1: Rgb::new(84, 84, 109),
+    surface2: Rgb::new(114, 113, 105),
+};
+
+const EVERFOREST: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(127, 187, 179),
+    lavender: Rgb::new(214, 153, 182),
+    pink: Rgb::new(214, 153, 182),
+    yellow: Rgb::new(219, 188, 127),
+    green: Rgb::new(167, 192, 128),
+    red: Rgb::new(230, 126, 128),
+    peach: Rgb::new(230, 152, 117),
+    teal: Rgb::new(131, 192, 146),
+    sky: Rgb::new(127, 187, 179),
+    text: Rgb::new(211, 198, 170),
+    subtext0: Rgb::new(157, 169, 160),
+    subtext1: Rgb::new(122, 132, 120),
+    overlay0: Rgb::new(122, 132, 120),
+    overlay1: Rgb::new(133, 146, 137),
+    surface1: Rgb::new(61, 72, 77),
+    surface2: Rgb::new(71, 82, 88),
+};
+
+const MATERIAL: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(130, 170, 255),
+    lavender: Rgb::new(199, 146, 234),
+    pink: Rgb::new(199, 146, 234),
+    yellow: Rgb::new(255, 203, 107),
+    green: Rgb::new(195, 232, 141),
+    red: Rgb::new(240, 113, 120),
+    peach: Rgb::new(247, 140, 108),
+    teal: Rgb::new(137, 221, 255),
+    sky: Rgb::new(130, 170, 255),
+    text: Rgb::new(238, 255, 255),
+    subtext0: Rgb::new(176, 190, 197),
+    subtext1: Rgb::new(84, 110, 122),
+    overlay0: Rgb::new(84, 110, 122),
+    overlay1: Rgb::new(55, 71, 79),
+    surface1: Rgb::new(69, 90, 100),
+    surface2: Rgb::new(84, 110, 122),
+};
+
+const COBALT2: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(0, 136, 255),
+    lavender: Rgb::new(154, 95, 235),
+    pink: Rgb::new(255, 157, 0),
+    yellow: Rgb::new(255, 198, 0),
+    green: Rgb::new(158, 255, 128),
+    red: Rgb::new(255, 0, 136),
+    peach: Rgb::new(255, 98, 140),
+    teal: Rgb::new(42, 255, 223),
+    sky: Rgb::new(0, 136, 255),
+    text: Rgb::new(255, 255, 255),
+    subtext0: Rgb::new(173, 183, 201),
+    subtext1: Rgb::new(102, 136, 170),
+    overlay0: Rgb::new(45, 90, 123),
+    overlay1: Rgb::new(31, 70, 98),
+    surface1: Rgb::new(35, 75, 107),
+    surface2: Rgb::new(45, 90, 123),
+};
+
+const FLEXOKI: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(67, 133, 190),
+    lavender: Rgb::new(139, 126, 200),
+    pink: Rgb::new(206, 93, 151),
+    yellow: Rgb::new(208, 162, 21),
+    green: Rgb::new(135, 154, 57),
+    red: Rgb::new(209, 77, 65),
+    peach: Rgb::new(218, 112, 44),
+    teal: Rgb::new(58, 169, 159),
+    sky: Rgb::new(67, 133, 190),
+    text: Rgb::new(206, 205, 195),
+    subtext0: Rgb::new(183, 181, 172),
+    subtext1: Rgb::new(135, 133, 128),
+    overlay0: Rgb::new(111, 110, 105),
+    overlay1: Rgb::new(87, 86, 83),
+    surface1: Rgb::new(52, 51, 49),
+    surface2: Rgb::new(64, 62, 60),
+};
+
+const AYU: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(89, 194, 255),
+    lavender: Rgb::new(210, 166, 255),
+    pink: Rgb::new(240, 113, 120),
+    yellow: Rgb::new(230, 180, 80),
+    green: Rgb::new(127, 217, 98),
+    red: Rgb::new(217, 87, 87),
+    peach: Rgb::new(255, 143, 64),
+    teal: Rgb::new(149, 230, 203),
+    sky: Rgb::new(57, 186, 230),
+    text: Rgb::new(191, 189, 182),
+    subtext0: Rgb::new(172, 182, 191),
+    subtext1: Rgb::new(86, 91, 102),
+    overlay0: Rgb::new(86, 91, 102),
+    overlay1: Rgb::new(108, 115, 128),
+    surface1: Rgb::new(15, 19, 26),
+    surface2: Rgb::new(17, 21, 28),
+};
+
+const AURA: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(130, 226, 255),
+    lavender: Rgb::new(162, 119, 255),
+    pink: Rgb::new(246, 148, 255),
+    yellow: Rgb::new(255, 202, 133),
+    green: Rgb::new(157, 255, 101),
+    red: Rgb::new(255, 103, 103),
+    peach: Rgb::new(255, 202, 133),
+    teal: Rgb::new(97, 255, 202),
+    sky: Rgb::new(130, 226, 255),
+    text: Rgb::new(237, 236, 238),
+    subtext0: Rgb::new(189, 189, 189),
+    subtext1: Rgb::new(109, 109, 109),
+    overlay0: Rgb::new(109, 109, 109),
+    overlay1: Rgb::new(45, 45, 45),
+    surface1: Rgb::new(31, 31, 43),
+    surface2: Rgb::new(45, 45, 45),
+};
+
+const MATRIX: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(48, 179, 255),
+    lavender: Rgb::new(199, 112, 255),
+    pink: Rgb::new(199, 112, 255),
+    yellow: Rgb::new(230, 255, 87),
+    green: Rgb::new(98, 255, 148),
+    red: Rgb::new(255, 75, 75),
+    peach: Rgb::new(255, 168, 61),
+    teal: Rgb::new(36, 246, 217),
+    sky: Rgb::new(48, 179, 255),
+    text: Rgb::new(98, 255, 148),
+    subtext0: Rgb::new(140, 163, 145),
+    subtext1: Rgb::new(74, 107, 85),
+    overlay0: Rgb::new(46, 74, 55),
+    overlay1: Rgb::new(30, 42, 27),
+    surface1: Rgb::new(24, 34, 24),
+    surface2: Rgb::new(30, 42, 27),
+};
+
+// Transparent uses the same palette as mocha (background transparency is
+// handled at the terminal level, not by the palette colors).
+const TRANSPARENT: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(137, 180, 250),
+    lavender: Rgb::new(180, 190, 254),
+    pink: Rgb::new(203, 166, 247),
+    yellow: Rgb::new(249, 226, 175),
+    green: Rgb::new(166, 227, 161),
+    red: Rgb::new(243, 139, 168),
+    peach: Rgb::new(250, 179, 135),
+    teal: Rgb::new(148, 226, 213),
+    sky: Rgb::new(137, 220, 235),
+    text: Rgb::new(205, 214, 244),
+    subtext0: Rgb::new(166, 173, 200),
+    subtext1: Rgb::new(186, 194, 222),
+    overlay0: Rgb::new(108, 112, 134),
+    overlay1: Rgb::new(127, 132, 156),
+    surface1: Rgb::new(69, 71, 90),
+    surface2: Rgb::new(88, 91, 112),
+};
+
+const SHADES_OF_PURPLE: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(158, 255, 255),
+    lavender: Rgb::new(179, 98, 255),
+    pink: Rgb::new(255, 98, 140),
+    yellow: Rgb::new(250, 208, 0),
+    green: Rgb::new(165, 255, 144),
+    red: Rgb::new(236, 58, 55),
+    peach: Rgb::new(255, 157, 0),
+    teal: Rgb::new(128, 255, 187),
+    sky: Rgb::new(158, 255, 255),
+    text: Rgb::new(255, 255, 255),
+    subtext0: Rgb::new(165, 153, 233),
+    subtext1: Rgb::new(126, 116, 179),
+    overlay0: Rgb::new(77, 33, 252),
+    overlay1: Rgb::new(105, 67, 255),
+    surface1: Rgb::new(34, 34, 68),
+    surface2: Rgb::new(45, 43, 85),
+};
+
+/// All built-in theme names, in display order. Used by the theme picker.
+pub const THEME_NAMES: &[&str] = &[
+    "catppuccin-mocha",
+    "catppuccin-latte",
+    "catppuccin-frappe",
+    "catppuccin-macchiato",
+    "tokyo-night",
+    "gruvbox-dark",
+    "nord",
+    "dracula",
+    "github-dark",
+    "one-dark",
+    "kanagawa",
+    "everforest",
+    "material",
+    "cobalt2",
+    "flexoki",
+    "ayu",
+    "aura",
+    "matrix",
+    "transparent",
+    "shades-of-purple",
+];
+
 /// Resolve a theme name to a built-in [`Palette`]. Unknown or missing names
 /// fall back to catppuccin-mocha so the default rendering keeps byte-for-byte
 /// parity with the reference ANSI snapshots.
 pub fn palette_for_theme(name: Option<&str>) -> Palette {
     match name {
         Some("catppuccin-latte") => CATPPUCCIN_LATTE,
+        Some("catppuccin-frappe") => CATPPUCCIN_FRAPPE,
+        Some("catppuccin-macchiato") => CATPPUCCIN_MACCHIATO,
+        Some("tokyo-night") => TOKYO_NIGHT,
+        Some("gruvbox-dark") => GRUVBOX_DARK,
+        Some("nord") => NORD,
+        Some("dracula") => DRACULA,
+        Some("github-dark") => GITHUB_DARK,
+        Some("one-dark") => ONE_DARK,
+        Some("kanagawa") => KANAGAWA,
+        Some("everforest") => EVERFOREST,
+        Some("material") => MATERIAL,
+        Some("cobalt2") => COBALT2,
+        Some("flexoki") => FLEXOKI,
+        Some("ayu") => AYU,
+        Some("aura") => AURA,
+        Some("matrix") => MATRIX,
+        Some("transparent") => TRANSPARENT,
+        Some("shades-of-purple") => SHADES_OF_PURPLE,
         _ => CATPPUCCIN_MOCHA,
     }
 }

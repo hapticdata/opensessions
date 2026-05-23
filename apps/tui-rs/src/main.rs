@@ -351,6 +351,8 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
                 height,
             })
         }
+        MouseEventKind::Drag(MouseButton::Left) => Some(UiMouse::Drag { y: mouse.row }),
+        MouseEventKind::Up(MouseButton::Left) => Some(UiMouse::DragEnd),
         _ => None,
     }
 }
@@ -373,11 +375,14 @@ fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => Some(UiKey::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(UiKey::Up),
+        KeyCode::Left => Some(UiKey::Left),
+        KeyCode::Right => Some(UiKey::Right),
         KeyCode::Char(ch) => Some(UiKey::Char(ch)),
         KeyCode::Tab => Some(UiKey::Tab { shift: false }),
         KeyCode::BackTab => Some(UiKey::Tab { shift: true }),
         KeyCode::Enter => Some(UiKey::Enter),
         KeyCode::Esc => Some(UiKey::Esc),
+        KeyCode::Backspace => Some(UiKey::Backspace),
         _ => None,
     }
 }

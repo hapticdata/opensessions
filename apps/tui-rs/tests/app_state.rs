@@ -1,7 +1,8 @@
-use opensessions_sidebar::app::{App, PanelFocus};
+use opensessions_sidebar::app::{App, Modal, PanelFocus};
 use opensessions_sidebar::generated::protocol::{
     ClientCommand, FocusUpdate, ServerMessage, SessionFilterMode,
 };
+use opensessions_sidebar::input::{UiKey, apply_ui_key};
 
 #[test]
 fn re_identify_message_resends_identify_pane_command() {
@@ -245,6 +246,12 @@ fn action_keys_queue_basic_session_commands() {
     app.handle_key_char('d');
     app.handle_key_char('x');
 
+    // 'x' now opens a kill confirmation modal instead of killing immediately
+    assert!(matches!(
+        app.modal,
+        Modal::KillConfirm { ref session_name } if session_name == "plane-pdf-word-formatting"
+    ));
+
     assert_eq!(
         app.drain_commands(),
         vec![
@@ -253,10 +260,17 @@ fn action_keys_queue_basic_session_commands() {
             ClientCommand::HideSession {
                 name: "plane-pdf-word-formatting".into()
             },
-            ClientCommand::KillSession {
-                name: "plane-pdf-word-formatting".into()
-            },
         ]
+    );
+
+    // Confirming with 'y' sends the KillSession command
+    apply_ui_key(&mut app, UiKey::Char('y'));
+    assert!(matches!(app.modal, Modal::None));
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::KillSession {
+            name: "plane-pdf-word-formatting".into()
+        }]
     );
 }
 
