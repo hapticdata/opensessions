@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -458,16 +458,28 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn list_active_windows(&self) -> Vec<ActiveWindow> {
-        self.client
+        let mut windows = Vec::<ActiveWindow>::new();
+        for window in self
+            .client
             .list_windows()
             .into_iter()
             .filter(|window| window.session_name != STASH_SESSION)
-            .map(|window| ActiveWindow {
+        {
+            let next = ActiveWindow {
                 id: window.id,
                 session_name: window.session_name,
                 active: window.active,
-            })
-            .collect()
+            };
+            if let Some(current) = windows.iter_mut().find(|current| current.id == next.id) {
+                if !current.active && next.active {
+                    *current = next;
+                }
+            } else {
+                windows.push(next);
+            }
+        }
+
+        windows
     }
 
     fn get_current_window_id(&self) -> Option<String> {
@@ -488,11 +500,13 @@ impl MuxProvider for TmuxProvider {
                 .or_insert(width);
         }
 
+        let mut seen_pane_ids = HashSet::new();
         panes
             .into_iter()
             .filter(|pane| {
                 pane.title == "opensessions-sidebar" && pane.session_name != STASH_SESSION
             })
+            .filter(|pane| seen_pane_ids.insert(pane.id.clone()))
             .map(|pane| SidebarPane {
                 pane_id: pane.id,
                 session_name: pane.session_name,
@@ -591,9 +605,10 @@ impl MuxProvider for TmuxProvider {
         let panes = self.client.list_panes(PaneScope::All);
         let mut window_pane_counts: HashMap<String, u32> = HashMap::new();
         let mut sidebars_by_window: HashMap<String, Vec<String>> = HashMap::new();
+        let mut seen_pane_ids = HashSet::new();
 
         for pane in panes {
-            if pane.session_name == STASH_SESSION {
+            if pane.session_name == STASH_SESSION || !seen_pane_ids.insert(pane.id.clone()) {
                 continue;
             }
             *window_pane_counts

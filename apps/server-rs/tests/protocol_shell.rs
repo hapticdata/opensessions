@@ -1822,6 +1822,68 @@ async fn http_toggle_spawns_sidebar_in_active_windows_when_hidden() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn http_toggle_spawns_once_for_grouped_sessions_that_share_a_window() {
+    let pid_file = test_pid_file("http-toggle-grouped-session-spawn");
+    let mux = Arc::new(HookMux {
+        sidebar_panes: Vec::new(),
+        active_windows: vec![
+            ActiveWindow {
+                id: "@1".to_string(),
+                session_name: "p2".to_string(),
+                active: false,
+            },
+            ActiveWindow {
+                id: "@1".to_string(),
+                session_name: "p2-5".to_string(),
+                active: true,
+            },
+            ActiveWindow {
+                id: "@2".to_string(),
+                session_name: "pi".to_string(),
+                active: true,
+            },
+        ],
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
+            ReadOnlyMuxStateSource::new(vec![mux.clone()]).with_sidebar_width(31),
+        ),
+    )
+    .await
+    .expect("server should start");
+
+    let response = post_text(server.addr(), "/toggle", "/dev/ttys-test|p2-5|@1").await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "response was {response}"
+    );
+    assert!(response.ends_with("\r\n\r\nok"));
+    assert_eq!(
+        *mux.spawn_calls.lock().unwrap(),
+        vec![
+            EnsureSpawnCall {
+                session_name: "p2-5".to_string(),
+                window_id: "@1".to_string(),
+                width: 31,
+                position: SidebarPosition::Left,
+            },
+            EnsureSpawnCall {
+                session_name: "pi".to_string(),
+                window_id: "@2".to_string(),
+                width: 31,
+                position: SidebarPosition::Left,
+            },
+        ]
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn http_agent_event_resolves_tmux_session_and_broadcasts_agent_state() {
     let pid_file = test_pid_file("http-agent-event");
     let mux = Arc::new(ServerMux {

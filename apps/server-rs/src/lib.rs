@@ -17,7 +17,7 @@ use opensessions_runtime::agent_watchers::{
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
-use opensessions_runtime::mux::{MuxProvider, SidebarPosition};
+use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
@@ -88,11 +88,7 @@ fn debug_log(line: impl AsRef<str>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(file, "[{now}] [server] {}", line.as_ref());
     }
 }
@@ -596,10 +592,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     "report-width width={width} session={:?} window={:?} \
                      active_session={is_active_session} current_window={is_current_window} \
                      accepted={} reason={}",
-                    context.session_name,
-                    context.window_id,
-                    decision.accepted,
-                    decision.reason,
+                    context.session_name, context.window_id, decision.accepted, decision.reason,
                 ));
                 if !decision.accepted {
                     return None;
@@ -1165,7 +1158,26 @@ impl ReadOnlyMuxStateSource {
         self.sidebar_coordinator.lock().unwrap().begin_warmup();
         let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
         for provider in providers {
+            let mut unique_windows = Vec::<ActiveWindow>::new();
             for window in provider.list_active_windows() {
+                if let Some(current) = unique_windows
+                    .iter_mut()
+                    .find(|current| current.id == window.id)
+                {
+                    if !current.active && window.active {
+                        *current = window;
+                    } else {
+                        debug_log(format!(
+                            "toggle_sidebar: skipping duplicate linked window session={} window={}",
+                            window.session_name, window.id,
+                        ));
+                    }
+                    continue;
+                }
+                unique_windows.push(window);
+            }
+
+            for window in unique_windows {
                 debug_log(format!(
                     "toggle_sidebar: spawning in session={} window={} width={width}",
                     window.session_name, window.id,
