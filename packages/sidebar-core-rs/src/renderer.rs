@@ -65,7 +65,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     let footer_sep_line = match app.fixture_name {
         Some("pane-opensessions-self") => 52,
         Some(_) => 53,
-        None => height.saturating_sub(2).max(detail_sep_line + 1),
+        None => height.saturating_sub(3).max(detail_sep_line + 1),
     };
     render_detail(app, &palette, &mut lines, footer_sep_line - 1);
 
@@ -75,6 +75,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     lines.push(separator(&palette, width));
     lines.push(footer_top(&palette, width));
     lines.push(footer_bottom(&palette, width));
+    lines.push(footer_lazydiff(&palette, width));
     while lines.len() < height {
         lines.push(StyledLine::blank());
     }
@@ -1072,6 +1073,15 @@ fn footer_top(palette: &Palette, width: usize) -> StyledLine {
 
 fn footer_bottom(palette: &Palette, width: usize) -> StyledLine {
     let hints: &[(&str, &str)] = &[("d", " hide"), ("x", " kill")];
+    let mut line = StyledLine::blank();
+    line.push(" ", palette.white);
+    line.push(" ", palette.overlay1);
+    push_hints_truncated(&mut line, palette, hints, width);
+    line.end(CellStyle::fg(palette.white))
+}
+
+fn footer_lazydiff(palette: &Palette, width: usize) -> StyledLine {
+    let hints: &[(&str, &str)] = &[("l", " lazydiff"), ("L", " new window")];
     let mut line = StyledLine::blank();
     line.push(" ", palette.white);
     line.push(" ", palette.overlay1);

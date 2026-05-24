@@ -8,7 +8,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::{SinkExt, StreamExt};
-use opensessions_sidebar::app::App;
+use opensessions_sidebar::app::{App, LaunchTarget};
 use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
 use opensessions_sidebar::client::{
     connect_ws, decode_server_message, encode_client_command, fire_quit_http, validate_hello,
@@ -223,6 +223,15 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    for launch in app.drain_launches() {
+                        let dir = app
+                            .focused_session
+                            .as_deref()
+                            .and_then(|name| app.sessions.iter().find(|s| s.name == name))
+                            .map(|s| s.dir.as_str())
+                            .unwrap_or(".");
+                        launch_lazydiff(launch, dir);
+                    }
                     terminal.draw(app)?;
                 } else if let Event::Resize(width, _) = event {
                     if let Some(app) = &mut app {
@@ -434,6 +443,41 @@ fn do_startup_refocus(pane_id: &str) {
         let _ = std::process::Command::new("tmux")
             .args(["select-pane", "-t", &plan.select_pane])
             .output();
+    }
+}
+
+fn launch_lazydiff(target: LaunchTarget, dir: &str) {
+    match target {
+        LaunchTarget::LazydiffTmux => {
+            let _ = std::process::Command::new("tmux")
+                .args(["new-window", "-c", dir, "lazydiff"])
+                .output();
+        }
+        LaunchTarget::LazydiffTerminal => {
+            #[cfg(target_os = "macos")]
+            {
+                // Open a new Terminal.app window and run lazydiff in the session dir.
+                let script = format!(
+                    "tell application \"Terminal\" to do script \"cd {} && lazydiff\"",
+                    dir.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &script])
+                    .output();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Fallback: try common terminal emulators.
+                let spawned = std::process::Command::new("x-terminal-emulator")
+                    .args(["-e", "sh", "-c", &format!("cd {} && lazydiff", dir)])
+                    .spawn();
+                if spawned.is_err() {
+                    let _ = std::process::Command::new("xterm")
+                        .args(["-e", "sh", "-c", &format!("cd {} && lazydiff", dir)])
+                        .spawn();
+                }
+            }
+        }
     }
 }
 

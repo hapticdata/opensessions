@@ -12,6 +12,14 @@ pub enum PanelFocus {
     Agents,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchTarget {
+    /// Open lazydiff in a new tmux window.
+    LazydiffTmux,
+    /// Open lazydiff in a new terminal window.
+    LazydiffTerminal,
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     None,
@@ -53,6 +61,7 @@ pub struct App {
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
     commands: Vec<ClientCommand>,
+    pending_launches: Vec<LaunchTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +96,7 @@ impl App {
             terminal_width: None,
             pane_identity: None,
             commands: Vec::new(),
+            pending_launches: Vec::new(),
         }
     }
 
@@ -203,6 +213,7 @@ impl App {
             terminal_width: None,
             pane_identity: None,
             commands: Vec::new(),
+            pending_launches: Vec::new(),
         };
 
         if name == "pane-opensessions-self" {
@@ -276,6 +287,8 @@ impl App {
                     };
                 }
             }
+            'l' => self.pending_launches.push(LaunchTarget::LazydiffTmux),
+            'L' => self.pending_launches.push(LaunchTarget::LazydiffTerminal),
             't' => self.open_theme_picker(),
             'f' => self.cycle_filter(),
             _ => {}
@@ -305,6 +318,10 @@ impl App {
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {
         self.commands.drain(..).collect()
+    }
+
+    pub fn drain_launches(&mut self) -> Vec<LaunchTarget> {
+        self.pending_launches.drain(..).collect()
     }
 
     pub fn commands_push(&mut self, command: ClientCommand) {
