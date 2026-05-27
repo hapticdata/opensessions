@@ -7,13 +7,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Star History](https://img.shields.io/github/stars/Ataraxy-Labs/opensessions?style=social)](https://github.com/Ataraxy-Labs/opensessions)
 
-tmux is all you need. make tmux great again :) 
+tmux is all you need. make tmux great again :)
 
 <img width="4180" height="2416" alt="amp-img-e686694168e21738-aesthetic" src="https://github.com/user-attachments/assets/2caaee1a-b3f5-4041-aa3c-5b3668aa1912" />
 
 `opensessions` is a sidebar for `tmux` when your sessions, agents, and localhost tabs start multiplying.
 
 It lives inside your existing tmux workflow instead of replacing it: one small pane for session switching, agent state, repo breadcrumbs, and quick jumps back into the right terminal.
+
+Built with Rust and [ratatui](https://ratatui.rs) for native performance and zero runtime dependencies.
 
 tmux is the only supported mux today. There is older zellij integration code in the repo, but it is not stable enough to document as supported; we are looking for maintainers who want to help bring it back to that bar.
 
@@ -22,7 +24,7 @@ tmux is the only supported mux today. There is older zellij integration code in 
 Requirements:
 
 - `tmux`
-- `bun`
+- `cargo` ([install Rust](https://rustup.rs))
 - [TPM](https://github.com/tmux-plugins/tpm)
 
 Add this to `~/.tmux.conf`:
@@ -38,14 +40,21 @@ tmux source-file ~/.tmux.conf
 ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
+Build the binaries:
+
+```bash
+cd ~/.tmux/plugins/opensessions
+cargo build --release
+```
+
 Open the sidebar with `prefix o → s`.
 
-TPM clones the repo into `~/.tmux/plugins/opensessions`. It does not install a standalone `opensessions` binary. `opensessions` runs from that checkout with your local `bun` installation.
+TPM clones the repo into `~/.tmux/plugins/opensessions`. The sidebar and server run as native Rust binaries from `target/release/`.
 
 If you want the same setup as a single shell command:
 
 ```bash
-grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
+grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins && cd ~/.tmux/plugins/opensessions && cargo build --release
 ```
 
 ## Update
@@ -56,7 +65,13 @@ Use TPM's built-in update (`prefix + U`) or run:
 ~/.tmux/plugins/tpm/bin/update_plugins opensessions
 ```
 
-The plugin automatically restarts the server on update so it picks up the new code. Toggle the sidebar back on with `prefix o → s` if it was open.
+Then rebuild:
+
+```bash
+cd ~/.tmux/plugins/opensessions && cargo build --release
+```
+
+The plugin automatically restarts the server on update so it picks up the new binary. Toggle the sidebar back on with `prefix o → s` if it was open.
 
 ## Uninstall
 
@@ -68,12 +83,6 @@ sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/uninstall.sh
 
 Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.conf` and run `prefix + alt + u` (TPM uninstall).
 
-## Support Status
-
-- `@opensessions/mux-tmux` and the tmux plugin flow are supported.
-- `@opensessions/mux-zellij` is still experimental.
-- The repo is organized for contributors around runnable apps, reusable packages, and host integrations.
-
 ## Today
 
 - Live agent state across sessions for Amp, Claude Code, Codex, and OpenCode.
@@ -82,7 +91,7 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
 - Fast switching with `j`/`k`, arrows, `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
 - `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, in-app theme switching, and plugin hooks for more mux providers or watchers.
-- Bun workspace, source-first execution, and a local server on `127.0.0.1:7391`.
+- Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local WebSocket server on `127.0.0.1:7391`.
 
 ## Programmatic API
 
@@ -113,17 +122,26 @@ Full reference: [docs/reference/programmatic-api.md](./docs/reference/programmat
 
 ## Local Development
 
-Smoke test from a local clone:
+Build and run from a local clone:
 
 ```bash
 git clone https://github.com/Ataraxy-Labs/opensessions.git
 cd opensessions
-bun install
-bun test
-bun run start:tui
+cargo build --release
+cargo test
 ```
 
-That starts the sidebar client and auto-launches the server if needed.
+Start the sidebar manually (outside tmux, for testing):
+
+```bash
+cargo run -p opensessions-sidebar
+```
+
+Start the server:
+
+```bash
+cargo run -p opensessions-server
+```
 
 For the full tmux workflow with keybindings, troubleshooting, and configuration options, follow the guide below.
 
@@ -152,27 +170,30 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 ### Apps
 
-- `apps/server` — Bun server bootstrap that wires together built-in mux providers and agent watchers
-- `apps/tui` — OpenTUI sidebar client built with Solid, plus the canonical sidebar launcher script
+- `apps/tui-rs/` — Rust ratatui sidebar client (connects to server over WebSocket)
+- `apps/server-rs/` — Rust server that assembles state from mux providers and agent watchers
+- `apps/sidebar-shim-rs/` — Lightweight shim for sidebar process management
+- `apps/tui/scripts/` — Shell scripts for tmux sidebar launch and session switching
 
 ### Packages
 
-- `packages/runtime` — shared runtime logic: tracker, config, plugin loader, server internals, themes, ordering
-- `packages/mux/contract` — mux contracts and capability guards exposed as `@opensessions/mux`
-- `packages/mux/providers/tmux` — tmux provider exposed as `@opensessions/mux-tmux`
-- `packages/mux/providers/zellij` — experimental zellij provider exposed as `@opensessions/mux-zellij`
-- `packages/mux/tmux-sdk` — lower-level typed tmux bindings used by tmux-aware code
+- `packages/runtime-rs/` — Shared Rust runtime: tmux provider, agent watchers, config, tracker, protocol
+- `packages/sidebar-core-rs/` — Core sidebar rendering logic, extractable for snapshot tests
+- `packages/sidebar-protocol-rs/` — Shared protocol types between server and sidebar
 
 ### Integrations
 
-- `opensessions.tmux` — root TPM entrypoint for users
-- `integrations/tmux-plugin` — tmux-facing scripts and host integration glue
+- `opensessions.tmux` — Root TPM entrypoint for users
+- `integrations/tmux-plugin/` — tmux-facing scripts and host integration glue
+- `integrations/amp/` — Amp agent integration
+- `integrations/pi-extension/` — Pi extension integration
 
 ## Current Caveats
 
 - The app is effectively pinned to `127.0.0.1:7391` today.
 - `theme`, `sidebarWidth`, `sidebarPosition`, `plugins`, and `mux` are wired through the runtime; other typed config fields are not all live yet.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
+- tmux is the only supported mux today.
 
 ## Star History
 
