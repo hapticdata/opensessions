@@ -5,7 +5,7 @@
 # Install:
 #   1. Add to .tmux.conf:  set -g @plugin 'Ataraxy-Labs/opensessions'
 #   2. Press prefix + I to install
-#   3. Requires: bun (https://bun.sh)
+#   3. Requires: cargo (https://rustup.rs) — build with: cargo build --release
 #
 # Default keybindings:
 #   prefix + o → s   — reveal and focus sidebar
@@ -75,10 +75,9 @@ if [ "$CURRENT_VERSION" != "$RUNNING_VERSION" ]; then
 
   echo -n "$CURRENT_VERSION" > "$VERSION_FILE"
 
-  # --- Bootstrap: install deps on version change ---
-  BUN_PATH="$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
-  if [ -x "$BUN_PATH" ]; then
-    (cd "$CURRENT_DIR" && "$BUN_PATH" install --frozen-lockfile 2>/tmp/opensessions-install.log) &
+  # --- Bootstrap: rebuild on version change if needed ---
+  if [ -x "$CURRENT_DIR/target/release/opensessions-sidebar" ]; then
+    : # Binary already built
   fi
 fi
 
