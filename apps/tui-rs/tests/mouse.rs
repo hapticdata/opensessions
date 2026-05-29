@@ -1,27 +1,50 @@
 use opensessions_sidebar::app::{App, PanelFocus};
 use opensessions_sidebar::generated::protocol::ClientCommand;
 use opensessions_sidebar::input::{UiMouse, apply_ui_mouse};
-use opensessions_sidebar::renderer::{HitTarget, compute_hit_map};
+use opensessions_sidebar::renderer::{HitTarget, compute_hit_map, detail_separator_row};
+use opensessions_sidebar::snapshot::{buffer_symbol_at, render_to_buffer};
 
 const W: u16 = 35;
 const H: u16 = 56;
 
 #[test]
-fn scroll_down_in_sessions_panel_moves_focus_and_queues_focus_session() {
+fn scroll_down_in_sessions_panel_moves_viewport_without_queueing_focus_command() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("opensessions".into());
+    let template = app.sessions[1].clone();
+    for idx in 0..30 {
+        let mut session = template.clone();
+        session.name = format!("extra-{idx}");
+        session.dir = format!("/tmp/extra-{idx}");
+        session.branch = "main".into();
+        app.sessions.push(session);
+    }
+    app.focused_session = Some("plane-feat-edit-pages-from-pi".into());
 
-    apply_ui_mouse(&mut app, UiMouse::ScrollDown { x: 5, y: 5 });
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::ScrollDown {
+            x: 5,
+            y: 5,
+            width: W,
+            height: H,
+        },
+    );
 
+    assert_eq!(app.session_scroll_offset(), 1);
     assert_eq!(
         app.focused_session.as_deref(),
-        Some("plane-pdf-word-formatting")
+        Some("plane-feat-edit-pages-from-pi")
     );
-    assert_eq!(
-        app.drain_commands(),
-        vec![ClientCommand::FocusSession {
-            name: "plane-pdf-word-formatting".into(),
-        }]
+    assert!(app.drain_commands().is_empty());
+
+    let buffer = render_to_buffer(&mut app, W, H);
+    let mut first_card_row = String::new();
+    for x in 0..W {
+        first_card_row.push_str(&buffer_symbol_at(&buffer, x, 3));
+    }
+    assert!(
+        first_card_row.contains("plane-feat-background-exports"),
+        "wheel scroll should move the viewport immediately instead of forcing the focused row back into view; got {first_card_row:?}",
     );
 }
 
@@ -31,7 +54,15 @@ fn scroll_up_in_agents_panel_moves_agent_focus() {
     app.focus_agents_panel();
     app.focused_agent_idx = 1;
 
-    apply_ui_mouse(&mut app, UiMouse::ScrollUp { x: 5, y: 45 });
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::ScrollUp {
+            x: 5,
+            y: 45,
+            width: W,
+            height: H,
+        },
+    );
 
     assert_eq!(app.focused_agent_idx, 0);
     assert_eq!(app.panel_focus, PanelFocus::Agents);
@@ -156,6 +187,33 @@ fn click_outside_any_target_is_a_noop() {
     let drained_after = app.drain_commands().len();
     assert_eq!(drained_before, 0);
     assert_eq!(drained_after, 0);
+}
+
+#[test]
+fn detail_separator_row_starts_drag_resize() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.detail_panel_height = 10;
+    let separator_row = detail_separator_row(&app, W, H);
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Click {
+            x: 5,
+            y: separator_row,
+            width: W,
+            height: H,
+        },
+    );
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Drag {
+            y: separator_row.saturating_sub(2),
+        },
+    );
+    apply_ui_mouse(&mut app, UiMouse::DragEnd);
+
+    assert_eq!(app.detail_panel_height, 12);
+    assert!(app.resize_drag_state.is_none());
 }
 
 #[test]

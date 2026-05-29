@@ -52,6 +52,49 @@ async fn writes_pid_file_without_newline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn server_installs_and_cleans_up_mux_hooks_for_state_source() {
+    #[derive(Debug, Default, Clone)]
+    struct HookStateSource {
+        setup_calls: Arc<Mutex<Vec<(String, u16)>>>,
+        cleanup_calls: Arc<AtomicUsize>,
+    }
+
+    impl StateSource for HookStateSource {
+        fn snapshot_json(&self) -> String {
+            r#"{"type":"state","sessions":[],"agents":{}}"#.to_string()
+        }
+
+        fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
+            self.setup_calls
+                .lock()
+                .unwrap()
+                .push((server_host.to_string(), server_port));
+        }
+
+        fn cleanup_mux_hooks(&self) {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let pid_file = test_pid_file("hooks");
+    let source = HookStateSource::default();
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(source.clone()),
+    )
+    .await
+    .expect("server should start");
+
+    assert_eq!(
+        source.setup_calls.lock().unwrap().as_slice(),
+        &[("127.0.0.1".to_string(), server.addr().port())]
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    assert_eq!(source.cleanup_calls.load(Ordering::SeqCst), 1);
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn post_quit_returns_ok_stops_server_and_removes_pid_file() {
     let pid_file = test_pid_file("quit");
     let server = start_server(ServerConfig::new("127.0.0.1", 0, &pid_file))
@@ -912,6 +955,7 @@ async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file)
@@ -975,17 +1019,20 @@ async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
         .await
         .expect("second report-width command should send");
 
-    let state = timeout(Duration::from_secs(1), receiver.next())
-        .await
-        .expect("clamped state broadcast should arrive before timeout")
-        .expect("clamped state broadcast should arrive")
-        .expect("clamped state broadcast should be valid");
-    assert_eq!(
-        state.as_text(),
-        Some(
-            r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":20,"initializing":true,"initLabel":"adjusting…","ts":1002}"#
-        )
-    );
+    let expected = r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":20,"initializing":true,"initLabel":"adjusting…","ts":1002}"#;
+    let mut saw_clamped = false;
+    for _ in 0..3 {
+        let state = timeout(Duration::from_secs(1), receiver.next())
+            .await
+            .expect("clamped state broadcast should arrive before timeout")
+            .expect("clamped state broadcast should arrive")
+            .expect("clamped state broadcast should be valid");
+        if state.as_text() == Some(expected) {
+            saw_clamped = true;
+            break;
+        }
+    }
+    assert!(saw_clamped, "expected clamped sidebar width state");
 
     server.shutdown().await.expect("server should shut down");
     let _ = fs::remove_file(pid_file);
@@ -1004,6 +1051,7 @@ async fn websocket_report_width_rejects_identified_background_sidebar() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file)
@@ -1660,11 +1708,18 @@ async fn http_resize_hooks_return_ok_for_tmux_hook_compatibility() {
 async fn http_pane_exited_returns_ok_and_kills_orphaned_sidebar_panes() {
     let pid_file = test_pid_file("http-pane-exited");
     let mux = Arc::new(HookMux {
-        sidebar_panes: Vec::new(),
+        sidebar_panes: vec![SidebarPane {
+            pane_id: "%sidebar".to_string(),
+            session_name: "worker".to_string(),
+            window_id: "@2".to_string(),
+            width: Some(62),
+            window_width: Some(160),
+        }],
         active_windows: Vec::new(),
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file)
@@ -1680,9 +1735,83 @@ async fn http_pane_exited_returns_ok_and_kills_orphaned_sidebar_panes() {
     );
     assert!(response.ends_with("\r\n\r\nok"));
     assert_eq!(*mux.orphan_cleanup_calls.lock().unwrap(), 1);
+    assert_eq!(
+        *mux.resize_calls.lock().unwrap(),
+        vec![("%sidebar".to_string(), 26)],
+        "pane-exit layout churn must re-enforce the coordinator-owned sidebar width instead of adopting tmux's redistributed width",
+    );
 
     server.shutdown().await.expect("server should shut down");
     let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_pane_layout_changed_reenforces_drifted_sidebar_width() {
+    let pid_file = test_pid_file("http-pane-layout-changed");
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![SidebarPane {
+            pane_id: "%sidebar".to_string(),
+            session_name: "worker".to_string(),
+            window_id: "@2".to_string(),
+            width: Some(60),
+            window_width: Some(160),
+        }],
+        active_windows: Vec::new(),
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
+            ReadOnlyMuxStateSource::new(vec![mux.clone()]).with_sidebar_width(40),
+        ),
+    )
+    .await
+    .expect("server should start");
+
+    let response = post_text(server.addr(), "/pane-layout-changed", "").await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "response was {response}"
+    );
+    assert!(response.ends_with("\r\n\r\nok"));
+    assert_eq!(
+        *mux.resize_calls.lock().unwrap(),
+        vec![("%sidebar".to_string(), 40)],
+        "layout changes may only borrow coordinator-owned width for correction",
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+fn state_source_corrects_sidebar_width_drift_after_settle() {
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![SidebarPane {
+            pane_id: "%sidebar".to_string(),
+            session_name: "worker".to_string(),
+            window_id: "@2".to_string(),
+            width: Some(60),
+            window_width: Some(160),
+        }],
+        active_windows: Vec::new(),
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let source = ReadOnlyMuxStateSource::new(vec![mux.clone()]).with_sidebar_width(40);
+
+    assert!(!source.correct_sidebar_width_drift_after_settle(1_000));
+    assert!(mux.resize_calls.lock().unwrap().is_empty());
+
+    assert!(source.correct_sidebar_width_drift_after_settle(1_300));
+    assert_eq!(
+        *mux.resize_calls.lock().unwrap(),
+        vec![("%sidebar".to_string(), 40)],
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1698,6 +1827,7 @@ async fn http_ensure_sidebar_spawns_missing_sidebar_in_context_window() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
@@ -1742,6 +1872,7 @@ async fn http_toggle_hides_existing_sidebar_panes() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file)
@@ -1783,6 +1914,7 @@ async fn http_toggle_spawns_sidebar_in_active_windows_when_hidden() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
@@ -1846,6 +1978,7 @@ async fn http_toggle_spawns_once_for_grouped_sessions_that_share_a_window() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let server = start_server(
         ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
@@ -2286,6 +2419,7 @@ fn state_source_reports_warmup_after_ensure_sidebar_spawns() {
         spawn_calls: Mutex::new(Vec::new()),
         hide_calls: Mutex::new(Vec::new()),
         orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
     });
     let source = ReadOnlyMuxStateSource::new(vec![mux]);
 
@@ -2635,6 +2769,7 @@ struct HookMux {
     spawn_calls: Mutex<Vec<EnsureSpawnCall>>,
     hide_calls: Mutex<Vec<String>>,
     orphan_cleanup_calls: Mutex<usize>,
+    resize_calls: Mutex<Vec<(String, u16)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2729,6 +2864,13 @@ impl MuxProvider for HookMux {
 
     fn kill_orphaned_sidebar_panes(&self) {
         *self.orphan_cleanup_calls.lock().unwrap() += 1;
+    }
+
+    fn resize_sidebar_pane(&self, pane_id: &str, width: u16) {
+        self.resize_calls
+            .lock()
+            .unwrap()
+            .push((pane_id.to_string(), width));
     }
 }
 

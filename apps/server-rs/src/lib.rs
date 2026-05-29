@@ -68,6 +68,8 @@ const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 // many milliseconds, then the next snapshot tick clears it so the sidebar
 // stops showing "adjusting…".
 const USER_DRAG_SETTLE_MS: u64 = 600;
+const SIDEBAR_WARMUP_MS: u64 = 1_200;
+const SIDEBAR_DRIFT_CORRECTION_MS: u64 = 300;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -95,6 +97,10 @@ fn debug_log(line: impl AsRef<str>) {
 
 pub trait StateSource: Send + Sync + 'static {
     fn snapshot_json(&self) -> String;
+
+    fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+    fn cleanup_mux_hooks(&self) {}
 
     fn start_background_tasks(
         self: Arc<Self>,
@@ -301,8 +307,12 @@ pub struct ReadOnlyMuxStateSource {
     port_snapshot_cache: Mutex<Option<CachedPortSnapshot>>,
     git_command_runner: Arc<dyn GitCommandRunner>,
     git_info_cache: Mutex<HashMap<String, CachedGitInfo>>,
+    // The sidebar coordinator owns the single source of truth for the current
+    // width (`SidebarCoordinator::state().width`). Mirrors the TS server where
+    // `getSidebarWidth()` always reads from the XState coordinator — there is no
+    // separate mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
-    sidebar_width: Mutex<u32>,
+    sidebar_drift_detected_at: Mutex<Option<u64>>,
     focused_session: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
@@ -337,7 +347,7 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
-            sidebar_width: Mutex::new(26),
+            sidebar_drift_detected_at: Mutex::new(None),
             focused_session: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
@@ -350,9 +360,19 @@ impl ReadOnlyMuxStateSource {
     }
 
     pub fn with_sidebar_width(mut self, sidebar_width: u32) -> Self {
-        self.sidebar_width = Mutex::new(sidebar_width);
         self.sidebar_coordinator = Mutex::new(SidebarCoordinator::new(sidebar_width));
         self
+    }
+
+    /// Current sidebar width from the coordinator (single source of truth),
+    /// clamped to `u16` for the tmux resize APIs.
+    fn current_sidebar_width_u16(&self) -> u16 {
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .state()
+            .width
+            .min(u16::MAX as u32) as u16
     }
 
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
@@ -372,6 +392,18 @@ impl ReadOnlyMuxStateSource {
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
+    fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
+        for provider in &self.providers {
+            provider.setup_hooks(server_host, server_port);
+        }
+    }
+
+    fn cleanup_mux_hooks(&self) {
+        for provider in &self.providers {
+            provider.cleanup_hooks();
+        }
+    }
+
     fn start_background_tasks(
         self: Arc<Self>,
         state_updates: broadcast::Sender<String>,
@@ -464,7 +496,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             focused_session: self.focused_session.lock().unwrap().clone(),
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
-            sidebar_width: *self.sidebar_width.lock().unwrap(),
+            sidebar_width: sidebar_state.width,
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
@@ -597,10 +629,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if !decision.accepted {
                     return None;
                 }
-                *self.sidebar_width.lock().unwrap() = decision.next_width;
+                // The coordinator already holds the accepted width; do not keep a
+                // second mirror. Enforce the new width on every OTHER window, but
+                // skip the sender's whole window so we never fight the pane the
+                // user is actively dragging. Mirrors `enforceSidebarWidth(senderWindowId)`
+                // in the TS server.
                 self.enforce_sidebar_width(
                     decision.next_width.min(u16::MAX as u32) as u16,
-                    context.pane_id.as_deref(),
+                    context.window_id.as_deref(),
                 );
                 Some(self.snapshot_json())
             }
@@ -658,10 +694,13 @@ impl StateSource for ReadOnlyMuxStateSource {
             .and_then(Value::as_str)
             .map(ToString::to_string);
         debug_log(format!(
-            "identify-pane session={:?} pane={:?} window={:?} -> mark_ready",
+            "identify-pane session={:?} pane={:?} window={:?} -> acknowledge_sidebar_connected",
             context.session_name, context.pane_id, context.window_id,
         ));
-        self.sidebar_coordinator.lock().unwrap().mark_ready();
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .acknowledge_sidebar_connected();
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
@@ -782,8 +821,34 @@ impl StateSource for ReadOnlyMuxStateSource {
             "/toggle" => self.toggle_sidebar(),
             "/ensure-sidebar" => self.ensure_sidebar(body),
             "/pane-exited" => {
+                let now = (self.now_ms)();
+                let width = self.current_sidebar_width_u16();
+                {
+                    let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+                    coordinator.suppress_width_reports(now + 500);
+                    coordinator.begin_programmatic_adjustment_until(now + 700);
+                }
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
+                }
+                self.enforce_sidebar_width(width, None);
+            }
+            "/pane-layout-changed" => {
+                let now = (self.now_ms)();
+                let width = self.current_sidebar_width_u16();
+                if self.sidebar_width_drifted(width) {
+                    let should_enforce = {
+                        let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+                        coordinator.mark_ready();
+                        coordinator.begin_programmatic_adjustment_until(now + 700)
+                    };
+                    if should_enforce {
+                        self.sidebar_coordinator
+                            .lock()
+                            .unwrap()
+                            .suppress_width_reports(now + 500);
+                        self.enforce_sidebar_width(width, None);
+                    }
                 }
             }
             "/suppress-width-reports" => {
@@ -798,12 +863,8 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .lock()
                     .unwrap()
                     .begin_client_resize_sync(now + 500, now + 700);
-                let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
+                let width = self.current_sidebar_width_u16();
                 self.enforce_sidebar_width(width, None);
-                self.sidebar_coordinator
-                    .lock()
-                    .unwrap()
-                    .finish_client_resize_sync();
             }
             _ => {}
         }
@@ -997,18 +1058,80 @@ impl ReadOnlyMuxStateSource {
             .and_then(|event| event.pane_id)
     }
 
-    fn enforce_sidebar_width(&self, width: u16, except_pane_id: Option<&str>) {
+    /// Resize every sidebar pane to `width`, skipping any pane already at the
+    /// target width and any pane in `except_window_id` (the window that just
+    /// reported a user drag — we must not fight the pane the user is dragging).
+    /// Mirrors `enforceSidebarWidth(skipWindowId)` in the TS server. Returns
+    /// `true` if any pane was actually resized.
+    fn enforce_sidebar_width(&self, width: u16, except_window_id: Option<&str>) -> bool {
+        let mut resized = false;
         for provider in &self.providers {
             if !provider.is_sidebar_capable() {
                 continue;
             }
             for pane in provider.list_sidebar_panes(None) {
-                if except_pane_id == Some(pane.pane_id.as_str()) {
+                if except_window_id == Some(pane.window_id.as_str()) {
+                    continue;
+                }
+                if pane.width == Some(width) {
                     continue;
                 }
                 provider.resize_sidebar_pane(&pane.pane_id, width);
+                resized = true;
             }
         }
+        resized
+    }
+
+    fn sidebar_width_drifted(&self, width: u16) -> bool {
+        self.providers
+            .iter()
+            .filter(|provider| provider.is_sidebar_capable())
+            .flat_map(|provider| provider.list_sidebar_panes(None))
+            .any(|pane| pane.width.is_some_and(|pane_width| pane_width != width))
+    }
+
+    pub fn correct_sidebar_width_drift_after_settle(&self, now: u64) -> bool {
+        let width = self.current_sidebar_width_u16();
+        if !self.sidebar_width_drifted(width) {
+            *self.sidebar_drift_detected_at.lock().unwrap() = None;
+            return false;
+        }
+
+        {
+            let coordinator = self.sidebar_coordinator.lock().unwrap();
+            let state = coordinator.state();
+            if matches!(
+                state.resize_authority,
+                opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag
+                    | opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::ClientResizeSync
+            ) {
+                *self.sidebar_drift_detected_at.lock().unwrap() = None;
+                return false;
+            }
+        }
+
+        let mut drift_detected_at = self.sidebar_drift_detected_at.lock().unwrap();
+        let first_seen = *drift_detected_at.get_or_insert(now);
+        if now < first_seen.saturating_add(SIDEBAR_DRIFT_CORRECTION_MS) {
+            return false;
+        }
+        *drift_detected_at = None;
+        drop(drift_detected_at);
+
+        let should_enforce = {
+            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+            coordinator.mark_ready();
+            coordinator.begin_programmatic_adjustment_until(now + 700)
+        };
+        if !should_enforce {
+            return false;
+        }
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .suppress_width_reports(now + 500);
+        self.enforce_sidebar_width(width, None)
     }
 
     fn provider_for_session(&self, session: &str) -> Option<Arc<dyn MuxProvider>> {
@@ -1155,8 +1278,12 @@ impl ReadOnlyMuxStateSource {
             return;
         }
 
-        self.sidebar_coordinator.lock().unwrap().begin_warmup();
-        let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
+        let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .begin_warmup_until(warmup_until);
+        let width = self.current_sidebar_width_u16();
         for provider in providers {
             let mut unique_windows = Vec::<ActiveWindow>::new();
             for window in provider.list_active_windows() {
@@ -1195,6 +1322,15 @@ impl ReadOnlyMuxStateSource {
 
     fn ensure_sidebar(&self, body: &str) {
         let context = parse_context(body);
+        // A window switch / new window makes tmux proportionally redistribute the
+        // panes in that window, so the already-spawned sidebar panes can drift off
+        // the stored width. Correct every existing pane up front (a no-op when the
+        // sidebar does not exist yet) using the coordinator's single source of
+        // truth. This replaces the old per-tick enforcement loop and mirrors the
+        // `if (isSidebarVisible()) enforceSidebarWidth()` call in the TS
+        // `/ensure-sidebar` handler.
+        let width = self.current_sidebar_width_u16();
+        self.enforce_sidebar_width(width, None);
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
                 continue;
@@ -1217,8 +1353,11 @@ impl ReadOnlyMuxStateSource {
             {
                 continue;
             }
-            self.sidebar_coordinator.lock().unwrap().begin_warmup();
-            let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
+            let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+            self.sidebar_coordinator
+                .lock()
+                .unwrap()
+                .begin_warmup_until(warmup_until);
             provider.spawn_sidebar(
                 &session_name,
                 &window_id,
@@ -1297,13 +1436,10 @@ impl ReadOnlyMuxStateSource {
     }
 }
 
-/// Background ticker that polls the sidebar coordinator's UserDrag settle
-/// state and broadcasts a fresh snapshot the moment the settle window
-/// expires. Without this loop the websocket only sends an "adjusting…"
-/// state when the width report is processed and never sends the cleared
-/// "ready" state once the user stops resizing. Mirrors the
-/// `setTimeout(USER_DRAG_SETTLE_MS)` callback in
-/// `packages/runtime/src/server/index.ts::startTransientSidebarResize`.
+/// Background ticker that advances sidebar lifecycle timers. This keeps
+/// user-visible `warming up…` and `adjusting…` states stable long enough to be
+/// perceived, then broadcasts the transition back to ready without relying on
+/// unrelated tmux or websocket traffic.
 async fn run_drag_settle_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
@@ -1318,17 +1454,18 @@ async fn run_drag_settle_loop(
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
                 let now = (source.now_ms)();
-                let cleared = {
+                let changed = {
                     let mut coordinator = source.sidebar_coordinator.lock().unwrap();
                     let was_drag = coordinator.state().resize_authority
                         == opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag;
                     coordinator.tick_user_drag_settle(now, USER_DRAG_SETTLE_MS);
                     let is_drag = coordinator.state().resize_authority
                         == opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag;
-                    was_drag && !is_drag
+                    let drag_cleared = was_drag && !is_drag;
+                    coordinator.tick_timers(now) || drag_cleared
                 };
-                if cleared {
-                    debug_log("drag_settle_loop: UserDrag cleared, broadcasting fresh state");
+                if changed {
+                    debug_log("sidebar_lifecycle_loop: lifecycle changed, broadcasting fresh state");
                     let _ = state_updates.send(source.snapshot_json());
                 }
             }
@@ -1373,11 +1510,16 @@ async fn run_tmux_state_poll_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
-                // Re-enforce the configured sidebar width on every tick so
-                // tmux pane resizes by other clients are corrected. Mirrors
-                // `enforceSidebarWidth` in the TS server's tick.
-                let width = (*source.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
-                source.enforce_sidebar_width(width, None);
+                // NOTE: width enforcement is intentionally NOT done here. The TS
+                // reference server (`packages/runtime/src/server/index.ts`) has no
+                // periodic enforcement loop — `enforceSidebarWidth` only runs on
+                // discrete events (accepted `report-width`, `/ensure-sidebar`,
+                // `/client-resized`, `/toggle`, window switches). A per-tick
+                // enforce fought live user drags: it resized the pane the user was
+                // actively dragging and clobbered the `UserDrag` authority, which
+                // made the width snap back. Cross-client / monitor-switch drift is
+                // now corrected by the tmux `client-resized` and `after-select-window`
+                // hooks instead.
 
                 // Visiting (= becoming the current tmux session) clears the
                 // unseen-agents notification dot for that session, so `●`
@@ -1394,6 +1536,8 @@ async fn run_tmux_state_poll_loop(
                     last_current_session = current_session;
                 }
 
+                let corrected_sidebar_drift = source.correct_sidebar_width_drift_after_settle((source.now_ms)());
+
                 let snapshot = source.snapshot_json();
                 // Hash the snapshot ignoring the per-tick `ts` field so that
                 // identical state on consecutive ticks does not trigger a
@@ -1404,7 +1548,7 @@ async fn run_tmux_state_poll_loop(
                 let mut hasher = DefaultHasher::new();
                 stripped.hash(&mut hasher);
                 let hash = hasher.finish();
-                if hash != last_hash {
+                if corrected_sidebar_drift || hash != last_hash {
                     last_hash = hash;
                     debug_log("tmux_state_poll_loop: state changed, broadcasting");
                     let _ = state_updates.send(snapshot);
@@ -1985,11 +2129,14 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let (state_updates, _) = broadcast::channel(16);
     if let Some(source) = config.state_source.clone() {
-        let _background_tasks =
-            source.start_background_tasks(state_updates.clone(), shutdown.clone());
+        let _background_tasks = source
+            .clone()
+            .start_background_tasks(state_updates.clone(), shutdown.clone());
+        source.setup_mux_hooks(&config.host, addr.port());
     }
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
+    let cleanup_state_source = state_source.clone();
     let cleanup_shim_socket_path = shim_socket_path.clone();
     let task = tokio::spawn(async move {
         let result = run_accept_loop(
@@ -2001,6 +2148,9 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             shim_listener,
         )
         .await;
+        if let Some(source) = cleanup_state_source.as_ref() {
+            source.cleanup_mux_hooks();
+        }
         let cleanup_result = fs::remove_file(&config.pid_file);
         let socket_cleanup_result = fs::remove_file(&cleanup_shim_socket_path);
         match (result, cleanup_result, socket_cleanup_result) {
@@ -2990,6 +3140,7 @@ fn is_ok_hook_path(path: &str) -> bool {
         "/suppress-width-reports"
             | "/client-resized"
             | "/pane-exited"
+            | "/pane-layout-changed"
             | "/ensure-sidebar"
             | "/toggle"
     )

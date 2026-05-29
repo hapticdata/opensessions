@@ -21,7 +21,10 @@ fn pane_identity_prefers_explicit_spawn_context() {
 
 #[test]
 fn foreground_sidebar_reports_width_like_opentui_client() {
-    assert!(should_report_width(Some("opensessions"), Some("opensessions")));
+    assert!(should_report_width(
+        Some("opensessions"),
+        Some("opensessions")
+    ));
     assert!(!should_report_width(Some("opensessions"), Some("other")));
     assert!(!should_report_width(None, Some("opensessions")));
 }
@@ -117,5 +120,22 @@ fn report_width_command_uses_current_terminal_width() {
     assert_eq!(
         report_width_command(31, Some("opensessions"), Some("other")),
         None
+    );
+}
+
+#[test]
+fn startup_width_observation_does_not_report_width_as_user_intent() {
+    let main_rs = include_str!("../src/main.rs");
+
+    assert!(
+        main_rs.contains("app.set_terminal_width(width);\n                            last_reported_width = Some(u32::from(width));"),
+        "startup should only seed the local render width; the server-owned sidebar width must not be rewritten until a later foreground resize report",
+    );
+    assert!(
+        !main_rs.contains("if last_reported_width.is_none()")
+            || !main_rs.contains(
+                "report_width_command(\n                                u32::from(width)"
+            ),
+        "initial terminal-size observation must not send report-width, because tmux pane redistribution is not user drag intent",
     );
 }

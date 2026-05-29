@@ -2,13 +2,15 @@ use std::collections::HashMap;
 
 use ratatui::Frame;
 use ratatui::buffer::Cell;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{
+    Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Modal};
+use crate::app::{App, Modal, SESSION_CARD_HEIGHT};
 use crate::generated::protocol::{AgentEvent, AgentStatus, MetadataTone, SessionData};
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App) {
@@ -37,45 +39,39 @@ pub fn compute_hit_map(app: &App, width: u16, height: u16) -> Vec<Option<HitTarg
         .collect()
 }
 
+pub fn detail_separator_row(app: &App, width: u16, height: u16) -> u16 {
+    sidebar_layout(app, width, height).detail_separator.y
+}
+
 pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel {
     let palette = palette_for_theme(app.theme.as_deref());
     let width = app
         .terminal_width()
         .map(|value| value as usize)
         .unwrap_or(width);
+    let layout = sidebar_layout(app, width as u16, height as u16);
     let mut lines = vec![
         StyledLine::marker(CellStyle::fg(palette.white)),
         header(app, &palette, width),
         StyledLine::blank(),
     ];
-    let detail_sep_line = match app.fixture_name {
-        Some("pane-opensessions-self") => 39,
-        Some("pane-multi-window") => 36,
-        Some(_) => 44,
-        None => height
-            .saturating_sub(3 + app.detail_panel_height)
-            .max(4),
-    };
-    render_sessions(app, &palette, &mut lines, detail_sep_line - 1, width);
+    let detail_separator_row = layout.detail_separator.y as usize;
+    let session_scrollbar = render_sessions(app, &palette, &mut lines, detail_separator_row, width);
 
-    while lines.len() < detail_sep_line - 1 {
+    while lines.len() < detail_separator_row {
         lines.push(StyledLine::blank());
     }
     lines.push(separator(&palette, width));
-    let footer_sep_line = match app.fixture_name {
-        Some("pane-opensessions-self") => 52,
-        Some(_) => 53,
-        None => height.saturating_sub(3).max(detail_sep_line + 1),
-    };
-    render_detail(app, &palette, &mut lines, footer_sep_line - 1);
+    let footer_separator_row = layout.footer_separator.y as usize;
+    render_detail(app, &palette, &mut lines, footer_separator_row);
 
-    while lines.len() < footer_sep_line - 1 {
+    while lines.len() < footer_separator_row {
         lines.push(StyledLine::blank());
     }
     lines.push(separator(&palette, width));
-    lines.push(footer_top(&palette, width));
-    lines.push(footer_bottom(&palette, width));
-    lines.push(footer_lazydiff(&palette, width));
+    let [footer_top, footer_bottom] = footer(&palette, width);
+    lines.push(footer_top);
+    lines.push(footer_bottom);
     while lines.len() < height {
         lines.push(StyledLine::blank());
     }
@@ -85,7 +81,68 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
         render_modal_overlay(app, &palette, &mut lines, width, height);
     }
 
-    RenderModel { lines }
+    RenderModel {
+        lines,
+        layout,
+        session_scrollbar,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SidebarLayout {
+    header_rows: u16,
+    detail_separator: Rect,
+    footer_separator: Rect,
+}
+
+fn sidebar_layout(app: &App, width: u16, height: u16) -> SidebarLayout {
+    const HEADER_ROWS: u16 = 3;
+    const DETAIL_SEPARATOR_ROWS: u16 = 1;
+    const FOOTER_SEPARATOR_ROWS: u16 = 1;
+    const FOOTER_ROWS: u16 = 2;
+
+    let detail_separator_row = match app.fixture_name {
+        Some("pane-opensessions-self") => 38,
+        Some("pane-multi-window") => 35,
+        Some(_) => 43,
+        None => height
+            .saturating_sub(FOOTER_SEPARATOR_ROWS + FOOTER_ROWS + app.detail_panel_height as u16)
+            .saturating_sub(DETAIL_SEPARATOR_ROWS)
+            .max(HEADER_ROWS),
+    };
+    let footer_separator_row = match app.fixture_name {
+        Some("pane-opensessions-self") => 51,
+        Some(_) => 52,
+        None => height.saturating_sub(FOOTER_ROWS + FOOTER_SEPARATOR_ROWS),
+    }
+    .max(detail_separator_row + DETAIL_SEPARATOR_ROWS);
+
+    let session_rows = detail_separator_row.saturating_sub(HEADER_ROWS);
+    let detail_rows =
+        footer_separator_row.saturating_sub(detail_separator_row + DETAIL_SEPARATOR_ROWS);
+    let area = Rect::new(0, 0, width, height);
+    let [
+        _header,
+        _sessions,
+        detail_separator,
+        _detail,
+        footer_separator,
+        _footer,
+    ] = Layout::vertical([
+        Constraint::Length(HEADER_ROWS),
+        Constraint::Length(session_rows),
+        Constraint::Length(DETAIL_SEPARATOR_ROWS),
+        Constraint::Length(detail_rows),
+        Constraint::Length(FOOTER_SEPARATOR_ROWS),
+        Constraint::Length(FOOTER_ROWS),
+    ])
+    .areas(area);
+
+    SidebarLayout {
+        header_rows: HEADER_ROWS,
+        detail_separator,
+        footer_separator,
+    }
 }
 
 pub(crate) fn render_model(frame: &mut Frame<'_>, model: &RenderModel) {
@@ -95,32 +152,114 @@ pub(crate) fn render_model(frame: &mut Frame<'_>, model: &RenderModel) {
         .style(Style::default().fg(WHITE.color()))
         .render(screen, frame.buffer_mut());
 
-    let paragraph = Paragraph::new(
-        model
-            .lines
-            .iter()
-            .take(screen.height as usize)
-            .map(StyledLine::to_ratatui_line)
-            .collect::<Vec<_>>(),
+    let layout = model.layout;
+    let header = Rect::new(screen.x, screen.y, screen.width, layout.header_rows);
+    let sessions = Rect::new(
+        screen.x,
+        screen.y + layout.header_rows,
+        screen.width,
+        layout.detail_separator.y.saturating_sub(layout.header_rows),
     );
-    frame.render_widget(paragraph, screen);
+    let detail_separator = Rect::new(
+        screen.x,
+        screen.y + layout.detail_separator.y,
+        screen.width,
+        layout.detail_separator.height,
+    );
+    let detail = Rect::new(
+        screen.x,
+        screen.y + layout.detail_separator.y + layout.detail_separator.height,
+        screen.width,
+        layout
+            .footer_separator
+            .y
+            .saturating_sub(layout.detail_separator.y + layout.detail_separator.height),
+    );
+    let footer_separator = Rect::new(
+        screen.x,
+        screen.y + layout.footer_separator.y,
+        screen.width,
+        layout.footer_separator.height,
+    );
+    let footer = Rect::new(
+        screen.x,
+        screen.y + layout.footer_separator.y + layout.footer_separator.height,
+        screen.width,
+        screen
+            .height
+            .saturating_sub(layout.footer_separator.y + layout.footer_separator.height),
+    );
 
-    // Edge-to-edge highlight: ratatui's `Paragraph` only paints the cells
-    // covered by spans, leaving cells past `line.width()` with the underlying
-    // `Block` style (which has no bg). For lines that carry a bg (selected /
-    // flashed session rows, header etc.), patch those trailing cells so the
-    // highlight reaches the right edge of the pane — matching the TS gold
-    // reference, where opentui's `<box backgroundColor=…>` fills the row.
-    // Snapshot ANSI output is unaffected because `buffer_to_ansi` skips
-    // trailing space cells.
+    render_lines(frame, &model.lines, 0, header);
+    render_lines(frame, &model.lines, header.height as usize, sessions);
+    render_lines(
+        frame,
+        &model.lines,
+        layout.detail_separator.y as usize,
+        detail_separator,
+    );
+    render_lines(
+        frame,
+        &model.lines,
+        (layout.detail_separator.y + layout.detail_separator.height) as usize,
+        detail,
+    );
+    render_lines(
+        frame,
+        &model.lines,
+        layout.footer_separator.y as usize,
+        footer_separator,
+    );
+    render_lines(
+        frame,
+        &model.lines,
+        (layout.footer_separator.y + layout.footer_separator.height) as usize,
+        footer,
+    );
+
+    if let Some(scrollbar) = model.session_scrollbar {
+        let mut state = ScrollbarState::new(scrollbar.content_length)
+            .position(scrollbar.position)
+            .viewport_content_length(scrollbar.viewport_length);
+        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(Style::default().fg(scrollbar.track.color()))
+            .thumb_symbol("┃")
+            .thumb_style(Style::default().fg(scrollbar.thumb.color()));
+        widget.render(scrollbar.area, frame.buffer_mut(), &mut state);
+    }
+}
+
+fn render_lines(frame: &mut Frame<'_>, lines: &[StyledLine], start: usize, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let visible = lines
+        .iter()
+        .skip(start)
+        .take(area.height as usize)
+        .map(StyledLine::to_ratatui_line)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), area);
+
+    // Edge-to-edge highlight: ratatui's `Paragraph` only paints cells covered
+    // by spans. Patch trailing cells for rows that intentionally carry a bg so
+    // selection / flash highlights fill the full component width like OpenTUI.
     let buffer = frame.buffer_mut();
-    for (line_idx, line) in model.lines.iter().take(screen.height as usize).enumerate() {
+    for (offset, line) in lines
+        .iter()
+        .skip(start)
+        .take(area.height as usize)
+        .enumerate()
+    {
         let Some(bg) = line.bg else { continue };
         let bg_color = bg.color();
-        let y = screen.y + line_idx as u16;
-        let start = (line.width().min(screen.width as usize)) as u16;
-        for x in start..screen.width {
-            let cell_x = screen.x + x;
+        let y = area.y + offset as u16;
+        let start_x = (line.width().min(area.width as usize)) as u16;
+        for x in start_x..area.width {
+            let cell_x = area.x + x;
             if let Some(cell) = buffer.cell_mut((cell_x, y)) {
                 cell.set_bg(bg_color);
             }
@@ -131,6 +270,18 @@ pub(crate) fn render_model(frame: &mut Frame<'_>, model: &RenderModel) {
 #[derive(Debug, Clone)]
 pub(crate) struct RenderModel {
     lines: Vec<StyledLine>,
+    layout: SidebarLayout,
+    session_scrollbar: Option<ScrollbarSpec>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarSpec {
+    area: Rect,
+    content_length: usize,
+    position: usize,
+    viewport_length: usize,
+    track: Rgb,
+    thumb: Rgb,
 }
 
 impl RenderModel {
@@ -170,23 +321,29 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
     line.push(" ", palette.white);
     line.push("  ", palette.overlay1);
     line.push("Sessions", palette.subtext0);
-    line.push(format!(" {sessions}"), palette.overlay0);
-    if running > 0 {
-        let extra = format!(" ⚡{running}");
-        if line.width() + extra.width() <= width {
-            line.push(extra, palette.yellow);
-        }
-    }
+
     if app.initializing {
         let label = app.init_label.as_deref().unwrap_or("warming up…");
         let spinner_glyph = spinner(spinner_clock(app));
-        // " " + spinner + " " + label, all in cells.
-        let extra_cells = 1 + spinner_glyph.width() + 1 + label.width();
-        if line.width() + extra_cells <= width {
+        let init_cells = 1 + spinner_glyph.width() + 1 + label.width();
+        let count = format!(" {sessions}");
+        if line.width() + count.width() + init_cells <= width {
+            line.push(count, palette.overlay0);
+        }
+        if line.width() + init_cells <= width {
             line.push(" ", palette.white);
             line.push(spinner_glyph, palette.peach);
             line.push(" ", palette.white);
             line.push(label, palette.peach);
+        }
+    } else {
+        line.push(format!(" {sessions}"), palette.overlay0);
+    }
+
+    if running > 0 {
+        let extra = format!(" ⚡{running}");
+        if line.width() + extra.width() <= width {
+            line.push(extra, palette.yellow);
         }
     }
     if unseen > 0 {
@@ -204,11 +361,11 @@ fn render_sessions(
     lines: &mut Vec<StyledLine>,
     max_lines: usize,
     width: usize,
-) {
+) -> Option<ScrollbarSpec> {
     let start_offset = lines.len();
     let available = max_lines.saturating_sub(start_offset);
     if available == 0 {
-        return;
+        return None;
     }
 
     let blocks: Vec<Vec<StyledLine>> = app
@@ -217,7 +374,7 @@ fn render_sessions(
         .map(|(idx, session)| build_session_block(app, palette, idx, session, width))
         .collect();
     if blocks.is_empty() {
-        return;
+        return None;
     }
 
     let focused_block_idx = app
@@ -229,20 +386,17 @@ fn render_sessions(
         })
         .unwrap_or(0);
 
-    let (first_visible, last_visible) =
-        compute_session_window(&blocks, focused_block_idx, available);
-    let need_up_indicator = first_visible > 0;
-    let need_down_indicator = last_visible < blocks.len();
+    let visible_cards = available.div_ceil(SESSION_CARD_HEIGHT).max(1);
+    let max_first_visible = blocks.len().saturating_sub(visible_cards);
+    let first_visible = if app.session_scroll_follows_focus() {
+        compute_session_window_start_for_focus(focused_block_idx, visible_cards, max_first_visible)
+    } else {
+        app.session_scroll_offset().min(max_first_visible)
+    };
 
-    if need_up_indicator {
-        lines.push(scroll_indicator_line(palette, "▲", width));
-    }
-
-    let body_capacity = available
-        .saturating_sub(if need_up_indicator { 1 } else { 0 })
-        .saturating_sub(if need_down_indicator { 1 } else { 0 });
+    let body_capacity = available;
     let mut used = 0;
-    'outer: for block in blocks[first_visible..last_visible].iter() {
+    'outer: for block in blocks[first_visible..].iter() {
         for line in block {
             if used >= body_capacity {
                 break 'outer;
@@ -252,58 +406,34 @@ fn render_sessions(
         }
     }
 
-    if need_down_indicator {
-        let target = available.saturating_sub(1);
-        while lines.len() - start_offset < target {
-            lines.push(StyledLine::blank());
-        }
-        lines.push(scroll_indicator_line(palette, "▼", width));
+    while lines.len() - start_offset < available {
+        lines.push(StyledLine::blank());
+    }
+
+    let total_rows = blocks.len() * SESSION_CARD_HEIGHT;
+    if total_rows > available {
+        Some(ScrollbarSpec {
+            area: Rect::new(0, start_offset as u16, width as u16, available as u16),
+            content_length: total_rows,
+            position: first_visible * SESSION_CARD_HEIGHT,
+            viewport_length: available,
+            track: palette.surface2,
+            thumb: palette.overlay1,
+        })
+    } else {
+        None
     }
 }
 
-fn compute_session_window(
-    blocks: &[Vec<StyledLine>],
+fn compute_session_window_start_for_focus(
     focused_idx: usize,
-    available: usize,
-) -> (usize, usize) {
-    for first in 0..=focused_idx {
-        let need_up = first > 0;
-        let mut consumed = if need_up { 1 } else { 0 };
-        let mut last = first;
-        for (i, block) in blocks[first..].iter().enumerate() {
-            let block_idx = first + i;
-            let need_down = block_idx + 1 < blocks.len();
-            let reserve_down = if need_down { 1 } else { 0 };
-            if consumed + block.len() + reserve_down > available {
-                break;
-            }
-            consumed += block.len();
-            last = block_idx + 1;
-        }
-        if focused_idx < last {
-            return (first, last);
-        }
-    }
-    // Fallback: anchor focused block at the end of the window.
-    let mut first = focused_idx;
-    let mut consumed = blocks[focused_idx].len() + 1; // up indicator reserved
-    while first > 0 {
-        let prev = &blocks[first - 1];
-        if consumed + prev.len() > available {
-            break;
-        }
-        consumed += prev.len();
-        first -= 1;
-    }
-    (first, focused_idx + 1)
-}
-
-fn scroll_indicator_line(palette: &Palette, glyph: &str, width: usize) -> StyledLine {
-    let mut line = StyledLine::blank();
-    let pad = width.saturating_sub(2);
-    line.push(" ".repeat(pad), palette.white);
-    line.push(glyph, palette.overlay0);
-    line.end(CellStyle::fg(palette.white))
+    visible_cards: usize,
+    max_first_visible: usize,
+) -> usize {
+    focused_idx
+        .saturating_add(1)
+        .saturating_sub(visible_cards)
+        .min(max_first_visible)
 }
 
 fn build_session_block(
@@ -343,9 +473,7 @@ fn build_session_block(
     row.push(format!(" {index:>1}"), index_color);
     row.push(" ", palette.white);
     row.push(&session.name, name_color);
-    block.push(
-        with_status(palette, row, session, width, spinner_clock(app)).with_hit(hit.clone()),
-    );
+    block.push(with_status(palette, row, session, width, spinner_clock(app)).with_hit(hit.clone()));
 
     if let Some(dir) = dir_name(session) {
         let color = if focused {
@@ -385,11 +513,7 @@ fn build_session_block(
             let port_text = if session.ports.len() == 1 {
                 format!("  ⌁{}", session.ports[0])
             } else {
-                format!(
-                    "  ⌁{}+{}",
-                    session.ports[0],
-                    session.ports.len() - 1
-                )
+                format!("  ⌁{}+{}", session.ports[0], session.ports.len() - 1)
             };
             line.push(port_text, port_color);
         }
@@ -405,21 +529,17 @@ fn build_session_block(
     if let Some(metadata) = &session.metadata {
         let mut summary_parts: Vec<(String, Rgb)> = Vec::new();
         if let Some(status) = &metadata.status {
-            summary_parts.push((
-                status.text.clone(),
-                tone_color(palette, status.tone),
-            ));
+            summary_parts.push((status.text.clone(), tone_color(palette, status.tone)));
         }
         if let Some(progress) = &metadata.progress {
-            let progress_text = if let (Some(current), Some(total)) =
-                (progress.current, progress.total)
-            {
-                format!("{current}/{total}")
-            } else if let Some(percent) = progress.percent {
-                format!("{percent:.0}%")
-            } else {
-                String::new()
-            };
+            let progress_text =
+                if let (Some(current), Some(total)) = (progress.current, progress.total) {
+                    format!("{current}/{total}")
+                } else if let Some(percent) = progress.percent {
+                    format!("{percent:.0}%")
+                } else {
+                    String::new()
+                };
             if !progress_text.is_empty() {
                 summary_parts.push((progress_text, palette.sky));
             }
@@ -451,14 +571,28 @@ fn build_session_block(
         }
     }
 
-    if focused {
-        block.push(StyledLine::marker(CellStyle {
+    while block.len() < SESSION_CARD_HEIGHT.saturating_sub(1) {
+        block.push(
+            StyledLine::with_bg(bg)
+                .with_hit(hit.clone())
+                .end(CellStyle {
+                    fg: palette.white,
+                    bg,
+                }),
+        );
+    }
+
+    block.truncate(SESSION_CARD_HEIGHT.saturating_sub(1));
+
+    let footer = if focused {
+        StyledLine::marker(CellStyle {
             fg: palette.white,
             bg: None,
-        }));
+        })
     } else {
-        block.push(StyledLine::blank());
-    }
+        StyledLine::blank()
+    };
+    block.push(footer.with_hit(hit));
 
     block
 }
@@ -492,12 +626,7 @@ fn with_status(
     })
 }
 
-fn render_detail(
-    app: &App,
-    palette: &Palette,
-    lines: &mut Vec<StyledLine>,
-    max_lines: usize,
-) {
+fn render_detail(app: &App, palette: &Palette, lines: &mut Vec<StyledLine>, max_lines: usize) {
     let Some(session) = app
         .focused_session
         .as_deref()
@@ -555,8 +684,8 @@ fn render_detail(
         .enumerate()
         .map(|(idx, agent)| {
             let mut block = Vec::with_capacity(2);
-            let focused = app.panel_focus == crate::app::PanelFocus::Agents
-                && app.focused_agent_idx == idx;
+            let focused =
+                app.panel_focus == crate::app::PanelFocus::Agents && app.focused_agent_idx == idx;
             let hit = HitTarget::Agent(idx);
             let flashed = app.active_flash_target() == Some(&hit);
             let highlight = focused || flashed;
@@ -967,12 +1096,13 @@ fn agent_row(
         }
         _ => {
             let suppress_status = is_terminal(agent) && agent.unseen == Some(true);
-            if !suppress_status
-                && let Some(status) = agent_status_text(agent)
-            {
+            if !suppress_status && let Some(status) = agent_status_text(agent) {
                 let spaces = 29_usize.saturating_sub(line.width() + status.width());
                 line.push(" ".repeat(spaces), palette.white);
-                line.push(status, agent_detail_color(palette, agent.status, session_unseen));
+                line.push(
+                    status,
+                    agent_detail_color(palette, agent.status, session_unseen),
+                );
                 line.push(" ✕", palette.overlay0);
             } else {
                 line.push("                         ", palette.white);
@@ -1055,63 +1185,38 @@ fn agent_detail_color(palette: &Palette, status: AgentStatus, unseen: bool) -> R
     }
 }
 
-fn footer_top(palette: &Palette, width: usize) -> StyledLine {
-    // Each hint is (key_glyph, key_separator_text). Hints are dropped from
-    // the right when the line cannot fit them in `width` cells, so the
-    // footer never shows a partial token like "agen" or "fil".
-    let hints: &[(&str, &str)] = &[
-        ("⇥", " cycle"),
-        ("⏎", " go"),
-        ("→", " agents"),
-        ("f", " filter"),
+fn footer(palette: &Palette, width: usize) -> [StyledLine; 2] {
+    let hints: &[(&str, Rgb)] = &[
+        (" ", palette.white),
+        ("⇥", palette.overlay0),
+        (" cycle  ", palette.overlay1),
+        ("⏎", palette.overlay0),
+        (" go  ", palette.overlay1),
+        ("→", palette.overlay0),
+        (" agents  ", palette.overlay1),
+        ("f", palette.overlay0),
+        (" filter  ", palette.overlay1),
+        ("d", palette.overlay0),
+        (" hide  ", palette.overlay1),
+        ("x", palette.overlay0),
+        (" kill", palette.overlay1),
     ];
     let mut line = StyledLine::blank();
-    line.push(" ", palette.white);
-    push_hints_truncated(&mut line, palette, hints, width);
-    line
-}
-
-fn footer_bottom(palette: &Palette, width: usize) -> StyledLine {
-    let hints: &[(&str, &str)] = &[("d", " hide"), ("x", " kill")];
-    let mut line = StyledLine::blank();
-    line.push(" ", palette.white);
-    line.push(" ", palette.overlay1);
-    push_hints_truncated(&mut line, palette, hints, width);
-    line.end(CellStyle::fg(palette.white))
-}
-
-fn footer_lazydiff(palette: &Palette, width: usize) -> StyledLine {
-    let hints: &[(&str, &str)] = &[("l", " lazydiff"), ("L", " new window")];
-    let mut line = StyledLine::blank();
-    line.push(" ", palette.white);
-    line.push(" ", palette.overlay1);
-    push_hints_truncated(&mut line, palette, hints, width);
-    line.end(CellStyle::fg(palette.white))
-}
-
-fn push_hints_truncated(
-    line: &mut StyledLine,
-    palette: &Palette,
-    hints: &[(&str, &str)],
-    width: usize,
-) {
-    const SEPARATOR: &str = "  ";
-    let mut first = true;
-    for (key, label) in hints {
-        let mut needed = key.width() + label.width();
-        if !first {
-            needed += SEPARATOR.width();
+    let mut wrapped = StyledLine::blank();
+    let mut on_wrapped_line = false;
+    for &(text, color) in hints {
+        if !on_wrapped_line && line.width() + text.width() > width {
+            on_wrapped_line = true;
         }
-        if line.width() + needed > width {
-            break;
+        if on_wrapped_line {
+            if wrapped.width() + text.width() <= width {
+                wrapped.push(text, color);
+            }
+        } else {
+            line.push(text, color);
         }
-        if !first {
-            line.push(SEPARATOR, palette.overlay1);
-        }
-        line.push(*key, palette.overlay0);
-        line.push(*label, palette.overlay1);
-        first = false;
     }
+    [line, wrapped.end(CellStyle::fg(palette.white))]
 }
 
 fn separator(palette: &Palette, width: usize) -> StyledLine {
@@ -1165,10 +1270,7 @@ fn is_unseen_terminal_status(agent: &AgentEvent, session_unseen: bool) -> bool {
     session_unseen
         && matches!(
             agent.status,
-            AgentStatus::Done
-                | AgentStatus::Error
-                | AgentStatus::Stale
-                | AgentStatus::Interrupted
+            AgentStatus::Done | AgentStatus::Error | AgentStatus::Stale | AgentStatus::Interrupted
         )
 }
 
@@ -1189,9 +1291,7 @@ fn spinner(ts: u64) -> &'static str {
 /// 120ms — the same period as the render tick in `apps/tui-rs/src/main.rs`,
 /// so the glyph advances exactly once per tick (smooth, no stutter).
 fn agent_spinner(ts: u64) -> &'static str {
-    const FRAMES: [&str; 10] = [
-        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-    ];
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     FRAMES[((ts / 120) as usize) % FRAMES.len()]
 }
 

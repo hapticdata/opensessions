@@ -60,6 +60,8 @@ pub struct SidebarCoordinator {
     drag_owner_window_id: Option<String>,
     last_width_report_decision: Option<SidebarWidthReportDecision>,
     last_user_drag_at: Option<u64>,
+    warmup_until: Option<u64>,
+    adjustment_until: Option<u64>,
 }
 
 impl SidebarCoordinator {
@@ -75,6 +77,8 @@ impl SidebarCoordinator {
             drag_owner_window_id: None,
             last_width_report_decision: None,
             last_user_drag_at: None,
+            warmup_until: None,
+            adjustment_until: None,
         }
     }
 
@@ -112,12 +116,19 @@ impl SidebarCoordinator {
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Warming;
         self.authority = SidebarResizeAuthority::None;
+        self.warmup_until = None;
         self.clear_drag_owner();
+    }
+
+    pub fn begin_warmup_until(&mut self, until: u64) {
+        self.begin_warmup();
+        self.warmup_until = Some(until);
     }
 
     pub fn warmup_done(&mut self) {
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Ready;
+        self.warmup_until = None;
         if self.authority == SidebarResizeAuthority::None {
             self.clear_drag_owner();
         }
@@ -126,12 +137,22 @@ impl SidebarCoordinator {
     pub fn mark_ready(&mut self) {
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Ready;
+        self.warmup_until = None;
+    }
+
+    pub fn acknowledge_sidebar_connected(&mut self) {
+        self.visible = true;
+        if self.lifecycle != SidebarLifecycle::Warming {
+            self.lifecycle = SidebarLifecycle::Ready;
+        }
     }
 
     pub fn hide(&mut self) {
         self.visible = false;
         self.lifecycle = SidebarLifecycle::Idle;
         self.authority = SidebarResizeAuthority::None;
+        self.warmup_until = None;
+        self.adjustment_until = None;
         self.clear_drag_owner();
     }
 
@@ -141,6 +162,7 @@ impl SidebarCoordinator {
         self.suppress_width_reports_until = self.suppress_width_reports_until.max(suppress_until);
         self.client_resize_report_guard_until =
             self.client_resize_report_guard_until.max(guard_until);
+        self.adjustment_until = Some(self.adjustment_until.unwrap_or(0).max(guard_until));
         self.clear_drag_owner();
     }
 
@@ -148,18 +170,47 @@ impl SidebarCoordinator {
         if self.authority == SidebarResizeAuthority::ClientResizeSync {
             self.authority = SidebarResizeAuthority::None;
         }
+        self.adjustment_until = None;
     }
 
-    pub fn begin_programmatic_adjustment(&mut self) {
-        self.visible = true;
-        self.authority = SidebarResizeAuthority::ProgrammaticAdjust;
-        self.clear_drag_owner();
+    /// Begin a programmatic (server-driven) width adjustment. Mirrors the TS
+    /// `startProgrammaticAdjustment` guard in `packages/runtime/src/server/index.ts`,
+    /// which early-returns when the sidebar is hidden or while a user drag /
+    /// client-resize-sync is in flight. Returning `false` (instead of blindly
+    /// overwriting the authority) is what prevents a background enforcement pass
+    /// from clobbering an active `UserDrag` and snapping the sidebar back to its
+    /// previous width.
+    pub fn begin_programmatic_adjustment(&mut self) -> bool {
+        if !self.visible {
+            return false;
+        }
+        match self.authority {
+            SidebarResizeAuthority::None => {
+                self.authority = SidebarResizeAuthority::ProgrammaticAdjust;
+                self.adjustment_until = None;
+                self.clear_drag_owner();
+                true
+            }
+            // Already adjusting — let the caller extend the settle deadline.
+            SidebarResizeAuthority::ProgrammaticAdjust => true,
+            // Never preempt a live user drag or an in-flight client resize sync.
+            SidebarResizeAuthority::UserDrag | SidebarResizeAuthority::ClientResizeSync => false,
+        }
+    }
+
+    pub fn begin_programmatic_adjustment_until(&mut self, until: u64) -> bool {
+        if !self.begin_programmatic_adjustment() {
+            return false;
+        }
+        self.adjustment_until = Some(until);
+        true
     }
 
     pub fn finish_programmatic_adjustment(&mut self) {
         if self.authority == SidebarResizeAuthority::ProgrammaticAdjust {
             self.authority = SidebarResizeAuthority::None;
         }
+        self.adjustment_until = None;
     }
 
     pub fn finish_user_drag(&mut self) {
@@ -168,6 +219,29 @@ impl SidebarCoordinator {
         }
         self.last_user_drag_at = None;
         self.clear_drag_owner();
+    }
+
+    pub fn tick_timers(&mut self, now: u64) -> bool {
+        let before = self.state();
+
+        if self.lifecycle == SidebarLifecycle::Warming
+            && self.warmup_until.is_some_and(|until| now >= until)
+        {
+            self.lifecycle = SidebarLifecycle::Ready;
+            self.warmup_until = None;
+        }
+
+        if self.adjustment_until.is_some_and(|until| now >= until) {
+            match self.authority {
+                SidebarResizeAuthority::ClientResizeSync => self.finish_client_resize_sync(),
+                SidebarResizeAuthority::ProgrammaticAdjust => self.finish_programmatic_adjustment(),
+                SidebarResizeAuthority::None | SidebarResizeAuthority::UserDrag => {
+                    self.adjustment_until = None;
+                }
+            }
+        }
+
+        before != self.state()
     }
 
     pub fn suppress_width_reports(&mut self, until: u64) {

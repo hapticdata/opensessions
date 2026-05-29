@@ -6,6 +6,8 @@ use crate::generated::protocol::{
 };
 use crate::renderer::HitTarget;
 
+pub const SESSION_CARD_HEIGHT: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelFocus {
     Sessions,
@@ -56,6 +58,8 @@ pub struct App {
     pub flash_deadline: Option<Instant>,
     pub modal: Modal,
     pub detail_panel_height: usize,
+    pub session_scroll_offset: usize,
+    session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
@@ -91,6 +95,8 @@ impl App {
             flash_deadline: None,
             modal: Modal::None,
             detail_panel_height: 10,
+            session_scroll_offset: 0,
+            session_scroll_follows_focus: true,
             resize_drag_state: None,
             fixture_name: None,
             terminal_width: None,
@@ -162,10 +168,13 @@ impl App {
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
+                self.clamp_session_scroll_offset(0);
+                self.session_scroll_follows_focus = true;
             }
             ServerMessage::Focus(update) => {
                 self.focused_session = update.focused_session;
                 self.current_session = update.current_session;
+                self.session_scroll_follows_focus = true;
             }
             ServerMessage::YourSession { name, .. } => {
                 self.my_session = Some(name);
@@ -208,6 +217,8 @@ impl App {
             flash_deadline: None,
             modal: Modal::None,
             detail_panel_height: 10,
+            session_scroll_offset: 0,
+            session_scroll_follows_focus: true,
             resize_drag_state: None,
             fixture_name: fixture_static_name(name),
             terminal_width: None,
@@ -282,9 +293,7 @@ impl App {
                 if self.panel_focus == PanelFocus::Agents {
                     self.kill_focused_agent_pane();
                 } else if let Some(name) = self.focused_session.clone() {
-                    self.modal = Modal::KillConfirm {
-                        session_name: name,
-                    };
+                    self.modal = Modal::KillConfirm { session_name: name };
                 }
             }
             'l' => self.pending_launches.push(LaunchTarget::LazydiffTmux),
@@ -343,7 +352,58 @@ impl App {
         self.focused_session = Some(name.clone());
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
+        self.session_scroll_follows_focus = true;
         self.commands.push(ClientCommand::FocusSession { name });
+    }
+
+    pub fn session_scroll_offset(&self) -> usize {
+        self.session_scroll_offset
+    }
+
+    pub fn session_scroll_follows_focus(&self) -> bool {
+        self.session_scroll_follows_focus
+    }
+
+    pub fn scroll_sessions(&mut self, delta: i8, viewport_rows: usize) {
+        let len = self.filtered_sessions().count();
+        if len == 0 || viewport_rows == 0 {
+            self.session_scroll_offset = 0;
+            return;
+        }
+
+        let visible_cards = visible_session_cards(viewport_rows);
+        let max_offset = len.saturating_sub(visible_cards);
+        let next_offset = if delta < 0 {
+            self.session_scroll_offset
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.session_scroll_offset.saturating_add(delta as usize)
+        }
+        .min(max_offset);
+
+        self.session_scroll_offset = next_offset;
+        self.session_scroll_follows_focus = false;
+        self.panel_focus = PanelFocus::Sessions;
+    }
+
+    pub fn ensure_focused_session_visible(&mut self, viewport_rows: usize) {
+        let Some((focused_idx, len)) = self.focused_filtered_index_and_len() else {
+            self.session_scroll_offset = 0;
+            return;
+        };
+        if viewport_rows == 0 {
+            return;
+        }
+
+        let visible_cards = visible_session_cards(viewport_rows);
+        let max_offset = len.saturating_sub(visible_cards);
+        if focused_idx < self.session_scroll_offset {
+            self.session_scroll_offset = focused_idx;
+        } else if focused_idx >= self.session_scroll_offset.saturating_add(visible_cards) {
+            self.session_scroll_offset =
+                focused_idx.saturating_add(1).saturating_sub(visible_cards);
+        }
+        self.session_scroll_offset = self.session_scroll_offset.min(max_offset);
     }
 
     pub fn focus_sessions_panel(&mut self) {
@@ -389,6 +449,7 @@ impl App {
     pub fn click_session(&mut self, name: String) {
         self.trigger_flash(HitTarget::Session(name.clone()));
         self.focused_session = Some(name.clone());
+        self.session_scroll_follows_focus = true;
         self.switch_to_session(name);
     }
 
@@ -531,6 +592,7 @@ impl App {
         self.focused_session = Some(name.clone());
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
+        self.session_scroll_follows_focus = true;
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
@@ -543,9 +605,18 @@ impl App {
             SessionFilterMode::Active => SessionFilterMode::Running,
             SessionFilterMode::Running => SessionFilterMode::All,
         };
+        self.clamp_session_scroll_offset(0);
         self.commands.push(ClientCommand::SetFilter {
             filter: self.session_filter,
         });
+    }
+
+    fn clamp_session_scroll_offset(&mut self, viewport_rows: usize) {
+        let len = self.filtered_sessions().count();
+        let visible_cards = visible_session_cards(viewport_rows);
+        self.session_scroll_offset = self
+            .session_scroll_offset
+            .min(len.saturating_sub(visible_cards));
     }
 
     fn focused_filtered_index_and_len(&self) -> Option<(usize, usize)> {
@@ -583,6 +654,10 @@ impl App {
         let agent = session.agents.get(self.focused_agent_idx)?;
         Some((session, agent))
     }
+}
+
+fn visible_session_cards(viewport_rows: usize) -> usize {
+    viewport_rows.div_ceil(SESSION_CARD_HEIGHT).max(1)
 }
 
 fn fixture_static_name(name: &str) -> Option<&'static str> {

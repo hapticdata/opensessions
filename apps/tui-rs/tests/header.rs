@@ -43,31 +43,29 @@ fn header_falls_back_to_warming_up_when_init_label_missing() {
 }
 
 #[test]
-fn header_at_narrow_width_omits_init_label_when_it_does_not_fit() {
-    // When the pane width is too narrow to fit "  Sessions N ◐ <label>",
-    // the renderer must omit the spinner+label section entirely rather than
-    // letting ratatui's Paragraph truncate it mid-word (e.g. "◐ adj").
+fn header_at_narrow_width_preserves_short_init_label() {
+    // The sidebar behavior contract says warming/adjusting states must be
+    // visible while spawn/width convergence is in flight. At the common 26-col
+    // fallback width, prefer the init label over secondary counters.
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.initializing = true;
-    app.init_label = Some("adjusting widths to fit".into());
+    app.init_label = Some("adjusting…".into());
     app.ts = 0;
 
-    let buffer = render_to_buffer(&mut app, 20, 10);
+    let buffer = render_to_buffer(&mut app, 26, 10);
 
     let mut header = String::new();
-    for x in 0..20 {
+    for x in 0..26 {
         header.push_str(&buffer_symbol_at(&buffer, x, 1));
     }
 
     assert!(
-        !header.contains("adj"),
-        "header at width=20 must drop the init_label section instead of \
-         showing a partial truncation; got: {header:?}",
+        header.contains("adjusting"),
+        "header at width=26 must show the lifecycle label; got: {header:?}",
     );
     assert!(
-        !header.contains('◐'),
-        "header at width=20 must drop the spinner section together with \
-         the label; got: {header:?}",
+        header.contains('◐'),
+        "header at width=26 must show the spinner with the label; got: {header:?}",
     );
     assert!(
         header.contains("Sessions"),

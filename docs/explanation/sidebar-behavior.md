@@ -103,7 +103,7 @@ These are non-negotiable:
 
 - ignore control-mode clients with empty `client_tty` when inferring current session or foreground client
 - keep tmux windows in `window-size latest`; do not leave them in manual mode after `resize-window`
-- do not use `after-resize-pane` as width authority for this feature; it was tried before and led to sync difficulty and resize loops
+- do not use `after-resize-pane` as width authority for this feature; it may only be used as a delayed drift signal that re-enforces the coordinator-owned width after tmux layout churn, and it must no-op while `user-drag` or client-resize authority is active
 - do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
 
@@ -195,6 +195,7 @@ Keep these constraints in mind:
 - avoid repeated full `list-panes -a` scans inside the same resize cycle
 - batch where possible, cache briefly, and invalidate on real topology changes
 - prioritize the active window first, then let the rest catch up quickly in the background
+- polling may correct a detected sidebar-width drift after a short settle window, but it must not redefine saved width and must not run while user-drag or client-resize authority is active
 
 ## Change Checklist
 

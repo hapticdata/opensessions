@@ -35,6 +35,40 @@ fn sidebar_coordinator_tracks_warmup_and_ready_lifecycle() {
 }
 
 #[test]
+fn sidebar_coordinator_keeps_warmup_until_settle_deadline() {
+    let mut coordinator = SidebarCoordinator::new(26);
+
+    coordinator.begin_warmup_until(1_200);
+    coordinator.acknowledge_sidebar_connected();
+    assert_eq!(coordinator.state().mode, "warming");
+    assert_eq!(coordinator.state().init_label, "warming up…");
+
+    assert!(!coordinator.tick_timers(1_199));
+    assert_eq!(coordinator.state().mode, "warming");
+
+    assert!(coordinator.tick_timers(1_200));
+    assert_eq!(coordinator.state().mode, "ready");
+    assert_eq!(coordinator.state().init_label, "");
+}
+
+#[test]
+fn sidebar_coordinator_keeps_adjusting_until_settle_deadline() {
+    let mut coordinator = SidebarCoordinator::new(26);
+    coordinator.mark_ready();
+
+    coordinator.begin_programmatic_adjustment_until(1_450);
+    assert_eq!(coordinator.state().mode, "resizing");
+    assert_eq!(coordinator.state().init_label, "adjusting…");
+
+    assert!(!coordinator.tick_timers(1_449));
+    assert_eq!(coordinator.state().mode, "resizing");
+
+    assert!(coordinator.tick_timers(1_450));
+    assert_eq!(coordinator.state().resize_authority, SidebarResizeAuthority::None);
+    assert_eq!(coordinator.state().mode, "ready");
+}
+
+#[test]
 fn sidebar_coordinator_prioritizes_adjusting_over_warmup() {
     let mut coordinator = SidebarCoordinator::new(26);
 
@@ -268,6 +302,61 @@ fn sidebar_coordinator_user_drag_settles_after_grace_period() {
     assert_eq!(settled.mode, "ready");
     assert!(!settled.initializing);
     assert_eq!(settled.init_label, "");
+}
+
+/// Regression for the "width snaps back / fights the drag" report: a background
+/// programmatic enforcement pass must never preempt a live user drag. Before the
+/// fix, `begin_programmatic_adjustment` overwrote the authority and cleared the
+/// drag owner, so the next (suppressed) drag report was rejected and the width
+/// snapped back to the previous value.
+#[test]
+fn programmatic_adjustment_cannot_clobber_active_user_drag() {
+    let mut coordinator = SidebarCoordinator::new(26);
+    coordinator.mark_ready();
+
+    let drag = coordinator.apply_width_report(width_report(30, 100));
+    assert!(drag.accepted);
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::UserDrag
+    );
+
+    // A concurrent enforcement pass tries to grab programmatic-adjust authority.
+    let took_over = coordinator.begin_programmatic_adjustment_until(550);
+    assert!(!took_over, "must not preempt a live user drag");
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::UserDrag,
+        "user drag authority must survive the enforcement attempt"
+    );
+
+    // The continuing drag (same session+window) is still accepted even though
+    // width reports are suppressed, and the width tracks the drag instead of
+    // snapping back.
+    let continued = coordinator.apply_width_report(width_report(32, 200));
+    assert!(continued.accepted);
+    assert!(continued.continued_drag);
+    assert_eq!(coordinator.state().width, 32);
+}
+
+/// A programmatic adjustment may only start from a quiescent (`None`) authority
+/// while the sidebar is visible — matching the TS `startProgrammaticAdjustment`
+/// early-returns.
+#[test]
+fn programmatic_adjustment_requires_visible_and_quiescent() {
+    let mut coordinator = SidebarCoordinator::new(26);
+    // Hidden: rejected.
+    assert!(!coordinator.begin_programmatic_adjustment());
+
+    coordinator.mark_ready();
+    // Visible + quiescent: accepted.
+    assert!(coordinator.begin_programmatic_adjustment());
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::ProgrammaticAdjust
+    );
+    // Re-entrant call while already adjusting is a no-op success.
+    assert!(coordinator.begin_programmatic_adjustment());
 }
 
 fn width_report(width: u32, now: u64) -> SidebarWidthReportInput {

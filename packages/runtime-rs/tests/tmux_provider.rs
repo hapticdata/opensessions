@@ -47,7 +47,17 @@ fn tmux_provider_filters_stash_and_uses_active_session_dirs() {
 
 #[test]
 fn tmux_provider_sends_core_commands_to_runner() {
-    let runner = Arc::new(RecordingRunner::new(HashMap::new()));
+    let runner = Arc::new(RecordingRunner::new(HashMap::from([
+        (
+            "list-windows".to_string(),
+            "@1\t$1\talpha\t0\tmain\t1\t2".to_string(),
+        ),
+        (
+            "list-panes".to_string(),
+            "%1\talpha\t@1\t0\t0\t0\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\talpha\t@1\t0\t1\t1\t/dev/ttys2\t124\t/repo\tzsh\tmain\t94\t24\t26\t119"
+                .to_string(),
+        ),
+    ])));
     let provider = TmuxProvider::new(runner.clone());
 
     provider.switch_session("alpha", Some("/dev/ttys004"));
@@ -61,6 +71,12 @@ fn tmux_provider_sends_core_commands_to_runner() {
         calls
             .iter()
             .any(|call| call == &vec!["switch-client", "-c", "/dev/ttys004", "-t", "alpha"])
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &vec!["select-pane", "-t", "%2"]),
+        "switching sessions from the sidebar should leave focus on the destination main pane, not its sidebar",
     );
     assert!(calls.iter().any(|call| call
         == &vec![
@@ -87,7 +103,18 @@ fn tmux_provider_sends_core_commands_to_runner() {
     assert!(
         calls
             .iter()
-            .any(|call| call == &vec!["set-hook", "-gu", "pane-exited"])
+            .any(|call| call == &vec!["set-hook", "-gu", "after-kill-pane"])
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call[0] == "set-hook" && call[2] == "after-resize-pane"),
+        "after-resize-pane should be a delayed drift signal for pane-exit layout changes, not width authority",
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &vec!["set-hook", "-gu", "after-resize-pane"])
     );
 }
 
@@ -277,6 +304,25 @@ fn tmux_provider_kills_orphaned_and_duplicate_sidebar_panes() {
             .iter()
             .any(|call| call == &vec!["kill-pane", "-t", "%5"]),
         "stash sidebars should be ignored"
+    );
+}
+
+#[test]
+fn tmux_provider_detects_more_agent_panes_from_titles_and_commands() {
+    let runner = RecordingRunner::new(HashMap::from([(
+        "list-panes".to_string(),
+        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tnode\tπ - task\t80\t24\t0\t79\n%2\talpha\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tgemini\tshell\t80\t24\t0\t79\n%3\talpha\t@1\t0\t2\t0\t/dev/ttys3\t125\t/repo\tcursor-agent\tshell\t80\t24\t0\t79\n%4\talpha\t@1\t0\t3\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25".to_string(),
+    )]));
+    let provider = TmuxProvider::new(Arc::new(runner));
+
+    let agents = provider.list_agent_panes("alpha");
+
+    assert_eq!(
+        agents
+            .iter()
+            .map(|pane| (pane.agent.as_str(), pane.pane_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("pi", "%1"), ("gemini", "%2"), ("cursor", "%3")]
     );
 }
 

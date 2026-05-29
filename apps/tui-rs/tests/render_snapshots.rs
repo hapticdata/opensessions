@@ -142,23 +142,23 @@ fn sessions_list_renders_scroll_indicator_when_overflow() {
 
     let buffer = render_to_buffer(&mut app, 35, 56);
 
-    let mut found_up = false;
-    let mut found_down = false;
+    let mut found_track = false;
+    let mut found_thumb = false;
     for y in 0..43 {
-        let glyph = buffer_symbol_at(&buffer, 33, y);
-        if glyph == "▲" {
-            found_up = true;
-        } else if glyph == "▼" {
-            found_down = true;
+        let glyph = buffer_symbol_at(&buffer, 34, y);
+        if glyph == "│" {
+            found_track = true;
+        } else if glyph == "┃" {
+            found_thumb = true;
         }
     }
     assert!(
-        found_up,
-        "scrolling past the top of the sessions list must show a ▲ indicator at the right edge",
+        found_track,
+        "overflowing sessions list must render a scrollbar track at the right edge",
     );
     assert!(
-        found_down,
-        "more sessions below the visible window must show a ▼ indicator at the right edge",
+        found_thumb,
+        "overflowing sessions list must render a scrollbar thumb at the right edge",
     );
 }
 

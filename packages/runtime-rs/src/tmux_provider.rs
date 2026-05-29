@@ -176,6 +176,26 @@ impl TmuxClient {
         self.run(&args);
     }
 
+    pub fn select_main_pane_for_session(&self, session_name: &str) {
+        let Some(window_id) = self
+            .list_windows()
+            .into_iter()
+            .find(|window| window.session_name == session_name && window.active)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let Some(main_pane) = self
+            .list_panes(PaneScope::Window(&window_id))
+            .into_iter()
+            .find(|pane| pane.title != "opensessions-sidebar")
+            .map(|pane| pane.id)
+        else {
+            return;
+        };
+        self.select_pane(&main_pane);
+    }
+
     pub fn new_session(&self, name: Option<&str>, cwd: Option<&str>) -> String {
         let mut args = vec!["new-session", "-d"];
         if let Some(name) = name {
@@ -360,6 +380,7 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
+        self.client.select_main_pane_for_session(name);
     }
 
     fn get_current_session(&self) -> Option<String> {
@@ -416,6 +437,9 @@ impl MuxProvider for TmuxProvider {
         );
         let client_resized_cmd = hook("/client-resized", None);
         let pane_exited_cmd = hook("/pane-exited", None);
+        let pane_resized_cmd = format!(
+            "run-shell -b \"sleep 0.2; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}/pane-layout-changed >/dev/null 2>&1 || true\""
+        );
 
         self.client.set_global_hook(
             "client-session-changed",
@@ -428,7 +452,10 @@ impl MuxProvider for TmuxProvider {
         self.client.set_global_hook("after-new-window", &ensure_cmd);
         self.client
             .set_global_hook("client-resized", &client_resized_cmd);
-        self.client.set_global_hook("pane-exited", &pane_exited_cmd);
+        self.client
+            .set_global_hook("after-kill-pane", &pane_exited_cmd);
+        self.client
+            .set_global_hook("after-resize-pane", &pane_resized_cmd);
     }
 
     fn cleanup_hooks(&self) {
@@ -439,7 +466,8 @@ impl MuxProvider for TmuxProvider {
             "after-select-window",
             "after-new-window",
             "client-resized",
-            "pane-exited",
+            "after-kill-pane",
+            "after-resize-pane",
         ] {
             self.client.unset_global_hook(hook);
         }
@@ -691,20 +719,39 @@ fn pane_format() -> &'static str {
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     let title = pane.title.to_lowercase();
     let command = pane.command.to_lowercase();
-    if title.starts_with("amp") || command.contains("amp") {
-        return Some("amp".to_string());
+    if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
+        return Some("pi".to_string());
     }
-    if title.contains("claude") || command.contains("claude") {
-        return Some("claude-code".to_string());
-    }
-    if title.contains("codex") || command.contains("codex") {
-        return Some("codex".to_string());
-    }
-    if title.contains("opencode") || command.contains("opencode") {
-        return Some("opencode".to_string());
+    let haystack = format!("{title} {command}");
+    for (agent, aliases) in AGENT_ALIASES {
+        if aliases.iter().any(|alias| haystack.contains(alias)) {
+            return Some((*agent).to_string());
+        }
     }
     None
 }
+
+// Keep this broad and process/title based, like herdr's zero-config agent
+// awareness. Transcript/file watchers still provide richer status where we
+// have native integrations; this path makes panes from other popular CLIs show
+// up immediately instead of disappearing from the sidebar.
+const AGENT_ALIASES: &[(&str, &[&str])] = &[
+    ("amp", &["amp", "amp-local"]),
+    ("claude-code", &["claude", "claude-code"]),
+    ("codex", &["codex"]),
+    ("gemini", &["gemini"]),
+    ("cursor", &["cursor", "cursor-agent"]),
+    ("antigravity", &["agy", "antigravity", "antigravity-cli"]),
+    ("cline", &["cline"]),
+    ("opencode", &["opencode", "open-code"]),
+    ("github-copilot", &["copilot", "github-copilot", "ghcs"]),
+    ("kimi", &["kimi", "kimi-code"]),
+    ("kiro", &["kiro", "kiro-cli"]),
+    ("droid", &["droid"]),
+    ("grok", &["grok", "grok-build"]),
+    ("hermes", &["hermes", "hermes-agent"]),
+    ("qodercli", &["qodercli", "qoderclicn", "qoder", "qodercn"]),
+];
 
 fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
     let title = pane.title.trim();
