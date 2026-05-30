@@ -946,7 +946,13 @@ async fn websocket_set_filter_updates_state_and_broadcasts() {
 async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
     let pid_file = test_pid_file("ws-report-width");
     let mux = Arc::new(HookMux {
-        sidebar_panes: Vec::new(),
+        sidebar_panes: vec![SidebarPane {
+            pane_id: "%1".to_string(),
+            session_name: "alpha".to_string(),
+            window_id: "@1".to_string(),
+            width: Some(26),
+            window_width: Some(120),
+        }],
         active_windows: vec![ActiveWindow {
             id: "@1".to_string(),
             session_name: "alpha".to_string(),

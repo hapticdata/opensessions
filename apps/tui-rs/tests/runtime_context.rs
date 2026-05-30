@@ -128,8 +128,8 @@ fn startup_width_observation_does_not_report_width_as_user_intent() {
     let main_rs = include_str!("../src/main.rs");
 
     assert!(
-        main_rs.contains("app.set_terminal_width(width);\n                            last_reported_width = Some(u32::from(width));"),
-        "startup should only seed the local render width; the server-owned sidebar width must not be rewritten until a later foreground resize report",
+        main_rs.contains("last_reported_width.is_some() && last_reported_width != Some(width)"),
+        "startup should only seed the local render width; only later foreground resize events may report user drag width",
     );
     assert!(
         !main_rs.contains("if last_reported_width.is_none()")

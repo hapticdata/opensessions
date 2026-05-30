@@ -28,16 +28,21 @@ server_key() {
 
 SERVER_KEY="$(server_key)"
 PORT_BASE=22000
-if [ -n "$OPENSESSIONS_PORT" ]; then
-  PORT="$OPENSESSIONS_PORT"
+TMUX_OPENSESSIONS_PORT="$(tmux show-environment -g OPENSESSIONS_PORT 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_HOST="$(tmux show-environment -g OPENSESSIONS_HOST 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_PID_FILE="$(tmux show-environment -g OPENSESSIONS_PID_FILE 2>/dev/null | cut -d= -f2)"
+TMUX_OPENSESSIONS_WIDTH="$(tmux show-environment -g OPENSESSIONS_WIDTH 2>/dev/null | cut -d= -f2)"
+
+if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
+  PORT="$TMUX_OPENSESSIONS_PORT"
 elif [ -n "$SERVER_KEY" ]; then
   PORT=$((PORT_BASE + SERVER_KEY))
 else
   PORT="7391"
 fi
-HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
-if [ -n "$OPENSESSIONS_PID_FILE" ]; then
-  PID_FILE="$OPENSESSIONS_PID_FILE"
+HOST="${TMUX_OPENSESSIONS_HOST:-127.0.0.1}"
+if [ -n "$TMUX_OPENSESSIONS_PID_FILE" ]; then
+  PID_FILE="$TMUX_OPENSESSIONS_PID_FILE"
 elif [ -n "$SERVER_KEY" ]; then
   PID_FILE="/tmp/opensessions.${SERVER_KEY}.pid"
 else
@@ -46,8 +51,8 @@ fi
 
 PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-SERVER_WIDTH="${OPENSESSIONS_WIDTH:-$(tmux show-environment -g OPENSESSIONS_WIDTH 2>/dev/null | cut -d= -f2)}"
-SERVER_LOG="/tmp/opensessions-server.log"
+SERVER_WIDTH="${TMUX_OPENSESSIONS_WIDTH:-26}"
+SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
 
 RUST_SERVER_BIN=""
 if [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
@@ -76,7 +81,14 @@ ensure_server() {
     return 1
   fi
 
-  "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
+  OPENSESSIONS_RUST=1 \
+  OPENSESSIONS_SERVER_KEY="$SERVER_KEY" \
+  OPENSESSIONS_HOST="$HOST" \
+  OPENSESSIONS_PORT="$PORT" \
+  OPENSESSIONS_PID_FILE="$PID_FILE" \
+  OPENSESSIONS_WIDTH="$SERVER_WIDTH" \
+  OPENSESSIONS_DIR="$PLUGIN_DIR" \
+    "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 
   attempt=0
   while [ "$attempt" -lt 30 ]; do

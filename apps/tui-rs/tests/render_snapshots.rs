@@ -258,7 +258,7 @@ fn live_tui_wires_runtime_context_helpers() {
     );
     assert!(
         main_rs.contains("report_width_command"),
-        "main.rs must use report_width_command so background sidebars do not report width"
+        "foreground sidebar pane resizes must report width so deliberate user drags update the server-owned sidebar width"
     );
     assert!(
         main_rs.contains("IdentifyPane"),

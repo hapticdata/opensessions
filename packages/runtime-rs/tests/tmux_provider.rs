@@ -75,8 +75,8 @@ fn tmux_provider_sends_core_commands_to_runner() {
     assert!(
         calls
             .iter()
-            .any(|call| call == &vec!["select-pane", "-t", "%2"]),
-        "switching sessions from the sidebar should leave focus on the destination main pane, not its sidebar",
+            .any(|call| call == &vec!["select-pane", "-t", "%1"]),
+        "switching sessions from the sidebar should leave focus on the destination sidebar pane",
     );
     assert!(calls.iter().any(|call| call
         == &vec![
@@ -104,6 +104,17 @@ fn tmux_provider_sends_core_commands_to_runner() {
         calls
             .iter()
             .any(|call| call == &vec!["set-hook", "-gu", "after-kill-pane"])
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call[0] == "set-hook" && call[2] == "pane-exited"),
+        "pane-exited must cover normal shell/process exits, not just explicit kill-pane",
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &vec!["set-hook", "-gu", "pane-exited"])
     );
     assert!(
         calls

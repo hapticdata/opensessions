@@ -22,14 +22,14 @@ fn cli_accepts_explicit_server_endpoint() {
 }
 
 #[test]
-fn resolves_tmux_derived_endpoint_from_environment_like_typescript_client() {
+fn resolves_tmux_derived_endpoint_from_environment_like_rust_launcher() {
     let endpoint = resolve_endpoint_from_env(|key| match key {
         "TMUX" => Some("/private/tmp/tmux-501/default,13614,3".to_string()),
         _ => None,
     });
 
     assert_eq!(endpoint.server_host, "127.0.0.1");
-    assert_eq!(endpoint.server_port, 36_916);
+    assert_eq!(endpoint.server_port, 41_916);
 }
 
 #[test]

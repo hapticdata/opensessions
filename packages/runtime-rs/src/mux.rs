@@ -83,6 +83,10 @@ pub trait MuxProvider: Send + Sync {
         None
     }
 
+    fn get_current_pane_id(&self) -> Option<String> {
+        None
+    }
+
     fn list_sidebar_panes(&self, _session_name: Option<&str>) -> Vec<SidebarPane> {
         Vec::new()
     }

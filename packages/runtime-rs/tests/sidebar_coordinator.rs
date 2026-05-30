@@ -64,7 +64,10 @@ fn sidebar_coordinator_keeps_adjusting_until_settle_deadline() {
     assert_eq!(coordinator.state().mode, "resizing");
 
     assert!(coordinator.tick_timers(1_450));
-    assert_eq!(coordinator.state().resize_authority, SidebarResizeAuthority::None);
+    assert_eq!(
+        coordinator.state().resize_authority,
+        SidebarResizeAuthority::None
+    );
     assert_eq!(coordinator.state().mode, "ready");
 }
 

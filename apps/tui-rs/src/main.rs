@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
                     if let Some(app) = &mut app {
                         app.set_terminal_width(width);
                         let width = u32::from(width);
-                        if last_reported_width != Some(width) {
+                        if last_reported_width.is_some() && last_reported_width != Some(width) {
                             let local_session = identity
                                 .as_ref()
                                 .map(|identity| identity.session_name.as_str())
@@ -252,11 +252,10 @@ async fn main() -> Result<()> {
                                 local_session,
                                 app.current_session.as_deref(),
                             ) {
-                                last_reported_width = Some(width);
-                                ws.send(Message::text(encode_client_command(&command)?))
-                                    .await?;
+                                ws.send(Message::text(encode_client_command(&command)?)).await?;
                             }
                         }
+                        last_reported_width = Some(width);
                         terminal.draw(app)?;
                     }
                 } else if let Event::Mouse(mouse) = event {

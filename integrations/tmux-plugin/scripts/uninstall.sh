@@ -7,6 +7,9 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SCRIPT_DIR/server-common.sh"
+
 echo "opensessions: uninstalling..."
 
 # --- Remove global hooks ---
@@ -17,6 +20,8 @@ for hook in \
   client-resized \
   after-select-window \
   after-new-window \
+  after-kill-pane \
+  pane-exited \
   after-resize-pane; do
   tmux set-hook -gu "$hook" 2>/dev/null || true
 done
@@ -37,8 +42,6 @@ tmux kill-session -t "_os_stash" 2>/dev/null || true
 echo "  ✓ removed stash session"
 
 # --- Kill the server ---
-PORT="${OPENSESSIONS_PORT:-7391}"
-HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
 curl -s -o /dev/null -X POST "http://${HOST}:${PORT}/shutdown" 2>/dev/null || true
 echo "  ✓ stopped server (if running)"
 
@@ -78,6 +81,9 @@ echo "  ✓ removed keybindings"
 # --- Remove environment variables ---
 tmux set-environment -gu OPENSESSIONS_DIR 2>/dev/null || true
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
+tmux set-environment -gu OPENSESSIONS_HOST 2>/dev/null || true
+tmux set-environment -gu OPENSESSIONS_PORT 2>/dev/null || true
+tmux set-environment -gu OPENSESSIONS_PID_FILE 2>/dev/null || true
 echo "  ✓ removed environment variables"
 
 echo "opensessions: uninstall complete. You can now remove the plugin files."

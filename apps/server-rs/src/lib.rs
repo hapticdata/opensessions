@@ -28,7 +28,9 @@ use opensessions_runtime::protocol::{
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
-use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidthReportInput};
+use opensessions_runtime::sidebar_coordinator::{
+    SidebarCoordinator, SidebarResizeAuthority, SidebarWidthReportInput,
+};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
@@ -608,13 +610,21 @@ impl StateSource for ReadOnlyMuxStateSource {
                     context.session_name.as_deref() == current_session.as_deref();
                 let is_current_window =
                     context.window_id.as_deref() == current_window_id.as_deref();
+                let is_current_sidebar_pane = context.pane_id.as_deref().is_some_and(|pane_id| {
+                    provider.list_sidebar_panes(None).into_iter().any(|pane| {
+                        pane.pane_id == pane_id
+                            && context.window_id.as_deref() == Some(pane.window_id.as_str())
+                    })
+                });
                 let decision = self.sidebar_coordinator.lock().unwrap().apply_width_report(
                     SidebarWidthReportInput {
                         width,
                         session: context.session_name.clone(),
                         window_id: context.window_id.clone(),
                         is_active_session,
-                        is_foreground_client: is_active_session && is_current_window,
+                        is_foreground_client: is_active_session
+                            && is_current_window
+                            && is_current_sidebar_pane,
                         is_current_window,
                         now: (self.now_ms)(),
                         suppress_ms: 500,
@@ -622,9 +632,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 );
                 debug_log(format!(
                     "report-width width={width} session={:?} window={:?} \
-                     active_session={is_active_session} current_window={is_current_window} \
-                     accepted={} reason={}",
-                    context.session_name, context.window_id, decision.accepted, decision.reason,
+                     pane={:?} active_session={is_active_session} \
+                     current_window={is_current_window} \
+                     current_sidebar_pane={is_current_sidebar_pane} accepted={} reason={}",
+                    context.session_name,
+                    context.window_id,
+                    context.pane_id,
+                    decision.accepted,
+                    decision.reason,
                 ));
                 if !decision.accepted {
                     return None;
@@ -823,32 +838,29 @@ impl StateSource for ReadOnlyMuxStateSource {
             "/pane-exited" => {
                 let now = (self.now_ms)();
                 let width = self.current_sidebar_width_u16();
-                {
-                    let mut coordinator = self.sidebar_coordinator.lock().unwrap();
-                    coordinator.suppress_width_reports(now + 500);
-                    coordinator.begin_programmatic_adjustment_until(now + 700);
-                }
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
                 }
-                self.enforce_sidebar_width(width, None);
+                if self.can_correct_sidebar_width_drift() && self.sidebar_width_drifted(width) {
+                    self.sidebar_coordinator
+                        .lock()
+                        .unwrap()
+                        .suppress_width_reports(now + 500);
+                    self.enforce_sidebar_width(width, None);
+                }
             }
             "/pane-layout-changed" => {
                 let now = (self.now_ms)();
                 let width = self.current_sidebar_width_u16();
-                if self.sidebar_width_drifted(width) {
-                    let should_enforce = {
-                        let mut coordinator = self.sidebar_coordinator.lock().unwrap();
-                        coordinator.mark_ready();
-                        coordinator.begin_programmatic_adjustment_until(now + 700)
-                    };
-                    if should_enforce {
-                        self.sidebar_coordinator
-                            .lock()
-                            .unwrap()
-                            .suppress_width_reports(now + 500);
-                        self.enforce_sidebar_width(width, None);
-                    }
+                if self.adopt_active_sidebar_width_from_layout(now) {
+                    return;
+                }
+                if self.can_correct_sidebar_width_drift() && self.sidebar_width_drifted(width) {
+                    self.sidebar_coordinator
+                        .lock()
+                        .unwrap()
+                        .suppress_width_reports(now + 500);
+                    self.enforce_sidebar_width(width, None);
                 }
             }
             "/suppress-width-reports" => {
@@ -882,6 +894,12 @@ impl StateSource for ReadOnlyMuxStateSource {
         };
         provider.get_current_session().as_deref() == Some(session_name)
             && provider.get_current_window_id().as_deref() == Some(window_id)
+            && context.pane_id.as_deref().is_some_and(|pane_id| {
+                provider
+                    .list_sidebar_panes(None)
+                    .into_iter()
+                    .any(|pane| pane.pane_id == pane_id && pane.window_id == window_id)
+            })
     }
 
     fn handle_switch_index(&self, index: u32, body: &str) {
@@ -1091,6 +1109,72 @@ impl ReadOnlyMuxStateSource {
             .any(|pane| pane.width.is_some_and(|pane_width| pane_width != width))
     }
 
+    fn adopt_active_sidebar_width_from_layout(&self, now: u64) -> bool {
+        for provider in &self.providers {
+            if !provider.is_sidebar_capable() {
+                continue;
+            }
+            let current_session = provider.get_current_session();
+            let current_window_id = provider.get_current_window_id();
+            let Some(current_pane_id) = provider.get_current_pane_id() else {
+                continue;
+            };
+            let Some(sidebar_pane) = provider
+                .list_sidebar_panes(None)
+                .into_iter()
+                .find(|pane| pane.pane_id == current_pane_id)
+            else {
+                continue;
+            };
+            let Some(width) = sidebar_pane.width else {
+                continue;
+            };
+            let is_active_session =
+                current_session.as_deref() == Some(sidebar_pane.session_name.as_str());
+            let is_current_window =
+                current_window_id.as_deref() == Some(sidebar_pane.window_id.as_str());
+            let decision = self.sidebar_coordinator.lock().unwrap().apply_width_report(
+                SidebarWidthReportInput {
+                    width: u32::from(clamp_sidebar_width(width)),
+                    session: Some(sidebar_pane.session_name.clone()),
+                    window_id: Some(sidebar_pane.window_id.clone()),
+                    is_active_session,
+                    is_foreground_client: is_active_session && is_current_window,
+                    is_current_window,
+                    now,
+                    suppress_ms: 500,
+                },
+            );
+            debug_log(format!(
+                "layout-width width={} pane={} session={} window={} accepted={} reason={}",
+                width,
+                sidebar_pane.pane_id,
+                sidebar_pane.session_name,
+                sidebar_pane.window_id,
+                decision.accepted,
+                decision.reason,
+            ));
+            if decision.accepted {
+                self.enforce_sidebar_width(
+                    decision.next_width.min(u16::MAX as u32) as u16,
+                    Some(sidebar_pane.window_id.as_str()),
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    fn can_correct_sidebar_width_drift(&self) -> bool {
+        let coordinator = self.sidebar_coordinator.lock().unwrap();
+        !matches!(
+            coordinator.state().resize_authority,
+            SidebarResizeAuthority::UserDrag
+                | SidebarResizeAuthority::ClientResizeSync
+                | SidebarResizeAuthority::ProgrammaticAdjust
+        )
+    }
+
     pub fn correct_sidebar_width_drift_after_settle(&self, now: u64) -> bool {
         let width = self.current_sidebar_width_u16();
         if !self.sidebar_width_drifted(width) {
@@ -1098,17 +1182,9 @@ impl ReadOnlyMuxStateSource {
             return false;
         }
 
-        {
-            let coordinator = self.sidebar_coordinator.lock().unwrap();
-            let state = coordinator.state();
-            if matches!(
-                state.resize_authority,
-                opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag
-                    | opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::ClientResizeSync
-            ) {
-                *self.sidebar_drift_detected_at.lock().unwrap() = None;
-                return false;
-            }
+        if !self.can_correct_sidebar_width_drift() {
+            *self.sidebar_drift_detected_at.lock().unwrap() = None;
+            return false;
         }
 
         let mut drift_detected_at = self.sidebar_drift_detected_at.lock().unwrap();
@@ -1119,14 +1195,6 @@ impl ReadOnlyMuxStateSource {
         *drift_detected_at = None;
         drop(drift_detected_at);
 
-        let should_enforce = {
-            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
-            coordinator.mark_ready();
-            coordinator.begin_programmatic_adjustment_until(now + 700)
-        };
-        if !should_enforce {
-            return false;
-        }
         self.sidebar_coordinator
             .lock()
             .unwrap()

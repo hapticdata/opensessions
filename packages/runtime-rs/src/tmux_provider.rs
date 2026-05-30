@@ -176,7 +176,7 @@ impl TmuxClient {
         self.run(&args);
     }
 
-    pub fn select_main_pane_for_session(&self, session_name: &str) {
+    pub fn select_sidebar_pane_for_session(&self, session_name: &str) {
         let Some(window_id) = self
             .list_windows()
             .into_iter()
@@ -185,15 +185,15 @@ impl TmuxClient {
         else {
             return;
         };
-        let Some(main_pane) = self
+        let Some(sidebar_pane) = self
             .list_panes(PaneScope::Window(&window_id))
             .into_iter()
-            .find(|pane| pane.title != "opensessions-sidebar")
+            .find(|pane| pane.title == "opensessions-sidebar")
             .map(|pane| pane.id)
         else {
             return;
         };
-        self.select_pane(&main_pane);
+        self.select_pane(&sidebar_pane);
     }
 
     pub fn new_session(&self, name: Option<&str>, cwd: Option<&str>) -> String {
@@ -274,6 +274,10 @@ impl TmuxClient {
     }
 
     pub fn get_current_session(&self) -> Option<String> {
+        let session_name = self.display("#{session_name}", None);
+        if !session_name.is_empty() && !session_name.contains('/') {
+            return Some(session_name);
+        }
         self.list_clients()
             .into_iter()
             .find(|client| !client.tty.is_empty())
@@ -287,6 +291,11 @@ impl TmuxClient {
     pub fn get_current_window_id(&self) -> Option<String> {
         let window_id = self.display("#{window_id}", None);
         (!window_id.is_empty()).then_some(window_id)
+    }
+
+    pub fn get_current_pane_id(&self) -> Option<String> {
+        let pane_id = self.display("#{pane_id}", None);
+        (!pane_id.is_empty()).then_some(pane_id)
     }
 
     pub fn get_session_dir(&self, target: &str) -> String {
@@ -380,7 +389,7 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
-        self.client.select_main_pane_for_session(name);
+        self.client.select_sidebar_pane_for_session(name);
     }
 
     fn get_current_session(&self) -> Option<String> {
@@ -428,6 +437,11 @@ impl MuxProvider for TmuxProvider {
                 "run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true\""
             )
         };
+        let delayed_hook = |path: &str| {
+            format!(
+                "run-shell -b \"sleep 0.2; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path} >/dev/null 2>&1 || true\""
+            )
+        };
 
         let focus_cmd = hook("/focus", Some("#{client_tty}|#{session_name}|#{window_id}"));
         let refresh_cmd = hook("/refresh", None);
@@ -437,9 +451,7 @@ impl MuxProvider for TmuxProvider {
         );
         let client_resized_cmd = hook("/client-resized", None);
         let pane_exited_cmd = hook("/pane-exited", None);
-        let pane_resized_cmd = format!(
-            "run-shell -b \"sleep 0.2; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}/pane-layout-changed >/dev/null 2>&1 || true\""
-        );
+        let pane_resized_cmd = delayed_hook("/pane-layout-changed");
 
         self.client.set_global_hook(
             "client-session-changed",
@@ -454,6 +466,7 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("client-resized", &client_resized_cmd);
         self.client
             .set_global_hook("after-kill-pane", &pane_exited_cmd);
+        self.client.set_global_hook("pane-exited", &pane_exited_cmd);
         self.client
             .set_global_hook("after-resize-pane", &pane_resized_cmd);
     }
@@ -467,6 +480,7 @@ impl MuxProvider for TmuxProvider {
             "after-new-window",
             "client-resized",
             "after-kill-pane",
+            "pane-exited",
             "after-resize-pane",
         ] {
             self.client.unset_global_hook(hook);
@@ -512,6 +526,10 @@ impl MuxProvider for TmuxProvider {
 
     fn get_current_window_id(&self) -> Option<String> {
         self.client.get_current_window_id()
+    }
+
+    fn get_current_pane_id(&self) -> Option<String> {
+        self.client.get_current_pane_id()
     }
 
     fn list_sidebar_panes(&self, session_name: Option<&str>) -> Vec<SidebarPane> {
