@@ -6,8 +6,9 @@ use opensessions_runtime::config::{
 };
 use opensessions_runtime::protocol::SessionFilterMode;
 use opensessions_runtime::shared::{
-    DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT, hash_server_key, resolve_pid_file,
-    resolve_server_host, resolve_server_key, resolve_server_port, resolve_server_settings,
+    DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT, OpensessionsEndpoint, ServerKey, TmuxSocketPath,
+    hash_server_key, resolve_pid_file, resolve_server_host, resolve_server_key,
+    resolve_server_port, resolve_server_settings,
 };
 
 #[test]
@@ -30,6 +31,33 @@ fn resolves_server_settings_from_tmux_socket_and_env_overrides() {
     assert_eq!(settings.host, "0.0.0.0");
     assert_eq!(settings.port, 36_916);
     assert_eq!(settings.pid_file, "/tmp/opensessions.19916.pid");
+}
+
+#[test]
+fn typed_endpoint_keeps_tmux_socket_namespace_together() {
+    let socket = TmuxSocketPath::from_tmux_env("/private/tmp/tmux-501/default,123,0")
+        .expect("tmux env should include socket path");
+    assert_eq!(socket.server_key(), ServerKey(19_916));
+
+    let endpoint = OpensessionsEndpoint::from_env(
+        |key| match key {
+            "TMUX" => Some("/private/tmp/tmux-501/default,123,0".to_string()),
+            _ => None,
+        },
+        true,
+    );
+
+    assert_eq!(endpoint.server_key, Some(ServerKey(19_916)));
+    assert_eq!(endpoint.host, "127.0.0.1");
+    assert_eq!(endpoint.port, 41_916);
+    assert_eq!(
+        endpoint.pid_file,
+        PathBuf::from("/tmp/opensessions.19916.pid")
+    );
+    assert_eq!(
+        endpoint.shim_socket,
+        PathBuf::from("/tmp/opensessions.19916.sock")
+    );
 }
 
 #[test]

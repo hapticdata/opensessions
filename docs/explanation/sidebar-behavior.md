@@ -15,7 +15,7 @@ That means:
 - full terminal resizes do not redefine the saved width
 - session switching does not cause the sidebar to jump, breathe, or re-proportion itself
 - background windows should already be correct before the user lands in them
-- the UI should clearly show `warming up…` while sidebars are still spawning and `adjusting…` while width normalization is still in flight
+- the UI should clearly show `warming up…` while sidebars are still spawning, `adjusting…` while width normalization is still in flight, and `closing…` while the server is draining clients before exit
 
 ## Product Behaviors
 
@@ -42,6 +42,18 @@ Important details from the user's point of view:
 - a normal tmux pane, background sidebar, or whole-terminal resize must not redefine the sidebar width
 - after a valid resize, background sidebars should converge to the new width without flashes or snap-back
 - pressing `q` quits opensessions only when the key is delivered to a connected sidebar client; pressing `q` in a normal tmux pane is just a normal shell/app keypress
+
+### Server shutdown must not leave stale sidebar clients
+
+When an opensessions server exits, every connected sidebar client in that tmux-server namespace should exit too. A dead server with old sidebar panes still rendering stale state is broken.
+
+Expected shutdown behavior:
+
+- quit can be requested by a connected sidebar keypress, websocket command, `/quit`, or process shutdown
+- the server marks the sidebar lifecycle as `closing…`
+- the server broadcasts `quit` to websocket and shim clients
+- the server waits briefly for clients to receive the quit frame, then removes hooks, pid file, and shim socket
+- restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
 
 ### Session switching keeps the sidebar in control
 
@@ -134,7 +146,7 @@ One specific regression we already paid for: forcing `resize-window` during the 
 
 ## Warmup And Adjusting Semantics
 
-There are two user-visible initializing states and they mean different things.
+There are three user-visible initializing states and they mean different things.
 
 `warming up…` means:
 
@@ -145,6 +157,11 @@ There are two user-visible initializing states and they mean different things.
 
 - width normalization is still in flight across windows/sessions
 - this includes whole-client resize sync, accepted drag propagation, and server-driven cross-window enforcement
+
+`closing…` means:
+
+- the server has accepted shutdown and is draining clients
+- sidebars should receive `quit` and exit rather than staying around as stale clients
 
 Important nuance:
 
@@ -184,6 +201,7 @@ Symptoms of broken per-server wiring:
 - hooks in one tmux server point to another tmux server's port
 - sidebars inside the same tmux server have mixed widths after settle
 - pressing `q` in a connected sidebar does not stop the expected derived server
+- sidebars keep rendering after their server pid file/socket has been removed
 
 The recovery path is: clear stale tmux-scoped overrides, refresh hooks from the current plugin, restart the derived server for that tmux socket, and respawn visible sidebar panes.
 
@@ -317,6 +335,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - background windows land at the current width without visible proportional flash
 - `warming up…` clears once spawn/restore is complete
 - `adjusting…` appears reliably while global width correction is still happening
+- server shutdown broadcasts `quit` to websocket and shim sidebar clients before cleanup
 - control-mode clients cannot steal foreground/current-session authority
 - hooks and sidebar clients point to the derived server for the current tmux socket
 - tmux windows remain in `window-size latest`

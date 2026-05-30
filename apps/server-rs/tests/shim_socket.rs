@@ -91,6 +91,63 @@ async fn shim_socket_accepts_hello_and_returns_rendered_full_frame() {
     let _ = fs::remove_file(pid_file);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn server_shutdown_sends_quit_to_shim_clients_before_cleanup() {
+    let pid_file = test_path("shim-shutdown", "pid");
+    let socket_path = test_path("shim-shutdown", "sock");
+    let state = r#"{
+        "type":"state",
+        "sessions":[],"focusedSession":null,"currentSession":null,
+        "theme":"catppuccin-mocha","sessionFilter":"all","sidebarWidth":35,
+        "initializing":false,"ts":3
+    }"#;
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file)
+            .with_shim_socket_path(&socket_path)
+            .with_state_source(move || state.to_string()),
+    )
+    .await
+    .expect("server should start");
+
+    let mut stream = UnixStream::connect(server.shim_socket_path().unwrap())
+        .await
+        .expect("shim socket should accept local clients");
+    stream
+        .write_all(&encode_shim_message(&ShimToServer::Hello(ShimHello {
+            protocol: 1,
+            pane_id: "%42".into(),
+            session_name: "opensessions".into(),
+            window_id: Some("@1".into()),
+            client_tty: Some("/dev/ttys-test".into()),
+            width: 35,
+            height: 10,
+        })))
+        .await
+        .expect("shim hello should write");
+    let _ = timeout(Duration::from_secs(1), read_server_message(&mut stream))
+        .await
+        .expect("server hello should arrive")
+        .expect("server hello should decode");
+    let _ = timeout(Duration::from_secs(1), read_server_message(&mut stream))
+        .await
+        .expect("initial frame should arrive")
+        .expect("initial frame should decode");
+
+    let shutdown_task = tokio::spawn(async move { server.shutdown().await });
+    let quit = timeout(Duration::from_secs(1), read_server_message(&mut stream))
+        .await
+        .expect("server quit should arrive before timeout")
+        .expect("server quit should decode");
+
+    assert_eq!(quit, ServerToShim::Quit);
+    shutdown_task
+        .await
+        .expect("shutdown task should join")
+        .expect("server should shut down");
+    assert!(!socket_path.exists(), "shutdown should remove shim socket");
+    let _ = fs::remove_file(pid_file);
+}
+
 async fn read_server_message(stream: &mut UnixStream) -> std::io::Result<ServerToShim> {
     let mut len = [0_u8; 4];
     stream.read_exact(&mut len).await?;

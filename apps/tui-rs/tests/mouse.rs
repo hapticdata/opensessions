@@ -123,6 +123,7 @@ fn click_on_session_row_switches_to_that_session() {
         vec![ClientCommand::SwitchSession {
             name: "learning".into(),
             client_tty: None,
+            debounce: None,
         }]
     );
 }

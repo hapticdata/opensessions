@@ -367,6 +367,37 @@ async fn websocket_quit_command_broadcasts_quit_and_stops_server() {
     assert!(!pid_file.exists(), "quit should remove the pid file");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn server_shutdown_broadcasts_quit_before_cleanup() {
+    let pid_file = test_pid_file("shutdown-quit");
+    let server = start_server(ServerConfig::new("127.0.0.1", 0, &pid_file))
+        .await
+        .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut client, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket clients");
+    let _ = client.next().await.expect("hello should arrive");
+
+    let shutdown_task = tokio::spawn(async move { server.shutdown().await });
+    let quit = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("shutdown quit should arrive before timeout")
+        .expect("shutdown quit should arrive")
+        .expect("shutdown quit should be valid");
+
+    assert_eq!(quit.as_text(), Some(EXPECTED_QUIT));
+    shutdown_task
+        .await
+        .expect("shutdown task should join")
+        .expect("server should shut down");
+    assert!(!pid_file.exists(), "shutdown should remove the pid file");
+}
+
 #[test]
 fn read_only_mux_state_source_serializes_runtime_state() {
     let source = ReadOnlyMuxStateSource::new(vec![Arc::new(ServerMux {
@@ -467,12 +498,20 @@ async fn websocket_switch_session_calls_mux_and_broadcasts_focus_update() {
     let pid_file = test_pid_file("ws-switch-session");
     let mux = Arc::new(ServerMux {
         current: Some("api".to_string()),
-        sessions: vec![MuxSessionInfo {
-            name: "api".to_string(),
-            created_at: 1,
-            dir: "/repo/api".to_string(),
-            windows: 1,
-        }],
+        sessions: vec![
+            MuxSessionInfo {
+                name: "api".to_string(),
+                created_at: 1,
+                dir: "/repo/api".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "worker".to_string(),
+                created_at: 2,
+                dir: "/repo/worker".to_string(),
+                windows: 1,
+            },
+        ],
         panes: 1,
         create_calls: Mutex::new(0),
         switch_calls: Mutex::new(Vec::new()),
@@ -509,7 +548,7 @@ async fn websocket_switch_session_calls_mux_and_broadcasts_focus_update() {
 
     sender
         .send(Message::text(
-            r#"{"type":"switch-session","name":"api","clientTty":"/dev/ttys001"}"#,
+            r#"{"type":"switch-session","name":"worker","clientTty":"/dev/ttys001"}"#,
         ))
         .await
         .expect("switch-session command should send");
@@ -521,11 +560,94 @@ async fn websocket_switch_session_calls_mux_and_broadcasts_focus_update() {
         .expect("focus broadcast should be valid");
     assert_eq!(
         *mux.switch_calls.lock().unwrap(),
-        vec![("api".to_string(), Some("/dev/ttys001".to_string()))]
+        vec![("worker".to_string(), Some("/dev/ttys001".to_string()))]
     );
     assert_eq!(
         focus.as_text(),
-        Some(r#"{"type":"focus","focusedSession":"api","currentSession":"api"}"#)
+        Some(r#"{"type":"focus","focusedSession":"worker","currentSession":"worker"}"#)
+    );
+
+    sender
+        .send(Message::text(r#"{"type":"refresh"}"#))
+        .await
+        .expect("refresh command should send");
+    let state = timeout(Duration::from_secs(1), receiver.next())
+        .await
+        .expect("handoff state should arrive before timeout")
+        .expect("handoff state should arrive")
+        .expect("handoff state should be valid");
+    assert!(
+        state
+            .as_text()
+            .is_some_and(|text| text.contains(r#""currentSession":"worker""#)),
+        "snapshots during the tmux handoff should keep the intended destination current"
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn debounced_switch_session_only_applies_latest_tmux_switch() {
+    let pid_file = test_pid_file("ws-switch-session-debounced");
+    let mux = Arc::new(ServerMux {
+        current: Some("alpha".to_string()),
+        sessions: vec![
+            MuxSessionInfo {
+                name: "alpha".to_string(),
+                created_at: 1,
+                dir: "/repo/alpha".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "bravo".to_string(),
+                created_at: 2,
+                dir: "/repo/bravo".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "charlie".to_string(),
+                created_at: 3,
+                dir: "/repo/charlie".to_string(),
+                windows: 1,
+            },
+        ],
+        panes: 1,
+        create_calls: Mutex::new(0),
+        switch_calls: Mutex::new(Vec::new()),
+        kill_calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file)
+            .with_state_source(ReadOnlyMuxStateSource::new(vec![mux.clone()])),
+    )
+    .await
+    .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut client, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket client");
+    let _ = client.next().await.expect("hello should arrive");
+    let _ = client.next().await.expect("initial state should arrive");
+
+    for name in ["bravo", "charlie", "bravo"] {
+        client
+            .send(Message::text(format!(
+                r#"{{"type":"switch-session","name":"{name}","debounce":true}}"#
+            )))
+            .await
+            .expect("debounced switch command should send");
+    }
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(
+        *mux.switch_calls.lock().unwrap(),
+        vec![("bravo".to_string(), None)],
+        "rapid debounced switches should only apply the final tmux switch"
     );
 
     server.shutdown().await.expect("server should shut down");
@@ -819,6 +941,77 @@ async fn websocket_kill_session_command_calls_mux_and_broadcasts_state() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn killing_current_session_switches_to_visible_session_above_before_kill() {
+    let pid_file = test_pid_file("ws-kill-current-session");
+    let mux = Arc::new(ServerMux {
+        current: Some("worker".to_string()),
+        sessions: vec![
+            MuxSessionInfo {
+                name: "api".to_string(),
+                created_at: 1,
+                dir: "/repo/api".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "worker".to_string(),
+                created_at: 2,
+                dir: "/repo/worker".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "ui".to_string(),
+                created_at: 3,
+                dir: "/repo/ui".to_string(),
+                windows: 1,
+            },
+        ],
+        panes: 1,
+        create_calls: Mutex::new(0),
+        switch_calls: Mutex::new(Vec::new()),
+        kill_calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file)
+            .with_state_source(ReadOnlyMuxStateSource::new(vec![mux.clone()]).with_now_ms(|| 789)),
+    )
+    .await
+    .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut sender, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket sender");
+    let _ = sender.next().await.expect("sender hello should arrive");
+    let _ = sender
+        .next()
+        .await
+        .expect("sender initial state should arrive");
+
+    sender
+        .send(Message::text(r#"{"type":"kill-session","name":"worker"}"#))
+        .await
+        .expect("kill-session command should send");
+
+    let _ = timeout(Duration::from_secs(1), sender.next())
+        .await
+        .expect("state reply should arrive before timeout")
+        .expect("state reply should arrive")
+        .expect("state reply should be valid");
+    assert_eq!(
+        *mux.switch_calls.lock().unwrap(),
+        vec![("api".to_string(), None)],
+        "killing current session should switch to the row above before tmux kills it"
+    );
+    assert_eq!(*mux.kill_calls.lock().unwrap(), vec!["worker".to_string()]);
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn websocket_set_theme_updates_state_and_broadcasts() {
     let pid_file = test_pid_file("ws-set-theme");
     let mux = Arc::new(ServerMux {
@@ -1016,7 +1209,7 @@ async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
     assert_eq!(
         state.as_text(),
         Some(
-            r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":41,"initializing":true,"initLabel":"adjusting…","ts":1002}"#
+            r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":41,"initializing":false,"ts":1002}"#
         )
     );
 
@@ -1025,7 +1218,7 @@ async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
         .await
         .expect("second report-width command should send");
 
-    let expected = r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":20,"initializing":true,"initLabel":"adjusting…","ts":1002}"#;
+    let expected = r#"{"type":"state","sessions":[],"focusedSession":null,"currentSession":"alpha","sidebarWidth":20,"initializing":false,"ts":1002}"#;
     let mut saw_clamped = false;
     for _ in 0..3 {
         let state = timeout(Duration::from_secs(1), receiver.next())
@@ -1039,6 +1232,183 @@ async fn websocket_report_width_updates_sidebar_width_and_broadcasts() {
         }
     }
     assert!(saw_clamped, "expected clamped sidebar width state");
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn report_width_coalesces_background_sidebar_fanout_to_latest_width() {
+    let pid_file = test_pid_file("ws-report-width-coalesced");
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![
+            SidebarPane {
+                pane_id: "%1".to_string(),
+                session_name: "alpha".to_string(),
+                window_id: "@1".to_string(),
+                width: Some(26),
+                window_width: Some(120),
+            },
+            SidebarPane {
+                pane_id: "%2".to_string(),
+                session_name: "beta".to_string(),
+                window_id: "@2".to_string(),
+                width: Some(26),
+                window_width: Some(120),
+            },
+        ],
+        active_windows: vec![ActiveWindow {
+            id: "@1".to_string(),
+            session_name: "alpha".to_string(),
+            active: true,
+        }],
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file)
+            .with_state_source(ReadOnlyMuxStateSource::new(vec![mux.clone()])),
+    )
+    .await
+    .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut client, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket client");
+    let _ = client.next().await.expect("hello should arrive");
+    let _ = client.next().await.expect("initial state should arrive");
+    client
+        .send(Message::text(
+            r#"{"type":"identify-pane","paneId":"%1","sessionName":"alpha","windowId":"@1"}"#,
+        ))
+        .await
+        .expect("identify-pane command should send");
+    let _ = client.next().await.expect("your-session should arrive");
+
+    for width in [41, 44] {
+        client
+            .send(Message::text(format!(
+                r#"{{"type":"report-width","width":{width}}}"#
+            )))
+            .await
+            .expect("report-width command should send");
+    }
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        *mux.resize_calls.lock().unwrap(),
+        vec![("%2".to_string(), 44)],
+        "rapid width reports should fan out only the final accepted width"
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn report_width_shows_adjusting_only_after_drag_settles_and_fanout_starts() {
+    let pid_file = test_pid_file("ws-report-width-adjusting-after-settle");
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![
+            SidebarPane {
+                pane_id: "%1".to_string(),
+                session_name: "alpha".to_string(),
+                window_id: "@1".to_string(),
+                width: Some(26),
+                window_width: Some(120),
+            },
+            SidebarPane {
+                pane_id: "%2".to_string(),
+                session_name: "beta".to_string(),
+                window_id: "@2".to_string(),
+                width: Some(26),
+                window_width: Some(120),
+            },
+        ],
+        active_windows: vec![ActiveWindow {
+            id: "@1".to_string(),
+            session_name: "alpha".to_string(),
+            active: true,
+        }],
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file)
+            .with_state_source(ReadOnlyMuxStateSource::new(vec![mux])),
+    )
+    .await
+    .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut sender, _) = ClientBuilder::from_uri(uri.clone())
+        .connect()
+        .await
+        .expect("server should upgrade websocket sender");
+    let (mut receiver, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket receiver");
+    let _ = sender.next().await.expect("sender hello should arrive");
+    let _ = sender
+        .next()
+        .await
+        .expect("sender initial state should arrive");
+    let _ = receiver.next().await.expect("receiver hello should arrive");
+    let _ = receiver
+        .next()
+        .await
+        .expect("receiver initial state should arrive");
+    sender
+        .send(Message::text(
+            r#"{"type":"identify-pane","paneId":"%1","sessionName":"alpha","windowId":"@1"}"#,
+        ))
+        .await
+        .expect("identify-pane command should send");
+    let _ = sender.next().await.expect("your-session should arrive");
+
+    sender
+        .send(Message::text(r#"{"type":"report-width","width":41}"#))
+        .await
+        .expect("report-width command should send");
+    let drag_state = timeout(Duration::from_secs(1), receiver.next())
+        .await
+        .expect("drag state should arrive before timeout")
+        .expect("drag state should arrive")
+        .expect("drag state should be valid");
+    let drag_text = drag_state.as_text().unwrap_or_default();
+    assert!(drag_text.contains(r#""sidebarWidth":41"#));
+    assert!(drag_text.contains(r#""initializing":false"#));
+
+    let mut saw_adjusting = false;
+    for _ in 0..8 {
+        let state = timeout(Duration::from_secs(1), receiver.next())
+            .await
+            .expect("settled state should arrive before timeout")
+            .expect("settled state should arrive")
+            .expect("settled state should be valid");
+        if state
+            .as_text()
+            .is_some_and(|text| text.contains(r#""initLabel":"adjusting…""#))
+        {
+            saw_adjusting = true;
+            break;
+        }
+    }
+    assert!(
+        saw_adjusting,
+        "adjusting should appear after delayed fan-out starts"
+    );
 
     server.shutdown().await.expect("server should shut down");
     let _ = fs::remove_file(pid_file);

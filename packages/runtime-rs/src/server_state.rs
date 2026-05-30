@@ -17,6 +17,7 @@ pub struct ReadOnlyStateInput<'a> {
     pub ports_by_session: Option<HashMap<String, Vec<u16>>>,
     pub portless_state: Option<PortlessState>,
     pub focused_session: Option<String>,
+    pub current_session_override: Option<String>,
     pub theme: Option<String>,
     pub session_filter: Option<SessionFilterMode>,
     pub sidebar_width: u32,
@@ -27,7 +28,7 @@ pub struct ReadOnlyStateInput<'a> {
 
 pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
     let now_secs = input.now_ms / 1_000;
-    let current_session = input
+    let provider_current_session = input
         .providers
         .first()
         .and_then(|provider| provider.get_current_session());
@@ -123,6 +124,10 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
         })
         .collect::<Vec<_>>();
 
+    let current_session = input
+        .current_session_override
+        .filter(|candidate| sessions.iter().any(|session| session.name == *candidate))
+        .or(provider_current_session);
     let focused_session =
         resolve_focused_session(input.focused_session, current_session.as_deref(), &sessions);
 

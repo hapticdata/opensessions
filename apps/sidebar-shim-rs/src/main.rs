@@ -14,6 +14,7 @@ use crossterm::terminal::{
     enable_raw_mode,
 };
 use futures_util::StreamExt;
+use opensessions_runtime::shared::{OpensessionsEndpoint, default_shim_socket_path};
 use opensessions_sidebar_protocol::{
     KeyCode, KeyMessage, KeyModifiers, MouseButton, MouseEventKind, MouseMessage, ServerToShim,
     ShimHello, ShimToServer, decode_server_message, encode_shim_message,
@@ -91,25 +92,13 @@ fn socket_path() -> PathBuf {
         return PathBuf::from(path);
     }
     if let Ok(pid_file) = std::env::var("OPENSESSIONS_PID_FILE") {
-        return PathBuf::from(pid_file).with_extension("sock");
+        return default_shim_socket_path(&PathBuf::from(pid_file));
     }
-    if let Ok(tmux) = std::env::var("TMUX") {
-        if let Some(socket) = tmux.split(',').next().filter(|value| !value.is_empty()) {
-            return PathBuf::from(format!(
-                "/tmp/opensessions.{}.sock",
-                hash_server_key(socket)
-            ));
-        }
+    let endpoint = OpensessionsEndpoint::from_env(|key| std::env::var(key).ok(), true);
+    if endpoint.server_key.is_some() {
+        return endpoint.shim_socket;
     }
     PathBuf::from("/tmp/opensessions.sock")
-}
-
-fn hash_server_key(input: &str) -> u16 {
-    let mut hash = 0_u32;
-    for (i, byte) in input.bytes().enumerate() {
-        hash = (hash + u32::from(byte) * (i as u32 + 1)) % 20_000;
-    }
-    hash as u16
 }
 
 fn arg_value(name: &str) -> Option<String> {

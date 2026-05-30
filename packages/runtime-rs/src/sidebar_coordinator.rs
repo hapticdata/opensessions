@@ -3,6 +3,7 @@ pub enum SidebarLifecycle {
     Idle,
     Warming,
     Ready,
+    Closing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +85,9 @@ impl SidebarCoordinator {
 
     pub fn state(&self) -> SidebarCoordinatorState {
         let mode = match (self.visible, self.lifecycle, self.authority) {
+            (true, SidebarLifecycle::Closing, _) => "closing",
             (_, _, SidebarResizeAuthority::ClientResizeSync)
-            | (_, _, SidebarResizeAuthority::ProgrammaticAdjust)
-            | (_, _, SidebarResizeAuthority::UserDrag) => "resizing",
+            | (_, _, SidebarResizeAuthority::ProgrammaticAdjust) => "resizing",
             (false, _, _) => "hidden",
             (true, SidebarLifecycle::Warming, _) => "warming",
             (true, SidebarLifecycle::Ready, _) => "ready",
@@ -95,6 +96,7 @@ impl SidebarCoordinator {
         let init_label = match mode {
             "resizing" => "adjusting…",
             "warming" => "warming up…",
+            "closing" => "closing…",
             _ => "",
         };
 
@@ -150,6 +152,15 @@ impl SidebarCoordinator {
     pub fn hide(&mut self) {
         self.visible = false;
         self.lifecycle = SidebarLifecycle::Idle;
+        self.authority = SidebarResizeAuthority::None;
+        self.warmup_until = None;
+        self.adjustment_until = None;
+        self.clear_drag_owner();
+    }
+
+    pub fn begin_closing(&mut self) {
+        self.visible = true;
+        self.lifecycle = SidebarLifecycle::Closing;
         self.authority = SidebarResizeAuthority::None;
         self.warmup_until = None;
         self.adjustment_until = None;
@@ -317,7 +328,10 @@ impl SidebarCoordinator {
         if self.authority == SidebarResizeAuthority::ClientResizeSync {
             return self.reject("client-resize-sync");
         }
-        if self.suppress_width_reports_until > report.now && !continued_drag {
+        if self.suppress_width_reports_until > report.now
+            && !continued_drag
+            && (self.authority == SidebarResizeAuthority::UserDrag || !report.is_foreground_client)
+        {
             return self.reject("suppressed");
         }
         if report.width == self.width {

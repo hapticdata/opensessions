@@ -192,6 +192,7 @@ fn read_only_state_sorts_sessions_and_selects_current_focus_and_uptime() {
         ports_by_session: None,
         portless_state: None,
         focused_session: None,
+        current_session_override: None,
         theme: Some("mocha".to_string()),
         session_filter: None,
         sidebar_width: 31,
@@ -253,6 +254,7 @@ fn read_only_state_keeps_valid_focus_or_falls_back_to_first_session() {
         ports_by_session: None,
         portless_state: None,
         focused_session: Some("beta".to_string()),
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,
@@ -277,6 +279,7 @@ fn read_only_state_keeps_valid_focus_or_falls_back_to_first_session() {
         ports_by_session: None,
         portless_state: None,
         focused_session: Some("gone".to_string()),
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,
@@ -285,6 +288,65 @@ fn read_only_state_keeps_valid_focus_or_falls_back_to_first_session() {
         now_ms: 10_000,
     });
     assert_eq!(fallback.focused_session.as_deref(), Some("alpha"));
+}
+
+#[test]
+fn read_only_state_uses_valid_current_session_override() {
+    let mux = StateMux {
+        current: Some("alpha".to_string()),
+        sessions: vec![
+            mux_session("alpha", 100, "/repo/alpha", 1),
+            mux_session("beta", 200, "/repo/beta", 1),
+        ],
+        pane_counts: Vec::new(),
+    };
+
+    let state = build_read_only_state(ReadOnlyStateInput {
+        providers: vec![&mux],
+        visible_session_names: None,
+        metadata_by_session: None,
+        git_by_session: None,
+        agent_state_by_session: None,
+        agents_by_session: None,
+        event_timestamps_by_session: None,
+        unseen_sessions: None,
+        ports_by_session: None,
+        portless_state: None,
+        focused_session: None,
+        current_session_override: Some("beta".to_string()),
+        theme: None,
+        session_filter: None,
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        now_ms: 10_000,
+    });
+
+    assert_eq!(state.current_session.as_deref(), Some("beta"));
+    assert_eq!(state.focused_session.as_deref(), Some("beta"));
+
+    let fallback = build_read_only_state(ReadOnlyStateInput {
+        providers: vec![&mux],
+        visible_session_names: None,
+        metadata_by_session: None,
+        git_by_session: None,
+        agent_state_by_session: None,
+        agents_by_session: None,
+        event_timestamps_by_session: None,
+        unseen_sessions: None,
+        ports_by_session: None,
+        portless_state: None,
+        focused_session: None,
+        current_session_override: Some("missing".to_string()),
+        theme: None,
+        session_filter: None,
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        now_ms: 10_000,
+    });
+
+    assert_eq!(fallback.current_session.as_deref(), Some("alpha"));
 }
 
 #[test]
@@ -311,6 +373,7 @@ fn read_only_state_applies_visible_session_order() {
         ports_by_session: None,
         portless_state: None,
         focused_session: Some("beta".to_string()),
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,
@@ -353,6 +416,7 @@ fn read_only_state_marks_unseen_sessions() {
         ports_by_session: None,
         portless_state: None,
         focused_session: None,
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,
@@ -404,6 +468,7 @@ fn read_only_state_includes_ports_and_local_links() {
         ports_by_session: Some(HashMap::from([("api".to_string(), vec![4549, 9000])])),
         portless_state: Some(portless_state),
         focused_session: None,
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,
@@ -448,6 +513,7 @@ fn read_only_state_includes_git_info() {
         ports_by_session: None,
         portless_state: None,
         focused_session: None,
+        current_session_override: None,
         theme: None,
         session_filter: None,
         sidebar_width: 26,

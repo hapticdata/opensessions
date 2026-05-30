@@ -28,6 +28,7 @@ use opensessions_runtime::protocol::{
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
+use opensessions_runtime::shared::default_shim_socket_path;
 use opensessions_runtime::sidebar_coordinator::{
     SidebarCoordinator, SidebarResizeAuthority, SidebarWidthReportInput,
 };
@@ -72,6 +73,11 @@ const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const USER_DRAG_SETTLE_MS: u64 = 600;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
 const SIDEBAR_DRIFT_CORRECTION_MS: u64 = 300;
+const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
+const COALESCED_OP_TICK_MS: u64 = 25;
+const SWITCH_DEBOUNCE_MS: u64 = 80;
+const SWITCH_HANDOFF_MS: u64 = 1_000;
+const WIDTH_FANOUT_DEBOUNCE_MS: u64 = 250;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -163,6 +169,10 @@ pub trait StateSource: Send + Sync + 'static {
     }
 
     fn handle_switch_index(&self, _index: u32, _body: &str) {}
+
+    fn begin_shutdown(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -303,6 +313,26 @@ struct CachedPortSnapshot {
     ts: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSessionSwitch {
+    name: String,
+    client_tty: Option<String>,
+    due_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWidthFanout {
+    width: u16,
+    except_window_id: Option<String>,
+    due_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchHandoff {
+    session: String,
+    until: u64,
+}
+
 pub struct ReadOnlyMuxStateSource {
     providers: Vec<Arc<dyn MuxProvider>>,
     port_command_runner: Arc<dyn PortCommandRunner>,
@@ -322,6 +352,9 @@ pub struct ReadOnlyMuxStateSource {
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
+    pending_session_switch: Mutex<Option<PendingSessionSwitch>>,
+    pending_width_fanout: Mutex<Option<PendingWidthFanout>>,
+    switch_handoff: Mutex<Option<SwitchHandoff>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -357,6 +390,9 @@ impl ReadOnlyMuxStateSource {
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
+            pending_session_switch: Mutex::new(None),
+            pending_width_fanout: Mutex::new(None),
+            switch_handoff: Mutex::new(None),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -418,6 +454,11 @@ impl StateSource for ReadOnlyMuxStateSource {
                 shutdown.clone(),
             )),
             tokio::spawn(run_drag_settle_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )),
+            tokio::spawn(run_coalesced_operation_loop(
                 self.clone(),
                 state_updates.clone(),
                 shutdown.clone(),
@@ -496,6 +537,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             ports_by_session,
             portless_state: None,
             focused_session: self.focused_session.lock().unwrap().clone(),
+            current_session_override: self.current_session_override(),
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
             sidebar_width: sidebar_state.width,
@@ -505,6 +547,14 @@ impl StateSource for ReadOnlyMuxStateSource {
         });
 
         serde_json::to_string(&ServerMessage::State(state)).expect("state must serialize")
+    }
+
+    fn begin_shutdown(&self) -> Option<String> {
+        {
+            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+            coordinator.begin_closing();
+        }
+        Some(self.snapshot_json())
     }
 
     fn handle_client_command(&self, command: &Value) -> Option<String> {
@@ -528,7 +578,17 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                provider.switch_session(name, client_tty);
+                let debounce = command
+                    .get("debounce")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if debounce {
+                    self.schedule_session_switch(name, client_tty);
+                } else {
+                    self.pending_session_switch.lock().unwrap().take();
+                    self.begin_switch_handoff(name);
+                    provider.switch_session(name, client_tty);
+                }
                 *self.focused_session.lock().unwrap() = Some(name.to_string());
                 // Visiting a session clears its unseen agents (turns ● back
                 // into ✓). Mirrors `tracker.handleFocus` in
@@ -567,6 +627,15 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "kill-session" => {
                 let name = command.get("name")?.as_str()?;
+                if provider.get_current_session().as_deref() == Some(name)
+                    && let Some(next) = self
+                        .session_before(name)
+                        .or_else(|| self.session_after(name))
+                {
+                    self.begin_switch_handoff(&next);
+                    provider.switch_session(&next, None);
+                    *self.focused_session.lock().unwrap() = Some(next);
+                }
                 provider.kill_session(name);
                 Some(self.snapshot_json())
             }
@@ -649,7 +718,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 // skip the sender's whole window so we never fight the pane the
                 // user is actively dragging. Mirrors `enforceSidebarWidth(senderWindowId)`
                 // in the TS server.
-                self.enforce_sidebar_width(
+                self.schedule_width_fanout(
                     decision.next_width.min(u16::MAX as u32) as u16,
                     context.window_id.as_deref(),
                 );
@@ -1101,6 +1170,94 @@ impl ReadOnlyMuxStateSource {
         resized
     }
 
+    fn schedule_session_switch(&self, name: &str, client_tty: Option<&str>) {
+        let due_at = (self.now_ms)().saturating_add(SWITCH_DEBOUNCE_MS);
+        self.begin_switch_handoff(name);
+        *self.pending_session_switch.lock().unwrap() = Some(PendingSessionSwitch {
+            name: name.to_string(),
+            client_tty: client_tty.map(ToString::to_string),
+            due_at,
+        });
+    }
+
+    fn begin_switch_handoff(&self, session: &str) {
+        let until = (self.now_ms)().saturating_add(SWITCH_HANDOFF_MS);
+        *self.switch_handoff.lock().unwrap() = Some(SwitchHandoff {
+            session: session.to_string(),
+            until,
+        });
+    }
+
+    fn current_session_override(&self) -> Option<String> {
+        let provider_current = self
+            .providers
+            .first()
+            .and_then(|provider| provider.get_current_session());
+        let now = (self.now_ms)();
+        let mut handoff = self.switch_handoff.lock().unwrap();
+        let Some(intent) = handoff.as_ref() else {
+            return None;
+        };
+        if provider_current.as_deref() == Some(intent.session.as_str()) || intent.until <= now {
+            handoff.take();
+            return None;
+        }
+        Some(intent.session.clone())
+    }
+
+    fn schedule_width_fanout(&self, width: u16, except_window_id: Option<&str>) {
+        let due_at = (self.now_ms)().saturating_add(WIDTH_FANOUT_DEBOUNCE_MS);
+        *self.pending_width_fanout.lock().unwrap() = Some(PendingWidthFanout {
+            width,
+            except_window_id: except_window_id.map(ToString::to_string),
+            due_at,
+        });
+    }
+
+    fn apply_due_coalesced_operations(&self, now: u64) -> bool {
+        let switch = {
+            let mut pending = self.pending_session_switch.lock().unwrap();
+            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        let mut changed = false;
+        if let Some(intent) = switch {
+            if let Some(provider) = self.providers.first() {
+                self.begin_switch_handoff(&intent.name);
+                provider.switch_session(&intent.name, intent.client_tty.as_deref());
+                self.agent_tracker
+                    .lock()
+                    .unwrap()
+                    .handle_focus(&intent.name);
+                changed = true;
+            }
+        }
+
+        let width = {
+            let mut pending = self.pending_width_fanout.lock().unwrap();
+            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        if let Some(intent) = width {
+            {
+                let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+                coordinator.finish_user_drag();
+                let _ = coordinator.begin_programmatic_adjustment_until(
+                    now.saturating_add(SIDEBAR_DRIFT_CORRECTION_MS),
+                );
+            }
+            changed |= self.enforce_sidebar_width(intent.width, intent.except_window_id.as_deref());
+        }
+
+        changed
+    }
+
     fn sidebar_width_drifted(&self, width: u16) -> bool {
         self.providers
             .iter()
@@ -1449,7 +1606,9 @@ impl ReadOnlyMuxStateSource {
         else {
             return;
         };
+        self.begin_switch_handoff(&name);
         provider.switch_session(&name, client_tty);
+        *self.focused_session.lock().unwrap() = Some(name);
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
@@ -1473,6 +1632,20 @@ impl ReadOnlyMuxStateSource {
         let next = names.swap_remove(next_idx);
         *self.focused_session.lock().unwrap() = Some(next.clone());
         Some(next)
+    }
+
+    fn session_before(&self, name: &str) -> Option<String> {
+        let names = self.visible_session_names()?;
+        let index = names.iter().position(|candidate| candidate == name)?;
+        index
+            .checked_sub(1)
+            .and_then(|previous| names.get(previous).cloned())
+    }
+
+    fn session_after(&self, name: &str) -> Option<String> {
+        let names = self.visible_session_names()?;
+        let index = names.iter().position(|candidate| candidate == name)?;
+        names.get(index + 1).cloned()
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
@@ -1534,6 +1707,34 @@ async fn run_drag_settle_loop(
                 };
                 if changed {
                     debug_log("sidebar_lifecycle_loop: lifecycle changed, broadcasting fresh state");
+                    let _ = state_updates.send(source.snapshot_json());
+                }
+            }
+        }
+    }
+}
+
+/// Latest-wins lane for expensive tmux effects whose intermediate states are
+/// not product commitments. The UI/state can move immediately, but tmux only
+/// receives the settled final intent. Immediate commands clear their matching
+/// pending intent before applying, so clicks/Enter/destructive actions keep
+/// their previous synchronous behavior.
+async fn run_coalesced_operation_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown.subscribe();
+    let mut interval = tokio::time::interval(Duration::from_millis(COALESCED_OP_TICK_MS));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = interval.tick() => {
+                let now = (source.now_ms)();
+                if source.apply_due_coalesced_operations(now) {
+                    debug_log("coalesced_operation_loop: applied pending tmux effects");
                     let _ = state_updates.send(source.snapshot_json());
                 }
             }
@@ -2237,19 +2438,6 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     })
 }
 
-fn default_shim_socket_path(pid_file: &std::path::Path) -> PathBuf {
-    let candidate = pid_file.with_extension("sock");
-    if candidate.as_os_str().len() < 90 {
-        return candidate;
-    }
-
-    let mut hash = 0_u32;
-    for (idx, byte) in pid_file.to_string_lossy().bytes().enumerate() {
-        hash = (hash + u32::from(byte) * (idx as u32 + 1)) % 100_000;
-    }
-    std::env::temp_dir().join(format!("opensessions-{hash}.sock"))
-}
-
 async fn run_accept_loop(
     listener: TcpListener,
     shutdown: broadcast::Sender<()>,
@@ -2260,7 +2448,11 @@ async fn run_accept_loop(
 ) -> Result<(), ServerError> {
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => return Ok(()),
+            _ = shutdown_rx.recv() => {
+                announce_shutdown(&state_source, &state_updates);
+                tokio::time::sleep(Duration::from_millis(SERVER_SHUTDOWN_DRAIN_MS)).await;
+                return Ok(());
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let connection_shutdown = shutdown.clone();
@@ -2293,6 +2485,28 @@ async fn run_accept_loop(
             }
         }
     }
+}
+
+fn announce_shutdown(
+    state_source: &Option<Arc<dyn StateSource>>,
+    state_updates: &broadcast::Sender<String>,
+) {
+    if let Some(payload) = state_source
+        .as_ref()
+        .and_then(|source| source.begin_shutdown())
+    {
+        let _ = state_updates.send(payload);
+    }
+    let _ = state_updates.send(QUIT_JSON.to_string());
+}
+
+fn request_shutdown(
+    state_source: &Option<Arc<dyn StateSource>>,
+    state_updates: &broadcast::Sender<String>,
+    shutdown: &broadcast::Sender<()>,
+) {
+    announce_shutdown(state_source, state_updates);
+    let _ = shutdown.send(());
 }
 
 async fn handle_shim_connection(
@@ -2552,8 +2766,7 @@ fn drain_sidebar_commands(
 ) -> Result<bool, ServerError> {
     for command in app.drain_commands() {
         if matches!(command, SidebarClientCommand::Quit) {
-            let _ = state_updates.send(QUIT_JSON.to_string());
-            let _ = shutdown.send(());
+            request_shutdown(state_source, state_updates, shutdown);
             return Ok(true);
         }
         let command = serde_json::to_value(command)
@@ -2770,7 +2983,7 @@ async fn handle_connection(
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .await?;
         let _ = stream.shutdown().await;
-        let _ = shutdown.send(());
+        request_shutdown(&state_source, &state_updates, &shutdown);
         return Ok(());
     }
 
@@ -2840,8 +3053,7 @@ async fn handle_connection(
                         Some(Ok(message)) if message.is_close() => return Ok(()),
                         Some(Ok(message)) => {
                             if is_quit_command(&message) {
-                                let _ = state_updates.send(QUIT_JSON.to_string());
-                                let _ = shutdown.send(());
+                                request_shutdown(&state_source, &state_updates, &shutdown);
                                 return Ok(());
                             }
                             if is_command_type(&message, "refresh") {
@@ -2958,8 +3170,7 @@ async fn handle_rendered_sidebar_connection(
                     Some(Ok(message)) if message.is_close() => return Ok(()),
                     Some(Ok(message)) => {
                         if is_quit_command(&message) {
-                            let _ = state_updates.send(QUIT_JSON.to_string());
-                            let _ = shutdown.send(());
+                            request_shutdown(&state_source, &state_updates, &shutdown);
                             return Ok(());
                         }
 
@@ -2984,8 +3195,7 @@ async fn handle_rendered_sidebar_connection(
                                     apply_render_key(app, &command);
                                     for command in app.drain_commands() {
                                         if matches!(command, SidebarClientCommand::Quit) {
-                                            let _ = state_updates.send(QUIT_JSON.to_string());
-                                            let _ = shutdown.send(());
+                                            request_shutdown(&state_source, &state_updates, &shutdown);
                                             return Ok(());
                                         }
                                         if let Ok(command) = serde_json::to_value(command) {

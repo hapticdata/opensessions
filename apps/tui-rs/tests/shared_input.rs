@@ -13,12 +13,7 @@ fn shared_input_mapping_drives_existing_session_navigation() {
         app.focused_session.as_deref(),
         Some("plane-pdf-word-formatting")
     );
-    assert_eq!(
-        app.drain_commands(),
-        vec![ClientCommand::FocusSession {
-            name: "plane-pdf-word-formatting".into()
-        }]
-    );
+    assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 }
 
 #[test]
@@ -56,6 +51,7 @@ fn shared_input_mapping_keeps_reorder_and_switch_shortcuts() {
             ClientCommand::SwitchSession {
                 name: "learning".into(),
                 client_tty: None,
+                debounce: Some(true),
             },
         ]
     );

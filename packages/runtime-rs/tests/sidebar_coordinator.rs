@@ -113,7 +113,8 @@ fn sidebar_coordinator_accepts_active_foreground_width_report() {
     assert_eq!(decision.previous_width, 26);
     assert_eq!(decision.next_width, 30);
     assert_eq!(state.width, 30);
-    assert_eq!(state.mode, "resizing");
+    assert_eq!(state.mode, "ready");
+    assert!(!state.initializing);
     assert_eq!(state.resize_authority, SidebarResizeAuthority::UserDrag);
 }
 
@@ -264,10 +265,10 @@ fn sidebar_coordinator_focus_context_change_preserves_drag_tail() {
 fn sidebar_coordinator_user_drag_settles_after_grace_period() {
     // Mirrors apps/server-rs's setTimeout(USER_DRAG_SETTLE_MS) behavior in TS:
     // once a width report is accepted, authority becomes UserDrag and the
-    // sidebar shows "adjusting…". After the settle window passes with no
+    // sidebar stays visually ready while the user is actively dragging. After
+    // the settle window passes with no
     // further reports, the next tick must clear the drag so callers see
-    // mode="ready" again. Without this the sidebar is permanently stuck in
-    // "adjusting…" because nothing else fires FINISH_USER_DRAG.
+    // authority=None again.
     let mut coordinator = SidebarCoordinator::new(26);
     coordinator.mark_ready();
     let accept_at = 1_000;

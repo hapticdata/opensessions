@@ -1,6 +1,6 @@
 use opensessions_sidebar::app::{App, Modal, PanelFocus};
 use opensessions_sidebar::generated::protocol::{
-    ClientCommand, FocusUpdate, ServerMessage, SessionFilterMode,
+    ClientCommand, FocusUpdate, ServerMessage, ServerState, SessionFilterMode,
 };
 use opensessions_sidebar::input::{UiKey, apply_ui_key};
 
@@ -95,7 +95,8 @@ fn tab_switches_to_next_visible_session_optimistically() {
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
             name: "plane-pdf-word-formatting".into(),
-            client_tty: None
+            client_tty: None,
+            debounce: Some(true),
         }]
     );
 }
@@ -113,7 +114,7 @@ fn number_key_queues_one_based_switch_index_command() {
 }
 
 #[test]
-fn navigation_keys_move_focus_optimistically_and_queue_focus_command() {
+fn navigation_keys_move_focus_locally_without_server_echo() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.focused_session = Some("opensessions".into());
 
@@ -123,12 +124,37 @@ fn navigation_keys_move_focus_optimistically_and_queue_focus_command() {
         app.focused_session.as_deref(),
         Some("plane-pdf-word-formatting")
     );
+    assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
+}
+
+#[test]
+fn state_refresh_preserves_local_session_list_cursor() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.focused_session = Some("opensessions".into());
+    app.move_focus(1);
     assert_eq!(
-        app.drain_commands(),
-        vec![ClientCommand::FocusSession {
-            name: "plane-pdf-word-formatting".into()
-        }]
+        app.focused_session.as_deref(),
+        Some("plane-pdf-word-formatting")
     );
+
+    let state = ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        ts: 1,
+    };
+    app.apply_server_message(ServerMessage::State(state));
+
+    assert_eq!(
+        app.focused_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
 }
 
 #[test]
@@ -155,6 +181,7 @@ fn agent_panel_navigation_and_actions_match_typescript_key_model() {
             ClientCommand::SwitchSession {
                 name: "opensessions".into(),
                 client_tty: None,
+                debounce: None,
             },
             ClientCommand::FocusAgentPane {
                 session: "opensessions".into(),
@@ -231,7 +258,8 @@ fn enter_switches_to_focused_session() {
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
             name: "plane-pdf-word-formatting".into(),
-            client_tty: None
+            client_tty: None,
+            debounce: None,
         }]
     );
 }

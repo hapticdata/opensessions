@@ -64,6 +64,7 @@ pub struct App {
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
+    optimistic_current_session: Option<String>,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -101,6 +102,7 @@ impl App {
             fixture_name: None,
             terminal_width: None,
             pane_identity: None,
+            optimistic_current_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         }
@@ -160,9 +162,30 @@ impl App {
     pub fn apply_server_message(&mut self, message: ServerMessage) {
         match message {
             ServerMessage::State(state) => {
+                let previous_focused_session = self.focused_session.clone();
                 self.sessions = state.sessions;
-                self.focused_session = state.focused_session;
-                self.current_session = state.current_session;
+                self.current_session = match self.optimistic_current_session.as_deref() {
+                    Some(optimistic)
+                        if state.current_session.as_deref() != Some(optimistic)
+                            && self
+                                .sessions
+                                .iter()
+                                .any(|session| session.name == optimistic) =>
+                    {
+                        Some(optimistic.to_string())
+                    }
+                    _ => {
+                        if self.optimistic_current_session.as_deref()
+                            == state.current_session.as_deref()
+                        {
+                            self.optimistic_current_session = None;
+                        }
+                        state.current_session
+                    }
+                };
+                self.focused_session = previous_focused_session
+                    .filter(|focused| self.sessions.iter().any(|session| session.name == *focused))
+                    .or(state.focused_session);
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.theme = state.theme;
@@ -174,6 +197,9 @@ impl App {
             ServerMessage::Focus(update) => {
                 self.focused_session = update.focused_session;
                 self.current_session = update.current_session;
+                if self.optimistic_current_session.as_deref() == self.current_session.as_deref() {
+                    self.optimistic_current_session = None;
+                }
                 self.session_scroll_follows_focus = true;
             }
             ServerMessage::YourSession { name, .. } => {
@@ -223,6 +249,7 @@ impl App {
             fixture_name: fixture_static_name(name),
             terminal_width: None,
             pane_identity: None,
+            optimistic_current_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -322,7 +349,7 @@ impl App {
         } else {
             (current_idx + 1) % names.len()
         };
-        self.switch_to_session(names[next_idx].clone());
+        self.switch_to_session_debounced(names[next_idx].clone());
     }
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {
@@ -353,7 +380,6 @@ impl App {
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
         self.session_scroll_follows_focus = true;
-        self.commands.push(ClientCommand::FocusSession { name });
     }
 
     pub fn session_scroll_offset(&self) -> usize {
@@ -532,9 +558,11 @@ impl App {
             return;
         };
         self.current_session = Some(session.clone());
+        self.optimistic_current_session = Some(session.clone());
         self.commands.push(ClientCommand::SwitchSession {
             name: session.clone(),
             client_tty: None,
+            debounce: None,
         });
         self.commands.push(ClientCommand::FocusAgentPane {
             session,
@@ -589,6 +617,7 @@ impl App {
     fn switch_to_session(&mut self, name: String) {
         self.my_session = Some(name.clone());
         self.current_session = Some(name.clone());
+        self.optimistic_current_session = Some(name.clone());
         self.focused_session = Some(name.clone());
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
@@ -596,6 +625,22 @@ impl App {
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
+            debounce: None,
+        });
+    }
+
+    fn switch_to_session_debounced(&mut self, name: String) {
+        self.my_session = Some(name.clone());
+        self.current_session = Some(name.clone());
+        self.optimistic_current_session = Some(name.clone());
+        self.focused_session = Some(name.clone());
+        self.panel_focus = PanelFocus::Sessions;
+        self.focused_agent_idx = 0;
+        self.session_scroll_follows_focus = true;
+        self.commands.push(ClientCommand::SwitchSession {
+            name,
+            client_tty: None,
+            debounce: Some(true),
         });
     }
 

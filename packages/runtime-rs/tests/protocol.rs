@@ -43,6 +43,7 @@ fn deserializes_client_commands_from_typescript_wire_format() {
         ClientCommand::SwitchSession {
             name: "api".to_string(),
             client_tty: Some("/dev/ttys001".to_string()),
+            debounce: None,
         }
     );
 

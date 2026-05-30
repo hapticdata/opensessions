@@ -37,6 +37,8 @@ function plog(msg: string): void {
 }
 
 const DEFAULT_SERVER_PORT = 7391;
+const RUST_SERVER_PORT_BASE = 22000;
+const TS_SERVER_PORT_BASE = 17000;
 const POST_TIMEOUT_MS = 3_000;
 
 type Status = "idle" | "running" | "tool-running" | "done" | "error" | "interrupted";
@@ -110,10 +112,9 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
 }
 
 /**
- * Port resolution — matches opensessions `packages/runtime/src/shared.ts`.
- * The server port is derived from the tmux socket path so that two users on
- * the same machine (or the same user with multiple tmux servers) don't fight
- * over the default port.
+ * Port resolution — matches the tmux-scoped opensessions server namespace.
+ * Rust servers use 22000+server_key; the older TS server used 17000+server_key.
+ * Try Rust first, then TS, so one installed plugin works while people migrate.
  */
 function hashServerKey(input: string): number {
   let hash = 0;
@@ -123,25 +124,41 @@ function hashServerKey(input: string): number {
   return hash;
 }
 
-function resolveServerPort(): number {
+function resolveServerUrls(): string[] {
+  if (process.env.OPENSESSIONS_URL) return [process.env.OPENSESSIONS_URL];
+
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  if (Number.isFinite(explicit) && explicit > 0) return [`http://127.0.0.1:${explicit}`];
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 17000 + Number.parseInt(explicitKey, 10);
+  if (explicitKey) {
+    const key = Number.parseInt(explicitKey, 10);
+    if (Number.isFinite(key)) {
+      return [
+        `http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`,
+        `http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`,
+      ];
+    }
+  }
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
     const socketPath = tmux.split(",", 1)[0];
-    if (socketPath) return 17000 + hashServerKey(socketPath);
+    if (socketPath) {
+      const key = hashServerKey(socketPath);
+      return [
+        `http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`,
+        `http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`,
+      ];
+    }
   }
-  return DEFAULT_SERVER_PORT;
+  return [`http://127.0.0.1:${DEFAULT_SERVER_PORT}`];
 }
 
-const SERVER_URL = process.env.OPENSESSIONS_URL ?? `http://127.0.0.1:${resolveServerPort()}`;
-const ENDPOINT = `${SERVER_URL}/api/agent-event`;
+const SERVER_URLS = resolveServerUrls();
+let preferredServerUrl: string | undefined;
 
-plog(`plugin loaded endpoint=${ENDPOINT} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
+plog(`plugin loaded endpoints=${SERVER_URLS.join(",")} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
 
 async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
   try {
@@ -154,17 +171,28 @@ async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
 }
 
 async function post(payload: EventPayload): Promise<void> {
-  try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-    });
-    plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
-  } catch (err) {
-    plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
+  const candidates = preferredServerUrl
+    ? [preferredServerUrl, ...SERVER_URLS.filter((url) => url !== preferredServerUrl)]
+    : SERVER_URLS;
+  let lastError: unknown;
+  for (const serverUrl of candidates) {
+    const endpoint = `${serverUrl}/api/agent-event`;
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+      });
+      if (res.ok || res.status === 404) preferredServerUrl = serverUrl;
+      plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
+      return;
+    } catch (err) {
+      lastError = err;
+      plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
+    }
   }
+  plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} failed all endpoints last=${String(lastError)}`);
 }
 
 export default function (amp: PluginAPI) {

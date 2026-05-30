@@ -231,6 +231,8 @@ pub enum ClientCommand {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        debounce: Option<bool>,
     },
     SwitchIndex {
         index: u32,
