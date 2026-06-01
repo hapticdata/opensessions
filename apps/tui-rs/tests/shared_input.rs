@@ -47,9 +47,13 @@ fn shared_input_mapping_keeps_reorder_and_switch_shortcuts() {
                 name: "plane-pdf-word-formatting".into(),
                 delta: -1,
             },
-            ClientCommand::SwitchIndex { index: 2 },
             ClientCommand::SwitchSession {
-                name: "learning".into(),
+                name: "plane-feat-background-exports".into(),
+                client_tty: None,
+                debounce: None,
+            },
+            ClientCommand::SwitchSession {
+                name: "plane-feat-edit-pages-from-pi".into(),
                 client_tty: None,
                 debounce: Some(true),
             },

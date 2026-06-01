@@ -1,11 +1,14 @@
-use opensessions_sidebar::app::{App, PanelFocus};
+use opensessions_sidebar::app::{AgentPanelScope, App, PanelFocus};
 use opensessions_sidebar::generated::protocol::ClientCommand;
 use opensessions_sidebar::input::{UiMouse, apply_ui_mouse};
-use opensessions_sidebar::renderer::{HitTarget, compute_hit_map, detail_separator_row};
-use opensessions_sidebar::snapshot::{buffer_symbol_at, render_to_buffer};
+use opensessions_sidebar::renderer::{
+    HitTarget, compute_hit_map, compute_hit_target, detail_separator_row,
+};
+use opensessions_sidebar::snapshot::{buffer_bg_at, buffer_symbol_at, render_to_buffer};
 
 const W: u16 = 35;
 const H: u16 = 56;
+const HOVER_BG: (u8, u8, u8) = (88, 91, 112);
 
 #[test]
 fn scroll_down_in_sessions_panel_moves_viewport_without_queueing_focus_command() {
@@ -126,6 +129,123 @@ fn click_on_session_row_switches_to_that_session() {
             debounce: None,
         }]
     );
+}
+
+#[test]
+fn click_on_diff_count_launches_lazydiffs_for_that_session() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    let session = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "learning")
+        .expect("fixture must include learning session");
+    session.changed_files = 3;
+    session.insertions = 4;
+    session.deletions = 10;
+
+    let mut target = None;
+    for y in 0..H {
+        for x in 0..W {
+            if compute_hit_target(&app, x, y, W, H) == Some(HitTarget::DiffCount("learning".into()))
+            {
+                target = Some((x, y));
+                break;
+            }
+        }
+        if target.is_some() {
+            break;
+        }
+    }
+    let (x, y) = target.expect("changed-file count must be a clickable target");
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Click {
+            x,
+            y,
+            width: W,
+            height: H,
+        },
+    );
+
+    assert_eq!(app.focused_session.as_deref(), Some("learning"));
+    assert!(app.drain_commands().is_empty());
+    assert_eq!(app.drain_launches().len(), 1);
+}
+
+#[test]
+fn hover_on_diff_count_highlights_diff_stats() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    let session = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "learning")
+        .expect("fixture must include learning session");
+    session.insertions = 4;
+    session.deletions = 10;
+
+    let mut target = None;
+    for y in 0..H {
+        for x in 0..W {
+            if compute_hit_target(&app, x, y, W, H) == Some(HitTarget::DiffCount("learning".into()))
+            {
+                target = Some((x, y));
+                break;
+            }
+        }
+        if target.is_some() {
+            break;
+        }
+    }
+    let (x, y) = target.expect("diff stats must expose a hover target");
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Move {
+            x,
+            y,
+            width: W,
+            height: H,
+        },
+    );
+
+    let buffer = render_to_buffer(&mut app, W, H);
+    let plus_x = (0..W)
+        .find(|candidate| buffer_symbol_at(&buffer, *candidate, y) == "+")
+        .expect("hovered diff row must render a plus sign");
+    assert_eq!(buffer_bg_at(&buffer, plus_x, y), Some(HOVER_BG));
+}
+
+#[test]
+fn click_on_agent_scope_label_toggles_between_current_and_all() {
+    let mut app = App::reference_fixture("pane-opensessions-self");
+    app.focused_session = Some("opensessions".into());
+
+    let mut target = None;
+    for y in 0..H {
+        for x in 0..W {
+            if compute_hit_target(&app, x, y, W, H) == Some(HitTarget::AgentScopeToggle) {
+                target = Some((x, y));
+                break;
+            }
+        }
+        if target.is_some() {
+            break;
+        }
+    }
+    let (x, y) = target.expect("agent scope label must be clickable");
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Click {
+            x,
+            y,
+            width: W,
+            height: H,
+        },
+    );
+
+    assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
 }
 
 #[test]

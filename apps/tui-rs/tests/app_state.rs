@@ -1,4 +1,4 @@
-use opensessions_sidebar::app::{App, Modal, PanelFocus};
+use opensessions_sidebar::app::{AgentPanelScope, App, Modal, PanelFocus};
 use opensessions_sidebar::generated::protocol::{
     ClientCommand, FocusUpdate, ServerMessage, ServerState, SessionFilterMode,
 };
@@ -109,7 +109,11 @@ fn number_key_queues_one_based_switch_index_command() {
 
     assert_eq!(
         app.drain_commands(),
-        vec![ClientCommand::SwitchIndex { index: 2 }]
+        vec![ClientCommand::SwitchSession {
+            name: "plane-feat-background-exports".into(),
+            client_tty: None,
+            debounce: None,
+        }]
     );
 }
 
@@ -202,6 +206,18 @@ fn agent_panel_navigation_and_actions_match_typescript_key_model() {
             },
         ]
     );
+}
+
+#[test]
+fn agent_panel_scope_toggle_exposes_all_session_agents() {
+    let mut app = App::reference_fixture("pane-opensessions-self");
+    app.focused_session = Some("learning".into());
+
+    app.handle_key_char('a');
+
+    assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+    app.focus_agents_panel();
+    assert_eq!(app.panel_focus, PanelFocus::Agents);
 }
 
 #[test]

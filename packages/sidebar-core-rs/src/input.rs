@@ -1,6 +1,6 @@
 use crate::app::{App, Modal, PanelFocus};
 use crate::generated::protocol::ClientCommand;
-use crate::renderer::{HitTarget, THEME_NAMES, compute_hit_map, detail_separator_row};
+use crate::renderer::{HitTarget, THEME_NAMES, compute_hit_target, detail_separator_row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiKey {
@@ -34,6 +34,12 @@ pub enum UiMouse {
         height: u16,
     },
     Click {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    Move {
         x: u16,
         y: u16,
         width: u16,
@@ -204,11 +210,11 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             let separator_row = detail_separator_row(app, width, height);
             let session_rows = separator_row.saturating_sub(3) as usize;
             if y < separator_row {
-                app.scroll_sessions(-1, session_rows as usize);
+                app.scroll_sessions(-1, session_rows);
             } else if app.panel_focus == PanelFocus::Agents {
                 app.move_agent_focus(-1);
             } else {
-                app.scroll_sessions(-1, session_rows as usize);
+                app.scroll_sessions(-1, session_rows);
             }
         }
         UiMouse::ScrollDown {
@@ -220,15 +226,15 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             let separator_row = detail_separator_row(app, width, height);
             let session_rows = separator_row.saturating_sub(3) as usize;
             if y < separator_row {
-                app.scroll_sessions(1, session_rows as usize);
+                app.scroll_sessions(1, session_rows);
             } else if app.panel_focus == PanelFocus::Agents {
                 app.move_agent_focus(1);
             } else {
-                app.scroll_sessions(1, session_rows as usize);
+                app.scroll_sessions(1, session_rows);
             }
         }
         UiMouse::Click {
-            x: _,
+            x,
             y,
             width,
             height,
@@ -239,17 +245,30 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
                 return;
             }
 
-            let hits = compute_hit_map(app, width, height);
-            let target = hits.get(y as usize).cloned().flatten();
+            let target = compute_hit_target(app, x, y, width, height);
             match target {
                 Some(HitTarget::Session(name)) => {
                     app.click_session(name);
                 }
+                Some(HitTarget::DiffCount(name)) => {
+                    app.click_diff_count(name);
+                }
                 Some(HitTarget::Agent(idx)) => {
                     app.click_agent(idx);
                 }
+                Some(HitTarget::AgentScopeToggle) => {
+                    app.toggle_agent_panel_scope();
+                }
                 None => {}
             }
+        }
+        UiMouse::Move {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            app.set_hover_target(compute_hit_target(app, x, y, width, height));
         }
         UiMouse::Drag { y } => {
             if let Some((start_y, start_height)) = app.resize_drag_state {

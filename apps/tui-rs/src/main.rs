@@ -49,7 +49,12 @@ fn debug_log(line: impl AsRef<str>) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(file, "[{now}] [sidebar] {}", line.as_ref());
+        let _ = writeln!(
+            file,
+            "[{now}] [sidebar pid={}] {}",
+            std::process::id(),
+            line.as_ref()
+        );
     }
 }
 
@@ -68,10 +73,7 @@ async fn main() -> Result<()> {
         args.server_port
     };
 
-    let identity = pane_identity_resolve(
-        |key| std::env::var(key).ok(),
-        |format, target| tmux_display_message(format, target),
-    );
+    let identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
 
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"
@@ -107,6 +109,7 @@ async fn main() -> Result<()> {
     let mut events = EventStream::new();
     let mut app: Option<App> = None;
     let mut last_reported_width: Option<u32> = None;
+    let mut last_lazydiff_launch: Option<std::time::Instant> = None;
     let mut startup_refocused = false;
     // Render-tick interval: advance the spinner clock and redraw at ~120ms so
     // the "warming up…" / "adjusting…" / agent-running spinners animate even
@@ -230,18 +233,23 @@ async fn main() -> Result<()> {
                         }
                     }
                     for launch in app.drain_launches() {
-                        let dir = app
+                        let session = app
                             .focused_session
                             .as_deref()
-                            .and_then(|name| app.sessions.iter().find(|s| s.name == name))
-                            .map(|s| s.dir.as_str())
-                            .unwrap_or(".");
-                        launch_lazydiff(launch, dir);
+                            .and_then(|name| app.sessions.iter().find(|s| s.name == name));
+                        let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
+                        let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
+                        maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
                     }
                 } else if let Event::Resize(width, _) = event {
                     if let Some(app) = &mut app {
                         app.set_terminal_width(width);
                         let width = u32::from(width);
+                        debug_log(format!(
+                            "resize-event: pane_identity={identity:?} local_session={:?} current_session={:?} previous_width={last_reported_width:?} new_width={width}",
+                            app.my_session,
+                            app.current_session,
+                        ));
                         if last_reported_width.is_some() && last_reported_width != Some(width) {
                             let local_session = identity
                                 .as_ref()
@@ -252,28 +260,45 @@ async fn main() -> Result<()> {
                                 local_session,
                                 app.current_session.as_deref(),
                             ) {
+                                debug_log(format!(
+                                    "resize-event: sending report-width width={width} local_session={local_session:?} current_session={:?}",
+                                    app.current_session,
+                                ));
                                 ws.send(Message::text(encode_client_command(&command)?)).await?;
+                            } else {
+                                debug_log(format!(
+                                    "resize-event: not reporting width={width} local_session={local_session:?} current_session={:?}",
+                                    app.current_session,
+                                ));
                             }
                         }
                         last_reported_width = Some(width);
                         terminal.draw(app)?;
                     }
-                } else if let Event::Mouse(mouse) = event {
-                    if let Some(app) = &mut app
-                        && let Some(ui_mouse) = ui_mouse_from_crossterm(mouse)
+                } else if let Event::Mouse(mouse) = event
+                    && let Some(app) = &mut app
+                    && let Some(ui_mouse) = ui_mouse_from_crossterm(mouse)
+                {
+                    let detail_height_before = app.detail_panel_height;
+                    let was_dragging_detail = app.resize_drag_state.is_some();
+                    apply_ui_mouse(app, ui_mouse);
+                    if app.detail_panel_height != detail_height_before
+                        || (was_dragging_detail && app.resize_drag_state.is_none())
                     {
-                        let detail_height_before = app.detail_panel_height;
-                        let was_dragging_detail = app.resize_drag_state.is_some();
-                        apply_ui_mouse(app, ui_mouse);
-                        if app.detail_panel_height != detail_height_before
-                            || (was_dragging_detail && app.resize_drag_state.is_none())
-                        {
-                            persist_detail_height_for_focus(app);
-                        }
-                        terminal.draw(app)?;
-                        for command in app.drain_commands() {
-                            ws.send(Message::text(encode_client_command(&command)?)).await?;
-                        }
+                        persist_detail_height_for_focus(app);
+                    }
+                    terminal.draw(app)?;
+                    for command in app.drain_commands() {
+                        ws.send(Message::text(encode_client_command(&command)?)).await?;
+                    }
+                    for launch in app.drain_launches() {
+                        let session = app
+                            .focused_session
+                            .as_deref()
+                            .and_then(|name| app.sessions.iter().find(|s| s.name == name));
+                        let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
+                        let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
+                        maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
                     }
                 }
             }
@@ -386,6 +411,15 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
             // `apps/tui/src/index.tsx`.
             let (width, height) = terminal::size().unwrap_or((0, 0));
             Some(UiMouse::Click {
+                x: mouse.column,
+                y: mouse.row,
+                width,
+                height,
+            })
+        }
+        MouseEventKind::Moved => {
+            let (width, height) = terminal::size().unwrap_or((0, 0));
+            Some(UiMouse::Move {
                 x: mouse.column,
                 y: mouse.row,
                 width,
@@ -533,7 +567,7 @@ fn tmux_run(args: &[&str]) -> Option<String> {
 /// `doStartupRefocus`).
 fn do_startup_refocus(pane_id: &str) {
     let refocus_window = std::env::var("REFOCUS_WINDOW").ok();
-    let plan = refocus_plan(pane_id, refocus_window.as_deref(), |args| tmux_run(args));
+    let plan = refocus_plan(pane_id, refocus_window.as_deref(), tmux_run);
     if let Some(plan) = plan {
         let _ = std::process::Command::new("tmux")
             .args(["select-pane", "-t", &plan.select_pane])
@@ -541,11 +575,22 @@ fn do_startup_refocus(pane_id: &str) {
     }
 }
 
-fn launch_lazydiff(target: LaunchTarget, dir: &str) {
+fn launch_lazydiff(target: LaunchTarget, dir: &str, branch: &str) {
+    let command = lazydiffs_command(branch);
     match target {
         LaunchTarget::LazydiffTmux => {
             let _ = std::process::Command::new("tmux")
-                .args(["new-window", "-c", dir, "lazydiff"])
+                .args([
+                    "display-popup",
+                    "-d",
+                    dir,
+                    "-h",
+                    "90%",
+                    "-w",
+                    "90%",
+                    "-E",
+                    &command,
+                ])
                 .output();
         }
         LaunchTarget::LazydiffTerminal => {
@@ -553,8 +598,9 @@ fn launch_lazydiff(target: LaunchTarget, dir: &str) {
             {
                 // Open a new Terminal.app window and run lazydiff in the session dir.
                 let script = format!(
-                    "tell application \"Terminal\" to do script \"cd {} && lazydiff\"",
-                    dir.replace('\\', "\\\\").replace('"', "\\\"")
+                    "tell application \"Terminal\" to do script \"cd {} && {}\"",
+                    shell_quote(dir).replace('\\', "\\\\").replace('"', "\\\""),
+                    command.replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 let _ = std::process::Command::new("osascript")
                     .args(["-e", &script])
@@ -564,16 +610,54 @@ fn launch_lazydiff(target: LaunchTarget, dir: &str) {
             {
                 // Fallback: try common terminal emulators.
                 let spawned = std::process::Command::new("x-terminal-emulator")
-                    .args(["-e", "sh", "-c", &format!("cd {} && lazydiff", dir)])
+                    .args([
+                        "-e",
+                        "sh",
+                        "-c",
+                        &format!("cd {} && {}", shell_quote(dir), command),
+                    ])
                     .spawn();
                 if spawned.is_err() {
                     let _ = std::process::Command::new("xterm")
-                        .args(["-e", "sh", "-c", &format!("cd {} && lazydiff", dir)])
+                        .args([
+                            "-e",
+                            "sh",
+                            "-c",
+                            &format!("cd {} && {}", shell_quote(dir), command),
+                        ])
                         .spawn();
                 }
             }
         }
     }
+}
+
+fn maybe_launch_lazydiff(
+    target: LaunchTarget,
+    dir: &str,
+    branch: &str,
+    last_launch: &mut Option<std::time::Instant>,
+) {
+    let now = std::time::Instant::now();
+    if last_launch
+        .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(750))
+    {
+        return;
+    }
+    *last_launch = Some(now);
+    launch_lazydiff(target, dir, branch);
+}
+
+fn lazydiffs_command(branch: &str) -> String {
+    if branch.is_empty() {
+        "lazydiff".to_string()
+    } else {
+        "lazydiff --branch".to_string()
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 struct TerminalGuard {

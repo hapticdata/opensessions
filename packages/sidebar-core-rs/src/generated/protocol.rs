@@ -60,6 +60,12 @@ pub struct SessionData {
     pub dir: String,
     pub branch: String,
     pub dirty: bool,
+    #[serde(default)]
+    pub changed_files: u32,
+    #[serde(default)]
+    pub insertions: u32,
+    #[serde(default)]
+    pub deletions: u32,
     pub is_worktree: bool,
     pub unseen: bool,
     pub panes: u32,

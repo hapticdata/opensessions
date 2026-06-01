@@ -77,7 +77,7 @@ const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const COALESCED_OP_TICK_MS: u64 = 25;
 const SWITCH_DEBOUNCE_MS: u64 = 80;
 const SWITCH_HANDOFF_MS: u64 = 1_000;
-const WIDTH_FANOUT_DEBOUNCE_MS: u64 = 250;
+const WIDTH_FANOUT_DEBOUNCE_MS: u64 = USER_DRAG_SETTLE_MS;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -99,7 +99,12 @@ fn debug_log(line: impl AsRef<str>) {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "[{now}] [server] {}", line.as_ref());
+        let _ = writeln!(
+            file,
+            "[{now}] [server pid={}] {}",
+            std::process::id(),
+            line.as_ref()
+        );
     }
 }
 
@@ -152,6 +157,10 @@ pub trait StateSource: Send + Sync + 'static {
 
     fn handle_http_hook(&self, _path: &str, _body: &str) {}
 
+    fn handle_switch_index(&self, _index: u32, _body: &str) -> Option<String> {
+        None
+    }
+
     fn should_report_sidebar_resize(&self, _context: &ClientConnectionContext) -> bool {
         false
     }
@@ -167,8 +176,6 @@ pub trait StateSource: Send + Sync + 'static {
     fn handle_pi_runtime_delete(&self, _body: &Value) -> Result<(), PiRuntimeError> {
         Err(PiRuntimeError::MissingPid)
     }
-
-    fn handle_switch_index(&self, _index: u32, _body: &str) {}
 
     fn begin_shutdown(&self) -> Option<String> {
         None
@@ -195,7 +202,15 @@ impl AgentEventError {
         match self {
             Self::MissingAgent => ("400 Bad Request", "missing agent"),
             Self::InvalidStatus => ("400 Bad Request", "invalid status"),
-            Self::CouldNotResolveSession => ("404 Not Found", "could not resolve session"),
+            // Agent events are intentionally broadcast to every opensessions
+            // server in every tmux namespace. A server that cannot map the
+            // event's projectDir/tmuxSession to one of its sessions should
+            // no-op with a non-error status so the plugin can publish once and
+            // let each server decide folder ownership locally. Use 202 (not
+            // 204) so the plugin can distinguish "ignored by this server" from
+            // "applied by an owning server" when deciding whether to retry
+            // during owner-server restarts.
+            Self::CouldNotResolveSession => ("202 Accepted", ""),
         }
     }
 }
@@ -292,10 +307,19 @@ impl GitCommandRunner for SystemGitCommandRunner {
             return String::new();
         };
 
+        let Ok(numstat) = process::Command::new("git")
+            .current_dir(dir)
+            .args(["diff", "--numstat", "HEAD", "--"])
+            .output()
+        else {
+            return String::new();
+        };
+
         format!(
-            "{}\n---\n{}",
+            "{}\n---\n{}\n---NUMSTAT---\n{}",
             String::from_utf8_lossy(&rev_parse.stdout).trim(),
-            String::from_utf8_lossy(&status.stdout).trim()
+            String::from_utf8_lossy(&status.stdout).trim(),
+            String::from_utf8_lossy(&numstat.stdout).trim()
         )
     }
 }
@@ -603,8 +627,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "switch-index" => {
                 let index = command.get("index")?.as_u64()?.min(u32::MAX as u64) as u32;
-                self.switch_visible_index(index, None);
-                None
+                self.switch_visible_index(index, None)
             }
             "focus-session" => {
                 let name = command.get("name")?.as_str()?;
@@ -685,6 +708,17 @@ impl StateSource for ReadOnlyMuxStateSource {
                             && context.window_id.as_deref() == Some(pane.window_id.as_str())
                     })
                 });
+                debug_log(format!(
+                    "width-report: received width={width} context_session={:?} context_window={:?} \
+                     context_pane={:?} provider_current_session={:?} provider_current_window={:?} \
+                     active_session={is_active_session} current_window={is_current_window} \
+                     sidebar_pane={is_current_sidebar_pane}",
+                    context.session_name,
+                    context.window_id,
+                    context.pane_id,
+                    current_session,
+                    current_window_id,
+                ));
                 let decision = self.sidebar_coordinator.lock().unwrap().apply_width_report(
                     SidebarWidthReportInput {
                         width,
@@ -700,15 +734,18 @@ impl StateSource for ReadOnlyMuxStateSource {
                     },
                 );
                 debug_log(format!(
-                    "report-width width={width} session={:?} window={:?} \
+                    "width-report: decision width={width} session={:?} window={:?} \
                      pane={:?} active_session={is_active_session} \
                      current_window={is_current_window} \
-                     current_sidebar_pane={is_current_sidebar_pane} accepted={} reason={}",
+                     current_sidebar_pane={is_current_sidebar_pane} accepted={} reason={} previous={} next={} continued_drag={}",
                     context.session_name,
                     context.window_id,
                     context.pane_id,
                     decision.accepted,
                     decision.reason,
+                    decision.previous_width,
+                    decision.next_width,
+                    decision.continued_drag,
                 ));
                 if !decision.accepted {
                     return None;
@@ -896,8 +933,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         if had_unseen {
             return Some(self.snapshot_json());
         }
-        let current_session = self.providers.first()?.get_current_session();
-        Some(format_focus_json(Some(&name), current_session.as_deref()))
+        Some(format_focus_json(Some(&name), Some(&name)))
     }
 
     fn handle_http_hook(&self, path: &str, body: &str) {
@@ -922,6 +958,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let now = (self.now_ms)();
                 let width = self.current_sidebar_width_u16();
                 if self.adopt_active_sidebar_width_from_layout(now) {
+                    return;
+                }
+                if self.active_window_sidebar_width_drifted(width) {
+                    debug_log(format!(
+                        "layout-width: active window sidebar differs from stored width={width}; leaving foreground pane alone while report-width settles"
+                    ));
                     return;
                 }
                 if self.can_correct_sidebar_width_drift() && self.sidebar_width_drifted(width) {
@@ -971,9 +1013,9 @@ impl StateSource for ReadOnlyMuxStateSource {
             })
     }
 
-    fn handle_switch_index(&self, index: u32, body: &str) {
+    fn handle_switch_index(&self, index: u32, body: &str) -> Option<String> {
         let client_tty = parse_context(body).and_then(|context| context.client_tty);
-        self.switch_visible_index(index, client_tty.as_deref());
+        self.switch_visible_index(index, client_tty.as_deref())
     }
 }
 
@@ -1158,11 +1200,23 @@ impl ReadOnlyMuxStateSource {
             }
             for pane in provider.list_sidebar_panes(None) {
                 if except_window_id == Some(pane.window_id.as_str()) {
+                    debug_log(format!(
+                        "width-fanout: skip pane={} window={} session={} width={:?} reason=source-window target_width={width}",
+                        pane.pane_id, pane.window_id, pane.session_name, pane.width,
+                    ));
                     continue;
                 }
                 if pane.width == Some(width) {
+                    debug_log(format!(
+                        "width-fanout: skip pane={} window={} session={} width={:?} reason=already-target target_width={width}",
+                        pane.pane_id, pane.window_id, pane.session_name, pane.width,
+                    ));
                     continue;
                 }
+                debug_log(format!(
+                    "width-fanout: resize pane={} window={} session={} from={:?} to={width}",
+                    pane.pane_id, pane.window_id, pane.session_name, pane.width,
+                ));
                 provider.resize_sidebar_pane(&pane.pane_id, width);
                 resized = true;
             }
@@ -1207,6 +1261,9 @@ impl ReadOnlyMuxStateSource {
 
     fn schedule_width_fanout(&self, width: u16, except_window_id: Option<&str>) {
         let due_at = (self.now_ms)().saturating_add(WIDTH_FANOUT_DEBOUNCE_MS);
+        debug_log(format!(
+            "width-fanout: scheduled width={width} except_window={except_window_id:?} due_at={due_at}"
+        ));
         *self.pending_width_fanout.lock().unwrap() = Some(PendingWidthFanout {
             width,
             except_window_id: except_window_id.map(ToString::to_string),
@@ -1245,6 +1302,10 @@ impl ReadOnlyMuxStateSource {
             }
         };
         if let Some(intent) = width {
+            debug_log(format!(
+                "width-fanout: applying width={} except_window={:?} now={now}",
+                intent.width, intent.except_window_id,
+            ));
             {
                 let mut coordinator = self.sidebar_coordinator.lock().unwrap();
                 coordinator.finish_user_drag();
@@ -1252,7 +1313,13 @@ impl ReadOnlyMuxStateSource {
                     now.saturating_add(SIDEBAR_DRIFT_CORRECTION_MS),
                 );
             }
-            changed |= self.enforce_sidebar_width(intent.width, intent.except_window_id.as_deref());
+            let resized =
+                self.enforce_sidebar_width(intent.width, intent.except_window_id.as_deref());
+            debug_log(format!(
+                "width-fanout: applied width={} resized={resized}",
+                intent.width,
+            ));
+            changed = true;
         }
 
         changed
@@ -1264,6 +1331,21 @@ impl ReadOnlyMuxStateSource {
             .filter(|provider| provider.is_sidebar_capable())
             .flat_map(|provider| provider.list_sidebar_panes(None))
             .any(|pane| pane.width.is_some_and(|pane_width| pane_width != width))
+    }
+
+    fn active_window_sidebar_width_drifted(&self, width: u16) -> bool {
+        self.providers
+            .iter()
+            .filter(|provider| provider.is_sidebar_capable())
+            .any(|provider| {
+                let current_session = provider.get_current_session();
+                let current_window_id = provider.get_current_window_id();
+                provider.list_sidebar_panes(None).into_iter().any(|pane| {
+                    current_session.as_deref() == Some(pane.session_name.as_str())
+                        && current_window_id.as_deref() == Some(pane.window_id.as_str())
+                        && pane.width.is_some_and(|pane_width| pane_width != width)
+                })
+            })
     }
 
     fn adopt_active_sidebar_width_from_layout(&self, now: u64) -> bool {
@@ -1356,7 +1438,11 @@ impl ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .suppress_width_reports(now + 500);
-        self.enforce_sidebar_width(width, None)
+        let current_window_id = self
+            .providers
+            .first()
+            .and_then(|provider| provider.get_current_window_id());
+        self.enforce_sidebar_width(width, current_window_id.as_deref())
     }
 
     fn provider_for_session(&self, session: &str) -> Option<Arc<dyn MuxProvider>> {
@@ -1593,22 +1679,27 @@ impl ReadOnlyMuxStateSource {
         }
     }
 
-    fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) {
+    fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
         let Some(provider) = self.providers.first() else {
-            return;
+            return None;
         };
         let Some(target_index) = index.checked_sub(1).map(|index| index as usize) else {
-            return;
+            return None;
         };
-        let Some(name) = self
-            .visible_session_names()
-            .and_then(|names| names.get(target_index).cloned())
-        else {
-            return;
+        let Some(name) = app_from_state_json(&self.snapshot_json()).and_then(|app| {
+            app.display_sessions()
+                .get(target_index)
+                .map(|session| session.name.clone())
+        }) else {
+            return None;
         };
         self.begin_switch_handoff(&name);
         provider.switch_session(&name, client_tty);
-        *self.focused_session.lock().unwrap() = Some(name);
+        *self.focused_session.lock().unwrap() = Some(name.clone());
+        self.agent_tracker.lock().unwrap().handle_focus(&name);
+        Some(format!(
+            r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
+        ))
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
@@ -2638,9 +2729,21 @@ async fn handle_shim_connection(
                     ShimToServer::Hello(_) => {}
                     ShimToServer::Close => return Ok(()),
                     ShimToServer::Resize { width: next_width, height: next_height } => {
-                        if next_width != width && state_source.as_ref().is_some_and(|state_source| {
-                            state_source.should_report_sidebar_resize(&context)
-                        }) {
+                        let should_report_resize = next_width != width
+                            && state_source.as_ref().is_some_and(|state_source| {
+                                state_source.should_report_sidebar_resize(&context)
+                            });
+                        debug_log(format!(
+                            "shim-resize: pane={:?} session={:?} window={:?} old={}x{} new={}x{} should_report_width={should_report_resize}",
+                            context.pane_id,
+                            context.session_name,
+                            context.window_id,
+                            width,
+                            height,
+                            next_width,
+                            next_height,
+                        ));
+                        if should_report_resize {
                             let command = serde_json::json!({
                                 "type": "report-width",
                                 "width": next_width,
@@ -2832,7 +2935,9 @@ async fn handle_connection(
         };
         let body = String::from_utf8_lossy(http_body(&request));
         if let Some(state_source) = &state_source {
-            state_source.handle_switch_index(index, &body);
+            if let Some(payload) = state_source.handle_switch_index(index, &body) {
+                let _ = state_updates.send(payload);
+            }
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")

@@ -111,6 +111,9 @@ fn serializes_server_state_with_typescript_fields_and_omits_undefined_optionals(
             dir: "/repo".to_string(),
             branch: "main".to_string(),
             dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
             is_worktree: false,
             unseen: false,
             panes: 2,
@@ -140,6 +143,6 @@ fn serializes_server_state_with_typescript_fields_and_omits_undefined_optionals(
 
     assert_eq!(
         serde_json::to_string(&ServerMessage::State(state)).unwrap(),
-        r#"{"type":"state","sessions":[{"name":"opensessions","createdAt":1,"dir":"/repo","branch":"main","dirty":false,"isWorktree":false,"unseen":false,"panes":2,"ports":[7391],"localLinks":[{"kind":"direct","port":7391,"url":"http://127.0.0.1:7391","label":":7391"}],"windows":1,"uptime":"1m","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"opensessions","currentSession":null,"sidebarWidth":35,"initializing":false,"ts":3}"#,
+        r#"{"type":"state","sessions":[{"name":"opensessions","createdAt":1,"dir":"/repo","branch":"main","dirty":false,"changedFiles":0,"insertions":0,"deletions":0,"isWorktree":false,"unseen":false,"panes":2,"ports":[7391],"localLinks":[{"kind":"direct","port":7391,"url":"http://127.0.0.1:7391","label":":7391"}],"windows":1,"uptime":"1m","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"opensessions","currentSession":null,"sidebarWidth":35,"initializing":false,"ts":3}"#,
     );
 }

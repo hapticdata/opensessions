@@ -27,7 +27,7 @@
 
 // @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
 import type { PluginAPI } from "@ampcode/plugin";
-import { appendFileSync, readFileSync } from "fs";
+import { appendFileSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -39,7 +39,10 @@ function plog(msg: string): void {
 const DEFAULT_SERVER_PORT = 7391;
 const RUST_SERVER_PORT_BASE = 22000;
 const TS_SERVER_PORT_BASE = 17000;
-const POST_TIMEOUT_MS = 3_000;
+const POST_TIMEOUT_MS = 750;
+const RETRY_INITIAL_MS = 250;
+const RETRY_MAX_MS = 2_000;
+const RETRY_FOR_MS = 30_000;
 
 type Status = "idle" | "running" | "tool-running" | "done" | "error" | "interrupted";
 
@@ -125,19 +128,22 @@ function hashServerKey(input: string): number {
 }
 
 function resolveServerUrls(): string[] {
-  if (process.env.OPENSESSIONS_URL) return [process.env.OPENSESSIONS_URL];
+  const urls: string[] = [];
+  const add = (url: string | undefined): void => {
+    if (url && !urls.includes(url)) urls.push(url);
+  };
+
+  add(process.env.OPENSESSIONS_URL);
 
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
-  if (Number.isFinite(explicit) && explicit > 0) return [`http://127.0.0.1:${explicit}`];
+  if (Number.isFinite(explicit) && explicit > 0) add(`http://127.0.0.1:${explicit}`);
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
   if (explicitKey) {
     const key = Number.parseInt(explicitKey, 10);
     if (Number.isFinite(key)) {
-      return [
-        `http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`,
-        `http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`,
-      ];
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
 
@@ -146,19 +152,39 @@ function resolveServerUrls(): string[] {
     const socketPath = tmux.split(",", 1)[0];
     if (socketPath) {
       const key = hashServerKey(socketPath);
-      return [
-        `http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`,
-        `http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`,
-      ];
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
-  return [`http://127.0.0.1:${DEFAULT_SERVER_PORT}`];
+
+  // Broadcast agent telemetry to every opensessions server currently known on
+  // this machine. Each server maps projectDir/tmuxSession against its own tmux
+  // sessions and no-ops events for folders it does not own.
+  try {
+    for (const entry of readdirSync("/tmp")) {
+      const match = /^opensessions\.(\d+)\.pid$/.exec(entry);
+      if (!match) continue;
+      const key = Number.parseInt(match[1], 10);
+      if (!Number.isFinite(key)) continue;
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
+    }
+  } catch {}
+
+  if (urls.length === 0) add(`http://127.0.0.1:${DEFAULT_SERVER_PORT}`);
+  return urls;
 }
 
-const SERVER_URLS = resolveServerUrls();
+function serverUrls(): string[] {
+  // Resolve at send time, not plugin-load time. Amp plugin processes can live
+  // across opensessions restarts and tmux env changes; stale endpoints during
+  // a restart should not strand events until Amp itself is restarted.
+  return resolveServerUrls();
+}
+
 let preferredServerUrl: string | undefined;
 
-plog(`plugin loaded endpoints=${SERVER_URLS.join(",")} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
+plog(`plugin loaded endpoints=${serverUrls().join(",")} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
 
 async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
   try {
@@ -170,11 +196,54 @@ async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
   }
 }
 
-async function post(payload: EventPayload): Promise<void> {
+type PendingPayload = EventPayload & { firstAttemptTs: number; retryDelayMs: number };
+
+const pendingByThread = new Map<string, PendingPayload>();
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+function pendingKey(payload: EventPayload): string {
+  return payload.threadId ?? `${payload.projectDir}:${payload.tmuxSession ?? ""}`;
+}
+
+function scheduleRetry(): void {
+  if (retryTimer || pendingByThread.size === 0) return;
+  const nextDelay = Math.min(
+    ...Array.from(pendingByThread.values()).map((payload) => payload.retryDelayMs),
+  );
+  retryTimer = setTimeout(() => {
+    retryTimer = undefined;
+    void flushPending();
+  }, nextDelay);
+}
+
+async function flushPending(): Promise<void> {
+  const now = Date.now();
+  for (const [key, payload] of Array.from(pendingByThread.entries())) {
+    if (now - payload.firstAttemptTs > RETRY_FOR_MS) {
+      pendingByThread.delete(key);
+      plog(`retry drop status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ageMs=${now - payload.firstAttemptTs}`);
+      continue;
+    }
+    const { firstAttemptTs, retryDelayMs, ...eventPayload } = payload;
+    if (await postOnce(eventPayload)) {
+      pendingByThread.delete(key);
+    } else {
+      pendingByThread.set(key, {
+        ...payload,
+        retryDelayMs: Math.min(retryDelayMs * 2, RETRY_MAX_MS),
+      });
+    }
+  }
+  scheduleRetry();
+}
+
+async function postOnce(payload: EventPayload): Promise<boolean> {
+  const urls = serverUrls();
   const candidates = preferredServerUrl
-    ? [preferredServerUrl, ...SERVER_URLS.filter((url) => url !== preferredServerUrl)]
-    : SERVER_URLS;
+    ? [preferredServerUrl, ...urls.filter((url) => url !== preferredServerUrl)]
+    : urls;
   let lastError: unknown;
+  let delivered = false;
   for (const serverUrl of candidates) {
     const endpoint = `${serverUrl}/api/agent-event`;
     try {
@@ -184,15 +253,33 @@ async function post(payload: EventPayload): Promise<void> {
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(POST_TIMEOUT_MS),
       });
-      if (res.ok || res.status === 404) preferredServerUrl = serverUrl;
+      if (res.status === 204) {
+        preferredServerUrl = serverUrl;
+        delivered = true;
+      }
       plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
-      return;
     } catch (err) {
       lastError = err;
       plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
     }
   }
+  if (delivered) return true;
   plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} failed all endpoints last=${String(lastError)}`);
+  return false;
+}
+
+async function post(payload: EventPayload): Promise<void> {
+  if (await postOnce(payload)) return;
+
+  const key = pendingKey(payload);
+  const existing = pendingByThread.get(key);
+  pendingByThread.set(key, {
+    ...payload,
+    firstAttemptTs: existing?.firstAttemptTs ?? Date.now(),
+    retryDelayMs: RETRY_INITIAL_MS,
+  });
+  plog(`retry queued status=${payload.status} thread=${payload.threadId?.slice(0, 8)} key=${key} pending=${pendingByThread.size}`);
+  scheduleRetry();
 }
 
 export default function (amp: PluginAPI) {

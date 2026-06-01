@@ -5,6 +5,8 @@ use crate::generated::protocol::{
     SessionData, SessionFilterMode,
 };
 use crate::renderer::HitTarget;
+pub use crate::session_display::DisplaySessionEntry;
+use crate::session_display::session_display_entries;
 
 pub const SESSION_CARD_HEIGHT: usize = 4;
 
@@ -15,8 +17,14 @@ pub enum PanelFocus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPanelScope {
+    Current,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchTarget {
-    /// Open lazydiff in a new tmux window.
+    /// Open lazydiffs in a tmux popup.
     LazydiffTmux,
     /// Open lazydiff in a new terminal window.
     LazydiffTerminal,
@@ -52,10 +60,12 @@ pub struct App {
     pub spinner_now: u64,
     pub session_filter: SessionFilterMode,
     pub panel_focus: PanelFocus,
+    pub agent_panel_scope: AgentPanelScope,
     pub focused_agent_idx: usize,
     pub quit_deadline: Option<Instant>,
     pub flash_target: Option<HitTarget>,
     pub flash_deadline: Option<Instant>,
+    pub hover_target: Option<HitTarget>,
     pub modal: Modal,
     pub detail_panel_height: usize,
     pub session_scroll_offset: usize,
@@ -90,10 +100,12 @@ impl App {
             spinner_now: 0,
             session_filter: state.session_filter.unwrap_or_default(),
             panel_focus: PanelFocus::Sessions,
+            agent_panel_scope: AgentPanelScope::Current,
             focused_agent_idx: 0,
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
+            hover_target: None,
             modal: Modal::None,
             detail_panel_height: 10,
             session_scroll_offset: 0,
@@ -237,10 +249,12 @@ impl App {
             spinner_now: 0,
             session_filter: SessionFilterMode::All,
             panel_focus: PanelFocus::Sessions,
+            agent_panel_scope: AgentPanelScope::Current,
             focused_agent_idx: 0,
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
+            hover_target: None,
             modal: Modal::None,
             detail_panel_height: 10,
             session_scroll_offset: 0,
@@ -266,10 +280,10 @@ impl App {
         next_current_session: Option<&str>,
         local_session_name: Option<&str>,
     ) -> Option<String> {
-        if let (Some(local), Some(current)) = (local_session_name, next_current_session) {
-            if current != local {
-                return Some(local.to_string());
-            }
+        if let (Some(local), Some(current)) = (local_session_name, next_current_session)
+            && current != local
+        {
+            return Some(local.to_string());
         }
 
         next_focused_session
@@ -297,11 +311,28 @@ impl App {
         })
     }
 
+    pub fn display_session_entries(&self) -> Vec<DisplaySessionEntry<'_>> {
+        session_display_entries(self.filtered_sessions().collect())
+    }
+
+    pub fn display_sessions(&self) -> Vec<&SessionData> {
+        self.display_session_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                DisplaySessionEntry::Session { session, .. } => Some(session),
+                DisplaySessionEntry::Group { .. } => None,
+            })
+            .collect()
+    }
+
     pub fn handle_key_char(&mut self, key: char) {
         match key {
-            '1'..='9' => self.commands.push(ClientCommand::SwitchIndex {
-                index: key.to_digit(10).expect("digit key must parse"),
-            }),
+            '1'..='9' => {
+                let index = key.to_digit(10).expect("digit key must parse") as usize;
+                if let Some(session) = self.display_sessions().get(index.saturating_sub(1)) {
+                    self.switch_to_session(session.name.clone());
+                }
+            }
             'q' => {
                 self.commands.push(ClientCommand::Quit);
                 self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
@@ -327,13 +358,15 @@ impl App {
             'L' => self.pending_launches.push(LaunchTarget::LazydiffTerminal),
             't' => self.open_theme_picker(),
             'f' => self.cycle_filter(),
+            'a' => self.toggle_agent_panel_scope(),
             _ => {}
         }
     }
 
     pub fn handle_tab(&mut self, shift: bool) {
         let names: Vec<String> = self
-            .filtered_sessions()
+            .display_sessions()
+            .into_iter()
             .map(|session| session.name.clone())
             .collect();
         if names.is_empty() {
@@ -391,7 +424,7 @@ impl App {
     }
 
     pub fn scroll_sessions(&mut self, delta: i8, viewport_rows: usize) {
-        let len = self.filtered_sessions().count();
+        let len = self.display_sessions().len();
         if len == 0 || viewport_rows == 0 {
             self.session_scroll_offset = 0;
             return;
@@ -445,6 +478,19 @@ impl App {
         self.focused_agent_idx = self.focused_agent_idx.min(agent_count - 1);
     }
 
+    pub fn toggle_agent_panel_scope(&mut self) {
+        self.agent_panel_scope = match self.agent_panel_scope {
+            AgentPanelScope::Current => AgentPanelScope::All,
+            AgentPanelScope::All => AgentPanelScope::Current,
+        };
+        self.focused_agent_idx = self
+            .focused_agent_idx
+            .min(self.focused_agents_len().saturating_sub(1));
+        if self.focused_agents_len() == 0 {
+            self.panel_focus = PanelFocus::Sessions;
+        }
+    }
+
     pub fn move_agent_focus(&mut self, delta: i8) {
         let agent_count = self.focused_agents_len();
         if agent_count == 0 {
@@ -477,6 +523,13 @@ impl App {
         self.focused_session = Some(name.clone());
         self.session_scroll_follows_focus = true;
         self.switch_to_session(name);
+    }
+
+    pub fn click_diff_count(&mut self, name: String) {
+        self.trigger_flash(HitTarget::DiffCount(name.clone()));
+        self.focused_session = Some(name);
+        self.session_scroll_follows_focus = true;
+        self.pending_launches.push(LaunchTarget::LazydiffTmux);
     }
 
     /// Click on an agent row in the detail panel. Mirrors the TS
@@ -517,6 +570,10 @@ impl App {
             return None;
         }
         self.flash_target.as_ref()
+    }
+
+    pub fn set_hover_target(&mut self, target: Option<HitTarget>) {
+        self.hover_target = target;
     }
 
     pub fn is_modal_open(&self) -> bool {
@@ -573,9 +630,10 @@ impl App {
     }
 
     pub fn dismiss_focused_agent(&mut self) {
-        let Some((session, agent, agent_count)) = self
+        let agent_count = self.focused_agents_len();
+        let Some((session, agent)) = self
             .focused_agent()
-            .map(|(session, agent)| (session.name.clone(), agent.clone(), session.agents.len()))
+            .map(|(session, agent)| (session.name.clone(), agent.clone()))
         else {
             return;
         };
@@ -668,7 +726,7 @@ impl App {
         let focused = self.focused_session.as_deref();
         let mut focused_idx = None;
         let mut len = 0;
-        for (idx, session) in self.filtered_sessions().enumerate() {
+        for (idx, session) in self.display_sessions().into_iter().enumerate() {
             if Some(session.name.as_str()) == focused {
                 focused_idx = Some(idx);
             }
@@ -678,8 +736,8 @@ impl App {
     }
 
     fn filtered_session_name_at(&self, index: usize) -> Option<String> {
-        self.filtered_sessions()
-            .nth(index)
+        self.display_sessions()
+            .get(index)
             .map(|session| session.name.clone())
     }
 
@@ -689,15 +747,32 @@ impl App {
     }
 
     fn focused_agents_len(&self) -> usize {
-        self.focused_session_data()
-            .map(|session| session.agents.len())
-            .unwrap_or(0)
+        match self.agent_panel_scope {
+            AgentPanelScope::Current => self
+                .focused_session_data()
+                .map(|session| session.agents.len())
+                .unwrap_or(0),
+            AgentPanelScope::All => self
+                .sessions
+                .iter()
+                .map(|session| session.agents.len())
+                .sum(),
+        }
     }
 
     fn focused_agent(&self) -> Option<(&SessionData, &AgentEvent)> {
-        let session = self.focused_session_data()?;
-        let agent = session.agents.get(self.focused_agent_idx)?;
-        Some((session, agent))
+        match self.agent_panel_scope {
+            AgentPanelScope::Current => {
+                let session = self.focused_session_data()?;
+                let agent = session.agents.get(self.focused_agent_idx)?;
+                Some((session, agent))
+            }
+            AgentPanelScope::All => self
+                .sessions
+                .iter()
+                .flat_map(|session| session.agents.iter().map(move |agent| (session, agent)))
+                .nth(self.focused_agent_idx),
+        }
     }
 }
 
@@ -813,6 +888,9 @@ fn session(
         dir: dir.to_string(),
         branch: branch.to_string(),
         dirty: false,
+        changed_files: 0,
+        insertions: 0,
+        deletions: 0,
         is_worktree: false,
         unseen: name == "plane-pdf-word-formatting",
         panes: 1,

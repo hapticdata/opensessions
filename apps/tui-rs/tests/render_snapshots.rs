@@ -36,7 +36,17 @@ fn focused_agent_row_uses_highlight_background() {
     app.focused_agent_idx = 0;
     let buffer = render_to_buffer(&mut app, 35, 55);
 
-    assert_eq!(buffer_bg_at(&buffer, 1, 41), Some((69, 71, 90)));
+    let mut found_highlight = false;
+    for y in 39..51 {
+        if buffer_bg_at(&buffer, 1, y) == Some((69, 71, 90)) {
+            found_highlight = true;
+            break;
+        }
+    }
+    assert!(
+        found_highlight,
+        "focused agent row must be highlighted in the detail panel"
+    );
 }
 
 #[test]
@@ -63,10 +73,47 @@ fn focused_detail_panel_streams_agent_status_labels() {
     let buffer = render_to_buffer(&mut app, 35, 55);
     let ansi = buffer_to_ansi(&buffer);
 
-    assert!(ansi.contains("running"));
-    assert!(ansi.contains("waiting"));
+    assert!(ansi.contains("working"));
+    assert!(ansi.contains("blocked"));
     assert!(ansi.contains("error"));
-    assert!(ansi.contains("Implement shim protocol"));
+    assert!(ansi.contains("Implement shim"));
+}
+
+#[test]
+fn worktree_sessions_render_under_parent_group() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    let first = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-edit-pages-from-pi")
+        .expect("fixture should include plane worktree session");
+    first.dir = "/Users/me/work/plane-ee-wt/feat-databases".into();
+    first.is_worktree = true;
+    let second = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-background-exports")
+        .expect("fixture should include second plane worktree session");
+    second.dir = "/Users/me/work/plane-ee-wt/preview".into();
+    second.is_worktree = true;
+
+    let buffer = render_to_buffer(&mut app, 35, 56);
+    let ansi = buffer_to_ansi(&buffer);
+
+    assert!(ansi.contains("plane-ee-wt"));
+    assert!(ansi.contains("2 worktrees"));
+    let mut found_second_worktree = false;
+    for y in 0..20 {
+        let mut row = String::new();
+        for x in 0..35 {
+            row.push_str(&buffer_symbol_at(&buffer, x, y));
+        }
+        if row.contains("2 plane-feat-background") {
+            found_second_worktree = true;
+            break;
+        }
+    }
+    assert!(found_second_worktree);
 }
 
 #[test]

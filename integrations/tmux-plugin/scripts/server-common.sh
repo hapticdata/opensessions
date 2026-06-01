@@ -53,6 +53,7 @@ PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 SERVER_WIDTH="${TMUX_OPENSESSIONS_WIDTH:-26}"
 SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
+START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
 
 RUST_SERVER_BIN=""
 if [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
@@ -71,13 +72,60 @@ server_alive() {
   curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
 }
 
+acquire_start_lock() {
+  attempt=0
+  while ! mkdir "$START_LOCK_DIR" 2>/dev/null; do
+    if server_alive; then
+      return 2
+    fi
+
+    lock_pid=""
+    if [ -f "$START_LOCK_DIR/pid" ]; then
+      lock_pid="$(cat "$START_LOCK_DIR/pid" 2>/dev/null)"
+    fi
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -rf "$START_LOCK_DIR"
+      continue
+    fi
+
+    if [ "$attempt" -ge 50 ]; then
+      show_startup_error "opensessions: server start lock timed out. Remove $START_LOCK_DIR if no launcher is active."
+      return 1
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+
+  printf '%s\n' "$$" >"$START_LOCK_DIR/pid" 2>/dev/null || true
+  return 0
+}
+
+release_start_lock() {
+  rm -rf "$START_LOCK_DIR"
+}
+
 ensure_server() {
   if server_alive; then
     return 0
   fi
 
+  acquire_start_lock
+  lock_status=$?
+  if [ "$lock_status" -eq 2 ]; then
+    return 0
+  fi
+  if [ "$lock_status" -ne 0 ]; then
+    return 1
+  fi
+
+  if server_alive; then
+    release_start_lock
+    return 0
+  fi
+
   if [ -z "$RUST_SERVER_BIN" ]; then
     show_startup_error "opensessions: server binary not found. Run: cd $PLUGIN_DIR && cargo build --release -p opensessions-server"
+    release_start_lock
     return 1
   fi
 
@@ -94,11 +142,21 @@ ensure_server() {
   while [ "$attempt" -lt 30 ]; do
     sleep 0.1
     if server_alive; then
+      release_start_lock
       return 0
     fi
     attempt=$((attempt + 1))
   done
 
+  # A concurrent launcher may have won the race between our final poll and the
+  # child bind attempt. Treat a healthy endpoint as success; never surface an
+  # "address already in use" startup failure when the server is actually up.
+  if server_alive; then
+    release_start_lock
+    return 0
+  fi
+
   show_startup_error "opensessions: server failed to start. See $SERVER_LOG"
+  release_start_lock
   return 1
 }

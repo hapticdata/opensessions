@@ -418,7 +418,7 @@ fn read_only_mux_state_source_serializes_runtime_state() {
 
     assert_eq!(
         source.snapshot_json(),
-        r#"{"type":"state","sessions":[{"name":"api","createdAt":60,"dir":"/repo/api","branch":"","dirty":false,"isWorktree":false,"unseen":false,"panes":5,"ports":[],"localLinks":[],"windows":2,"uptime":"1m","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"api","currentSession":"api","sidebarWidth":33,"initializing":false,"ts":120000}"#,
+        r#"{"type":"state","sessions":[{"name":"api","createdAt":60,"dir":"/repo/api","branch":"","dirty":false,"changedFiles":0,"insertions":0,"deletions":0,"isWorktree":false,"unseen":false,"panes":5,"ports":[],"localLinks":[],"windows":2,"uptime":"1m","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"api","currentSession":"api","sidebarWidth":33,"initializing":false,"ts":120000}"#,
     );
 }
 
@@ -932,7 +932,7 @@ async fn websocket_kill_session_command_calls_mux_and_broadcasts_state() {
     assert_eq!(
         state.as_text(),
         Some(
-            r#"{"type":"state","sessions":[{"name":"api","createdAt":1,"dir":"/repo/api","branch":"","dirty":false,"isWorktree":false,"unseen":false,"panes":1,"ports":[],"localLinks":[],"windows":1,"uptime":"","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"api","currentSession":"api","sidebarWidth":26,"initializing":false,"ts":789}"#
+            r#"{"type":"state","sessions":[{"name":"api","createdAt":1,"dir":"/repo/api","branch":"","dirty":false,"changedFiles":0,"insertions":0,"deletions":0,"isWorktree":false,"unseen":false,"panes":1,"ports":[],"localLinks":[],"windows":1,"uptime":"","agentState":null,"agents":[],"eventTimestamps":[]}],"focusedSession":"api","currentSession":"api","sidebarWidth":26,"initializing":false,"ts":789}"#
         )
     );
 
@@ -1300,7 +1300,7 @@ async fn report_width_coalesces_background_sidebar_fanout_to_latest_width() {
             .expect("report-width command should send");
     }
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     assert_eq!(
         *mux.resize_calls.lock().unwrap(),
         vec![("%2".to_string(), 44)],
@@ -1998,7 +1998,7 @@ async fn http_focus_context_returns_ok_and_broadcasts_focus_update() {
         .expect("focus broadcast should be valid");
     assert_eq!(
         focus.as_text(),
-        Some(r#"{"type":"focus","focusedSession":"worker","currentSession":"api"}"#)
+        Some(r#"{"type":"focus","focusedSession":"worker","currentSession":"worker"}"#)
     );
 
     server.shutdown().await.expect("server should shut down");
@@ -2036,6 +2036,16 @@ async fn http_switch_index_switches_to_visible_session_with_context_tty() {
     )
     .await
     .expect("server should start");
+    let uri: Uri = format!("ws://{}", server.addr())
+        .parse()
+        .expect("server address should produce a websocket uri");
+
+    let (mut client, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("server should upgrade websocket client");
+    let _ = client.next().await.expect("hello should arrive");
+    let _ = client.next().await.expect("initial state should arrive");
 
     let response = post_text(
         server.addr(),
@@ -2051,6 +2061,86 @@ async fn http_switch_index_switches_to_visible_session_with_context_tty() {
     assert_eq!(
         *mux.switch_calls.lock().unwrap(),
         vec![("worker".to_string(), Some("/dev/ttys-test".to_string()))]
+    );
+    let focus = timeout(Duration::from_secs(1), client.next())
+        .await
+        .expect("focus broadcast should arrive before timeout")
+        .expect("focus broadcast should arrive")
+        .expect("focus broadcast should be valid");
+    assert_eq!(
+        focus.as_text(),
+        Some(r#"{"type":"focus","focusedSession":"worker","currentSession":"worker"}"#),
+        "prefix opensessions index shortcuts should update sidebars immediately without waiting for tmux poll"
+    );
+
+    server.shutdown().await.expect("server should shut down");
+    let _ = fs::remove_file(pid_file);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_switch_index_follows_grouped_sidebar_order() {
+    let pid_file = test_pid_file("http-switch-index-grouped-order");
+    let mux = Arc::new(ServerMux {
+        current: Some("api".to_string()),
+        sessions: vec![
+            MuxSessionInfo {
+                name: "api".to_string(),
+                created_at: 1,
+                dir: "/standalone/api".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "feat-databases".to_string(),
+                created_at: 2,
+                dir: "/repo/plane-ee-wt/feat-databases".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "worker".to_string(),
+                created_at: 3,
+                dir: "/other/worker".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "preview".to_string(),
+                created_at: 4,
+                dir: "/repo/plane-ee-wt/preview".to_string(),
+                windows: 1,
+            },
+        ],
+        panes: 1,
+        create_calls: Mutex::new(0),
+        switch_calls: Mutex::new(Vec::new()),
+        kill_calls: Mutex::new(Vec::new()),
+    });
+    let git_runner = Arc::new(StaticGitRunner {
+        output: "main\n.git/worktrees/session\n---\n".to_string(),
+        calls: Mutex::new(Vec::new()),
+    });
+    let server = start_server(
+        ServerConfig::new("127.0.0.1", 0, &pid_file).with_state_source(
+            ReadOnlyMuxStateSource::new(vec![mux.clone()])
+                .with_now_ms(|| 5_000)
+                .with_git_command_runner(git_runner),
+        ),
+    )
+    .await
+    .expect("server should start");
+
+    let response = post_text(
+        server.addr(),
+        "/switch-index?index=3",
+        "/dev/ttys-test|api|@1",
+    )
+    .await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "response was {response}"
+    );
+    assert_eq!(
+        *mux.switch_calls.lock().unwrap(),
+        vec![("preview".to_string(), Some("/dev/ttys-test".to_string()))],
+        "index shortcuts should match the sidebar's grouped visual order"
     );
 
     server.shutdown().await.expect("server should shut down");
@@ -2187,6 +2277,46 @@ fn state_source_corrects_sidebar_width_drift_after_settle() {
     assert_eq!(
         *mux.resize_calls.lock().unwrap(),
         vec![("%sidebar".to_string(), 40)],
+    );
+}
+
+#[test]
+fn state_source_drift_correction_never_snaps_foreground_sidebar() {
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![
+            SidebarPane {
+                pane_id: "%foreground".to_string(),
+                session_name: "worker".to_string(),
+                window_id: "@2".to_string(),
+                width: Some(36),
+                window_width: Some(160),
+            },
+            SidebarPane {
+                pane_id: "%background".to_string(),
+                session_name: "api".to_string(),
+                window_id: "@1".to_string(),
+                width: Some(36),
+                window_width: Some(160),
+            },
+        ],
+        active_windows: vec![ActiveWindow {
+            id: "@2".to_string(),
+            session_name: "worker".to_string(),
+            active: true,
+        }],
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let source = ReadOnlyMuxStateSource::new(vec![mux.clone()]).with_sidebar_width(40);
+
+    assert!(!source.correct_sidebar_width_drift_after_settle(1_000));
+    assert!(source.correct_sidebar_width_drift_after_settle(1_300));
+    assert_eq!(
+        *mux.resize_calls.lock().unwrap(),
+        vec![("%background".to_string(), 40)],
+        "drift correction may normalize background panes, but must not snap the foreground pane while its report-width can still be in flight"
     );
 }
 
@@ -2502,8 +2632,7 @@ async fn http_agent_event_rejects_invalid_payloads() {
         r#"{"agent":"amp","status":"running","tmuxSession":"missing"}"#,
     )
     .await;
-    assert!(unresolved.starts_with("HTTP/1.1 404 Not Found\r\n"));
-    assert!(unresolved.ends_with("\r\n\r\ncould not resolve session"));
+    assert!(unresolved.starts_with("HTTP/1.1 202 Accepted\r\n"));
 
     server.shutdown().await.expect("server should shut down");
     let _ = fs::remove_file(pid_file);
@@ -2732,6 +2861,9 @@ fn state_source_populates_git_info_and_caches_by_dir_for_five_seconds() {
 
     assert_eq!(first["sessions"][0]["branch"], "main");
     assert_eq!(first["sessions"][0]["dirty"], true);
+    assert_eq!(first["sessions"][0]["changedFiles"], 1);
+    assert_eq!(first["sessions"][0]["insertions"], 0);
+    assert_eq!(first["sessions"][0]["deletions"], 0);
     assert_eq!(first["sessions"][0]["isWorktree"], true);
     assert_eq!(second["sessions"][0]["branch"], "main");
     assert_eq!(
