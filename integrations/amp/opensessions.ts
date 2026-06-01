@@ -52,6 +52,7 @@ interface EventPayload {
   threadId?: string;
   threadName?: string;
   tmuxSession?: string;
+  paneId?: string;
   projectDir: string;
   ts: number;
 }
@@ -164,15 +165,26 @@ function resolveServerUrls(): string[] {
     for (const entry of readdirSync("/tmp")) {
       const match = /^opensessions\.(\d+)\.pid$/.exec(entry);
       if (!match) continue;
+      if (!pidFileIsAlive(join("/tmp", entry))) continue;
       const key = Number.parseInt(match[1], 10);
       if (!Number.isFinite(key)) continue;
       add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   } catch {}
 
   if (urls.length === 0) add(`http://127.0.0.1:${DEFAULT_SERVER_PORT}`);
   return urls;
+}
+
+function pidFileIsAlive(path: string): boolean {
+  try {
+    const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function serverUrls(): string[] {
@@ -191,6 +203,16 @@ async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
     const result = await $`tmux display-message -p '#S'`;
     const name = result.stdout.trim();
     return name.length > 0 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveTmuxPane($: PluginAPI["$"]): Promise<string | null> {
+  try {
+    const result = await $`tmux display-message -p '#{pane_id}'`;
+    const paneId = result.stdout.trim();
+    return paneId.length > 0 ? paneId : null;
   } catch {
     return null;
   }
@@ -243,7 +265,6 @@ async function postOnce(payload: EventPayload): Promise<boolean> {
     ? [preferredServerUrl, ...urls.filter((url) => url !== preferredServerUrl)]
     : urls;
   let lastError: unknown;
-  let delivered = false;
   for (const serverUrl of candidates) {
     const endpoint = `${serverUrl}/api/agent-event`;
     try {
@@ -255,7 +276,8 @@ async function postOnce(payload: EventPayload): Promise<boolean> {
       });
       if (res.status === 204) {
         preferredServerUrl = serverUrl;
-        delivered = true;
+        plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
+        return true;
       }
       plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
     } catch (err) {
@@ -263,7 +285,6 @@ async function postOnce(payload: EventPayload): Promise<boolean> {
       plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
     }
   }
-  if (delivered) return true;
   plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} failed all endpoints last=${String(lastError)}`);
   return false;
 }
@@ -285,10 +306,14 @@ async function post(payload: EventPayload): Promise<void> {
 export default function (amp: PluginAPI) {
   const projectDir = process.cwd();
   let tmuxSession: string | null = null;
+  let paneId: string | null = null;
 
   // Resolve tmux session eagerly so we have it ready for the first event.
   resolveTmuxSession(amp.$).then((name) => {
     tmuxSession = name;
+  });
+  resolveTmuxPane(amp.$).then((id) => {
+    paneId = id;
   });
 
   /**
@@ -343,6 +368,7 @@ export default function (amp: PluginAPI) {
       threadId: tid,
       threadName: resolveTitle(tid),
       tmuxSession: tmuxSession ?? undefined,
+      paneId: paneId ?? undefined,
       projectDir,
       ts: Date.now(),
     });
@@ -350,6 +376,7 @@ export default function (amp: PluginAPI) {
 
   amp.on("session.start", async (event, ctx) => {
     if (!tmuxSession) tmuxSession = await resolveTmuxSession(ctx.$);
+    if (!paneId) paneId = await resolveTmuxPane(ctx.$);
     await send("idle", event.thread?.id ?? ctx.thread?.id);
   });
 

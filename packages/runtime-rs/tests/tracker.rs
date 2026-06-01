@@ -235,6 +235,99 @@ fn synthetic_pane_entry_merges_when_watcher_event_arrives_for_same_thread() {
     assert_eq!(agents[0].liveness, Some(AgentLiveness::Alive));
 }
 
+#[test]
+fn synthetic_pane_entry_merges_by_pane_id_when_thread_names_drift() {
+    let mut tracker = AgentTracker::new();
+
+    tracker.apply_pane_presence(
+        "sess-1",
+        vec![
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%21".to_string(),
+                thread_id: None,
+                thread_name: Some("Pane title".to_string()),
+            },
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%22".to_string(),
+                thread_id: None,
+                thread_name: Some("Other pane".to_string()),
+            },
+        ],
+    );
+    let mut plugin_event = event("sess-1", "amp", AgentStatus::ToolRunning).with_thread("abc");
+    plugin_event.thread_name = Some("Cloud title".to_string());
+    plugin_event.pane_id = Some("%21".to_string());
+    plugin_event.liveness = Some(AgentLiveness::Alive);
+    tracker.apply_event(plugin_event);
+
+    let agents = tracker.get_agents("sess-1");
+    assert_eq!(agents.len(), 2);
+    let matched = agents
+        .iter()
+        .find(|agent| agent.thread_id.as_deref() == Some("abc"))
+        .unwrap();
+    assert_eq!(matched.thread_name.as_deref(), Some("Cloud title"));
+    assert_eq!(matched.pane_id.as_deref(), Some("%21"));
+}
+
+#[test]
+fn pane_presence_uses_thread_name_to_avoid_duplicate_agent_rows() {
+    let mut tracker = AgentTracker::new();
+
+    tracker.apply_pane_presence(
+        "sess-1",
+        vec![
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%21".to_string(),
+                thread_id: None,
+                thread_name: Some("Build better panel".to_string()),
+            },
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%22".to_string(),
+                thread_id: None,
+                thread_name: Some("Other task".to_string()),
+            },
+        ],
+    );
+
+    let mut thread_b = event("sess-1", "amp", AgentStatus::ToolRunning).with_thread("thread-b");
+    thread_b.thread_name = Some("Build better panel".to_string());
+    tracker.apply_event(thread_b);
+
+    let agents = tracker.get_agents("sess-1");
+    assert_eq!(agents.len(), 3);
+    assert!(tracker.apply_pane_presence(
+        "sess-1",
+        vec![
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%21".to_string(),
+                thread_id: None,
+                thread_name: Some("Build better panel".to_string()),
+            },
+            PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%22".to_string(),
+                thread_id: None,
+                thread_name: Some("Other task".to_string()),
+            },
+        ]
+    ));
+
+    let agents = tracker.get_agents("sess-1");
+    assert_eq!(agents.len(), 2);
+    let matched = agents
+        .iter()
+        .find(|agent| agent.thread_id.as_deref() == Some("thread-b"))
+        .unwrap();
+    assert_eq!(matched.pane_id.as_deref(), Some("%21"));
+    assert_eq!(matched.liveness, Some(AgentLiveness::Alive));
+}
+
 fn event(session: &str, agent: &str, status: AgentStatus) -> AgentEvent {
     event_at(session, agent, status, now_ms())
 }

@@ -54,6 +54,28 @@ impl SessionOrder {
         let _ = self.save();
     }
 
+    pub fn reorder_visible(&mut self, visible_names: &[String], name: &str, delta: i8) {
+        let Some(index) = visible_names.iter().position(|candidate| candidate == name) else {
+            return;
+        };
+        let new_index = index as isize + delta as isize;
+        if new_index < 0 || new_index >= visible_names.len() as isize {
+            return;
+        }
+
+        let mut visible = visible_names.to_vec();
+        visible.swap(index, new_index as usize);
+        let visible_set = visible.iter().cloned().collect::<BTreeSet<_>>();
+        visible.extend(
+            self.order
+                .iter()
+                .filter(|name| !visible_set.contains(*name))
+                .cloned(),
+        );
+        self.order = visible;
+        let _ = self.save();
+    }
+
     pub fn hide(&mut self, name: &str) {
         if !self.order.iter().any(|candidate| candidate == name)
             || self.hidden.iter().any(|candidate| candidate == name)

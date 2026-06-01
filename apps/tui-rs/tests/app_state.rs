@@ -192,6 +192,7 @@ fn agent_panel_navigation_and_actions_match_typescript_key_model() {
                 agent: "amp".into(),
                 thread_id: None,
                 thread_name: Some("Query tmux for open sessions".into()),
+                pane_id: None,
             },
             ClientCommand::DismissAgent {
                 session: "opensessions".into(),
@@ -203,9 +204,37 @@ fn agent_panel_navigation_and_actions_match_typescript_key_model() {
                 agent: "amp".into(),
                 thread_id: None,
                 thread_name: Some("Query tmux for open sessions".into()),
+                pane_id: None,
             },
         ]
     );
+}
+
+#[test]
+fn agent_panel_actions_prefer_exact_pane_id_when_available() {
+    let mut app = App::reference_fixture("pane-opensessions-self");
+    app.focused_session = Some("opensessions".into());
+    let agent = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "opensessions")
+        .and_then(|session| session.agents.first_mut())
+        .expect("fixture should include an opensessions agent");
+    agent.pane_id = Some("%agent".into());
+
+    app.focus_agents_panel();
+    app.activate_focused_item();
+    app.kill_focused_agent_pane();
+
+    let commands = app.drain_commands();
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        ClientCommand::FocusAgentPane { pane_id, .. } if pane_id.as_deref() == Some("%agent")
+    )));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        ClientCommand::KillAgentPane { pane_id, .. } if pane_id.as_deref() == Some("%agent")
+    )));
 }
 
 #[test]

@@ -612,18 +612,18 @@ impl MuxProvider for TmuxProvider {
             .filter(|pane| pane.title != "opensessions-sidebar")
             .collect::<Vec<_>>();
 
-        if agent == "amp" {
-            if let Some(thread_name) = thread_name {
-                let matches = panes
-                    .iter()
-                    .filter(|pane| {
-                        pane.title.to_lowercase().starts_with("amp - ")
-                            && pane.title.contains(thread_name)
-                    })
-                    .collect::<Vec<_>>();
-                if matches.len() == 1 {
-                    return Some(matches[0].id.clone());
-                }
+        if agent == "amp"
+            && let Some(thread_name) = thread_name
+        {
+            let matches = panes
+                .iter()
+                .filter(|pane| {
+                    pane.title.to_lowercase().starts_with("amp - ")
+                        && pane.title.contains(thread_name)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                return Some(matches[0].id.clone());
             }
         }
 
@@ -774,7 +774,7 @@ const AGENT_ALIASES: &[(&str, &[&str])] = &[
 fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
     let title = pane.title.trim();
     if agent == "amp"
-        && let Some((_, thread_name)) = title.split_once(" - ")
+        && let Some((thread_name, _)) = title.split_once(" - amp - ")
     {
         let thread_name = thread_name.trim();
         if !thread_name.is_empty() {

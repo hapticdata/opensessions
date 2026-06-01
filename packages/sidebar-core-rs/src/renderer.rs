@@ -1242,6 +1242,10 @@ fn compute_agent_window(
 }
 
 fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -> Vec<StyledLine> {
+    if app.agent_panel_scope == AgentPanelScope::All {
+        return compact_agent_panel_block(app, palette, entry);
+    }
+
     let focused = app.panel_focus == crate::app::PanelFocus::Agents
         && app.focused_agent_idx == entry.global_idx;
     let hit = HitTarget::Agent(entry.global_idx);
@@ -1260,30 +1264,25 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
     primary.push(icon, icon_color);
     primary.push(" ", palette.white);
     primary.push(
-        &entry.session.name,
+        &entry.agent.agent,
         if highlight {
             palette.text
         } else {
             palette.subtext1
         },
     );
-    if let Some(thread_name) = entry.agent.thread_name.as_deref() {
-        primary.push(" · ", palette.overlay0);
-        primary.push(truncate_right(thread_name, 14), palette.overlay1);
-    }
+    primary.push(" · ", palette.overlay0);
+    primary.push(
+        semantic_agent_status_text(entry.agent, entry.session.unseen),
+        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
+    );
 
     let mut secondary = StyledLine::with_bg(bg);
     secondary.push("    ", palette.white);
-    let label = semantic_agent_status_text(entry.agent, entry.session.unseen);
-    secondary.push(
-        label,
-        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
-    );
-    secondary.push(" · ", palette.overlay0);
-    secondary.push(&entry.agent.agent, palette.overlay0);
     if let Some(thread_name) = entry.agent.thread_name.as_deref() {
-        secondary.push(" · ", palette.overlay0);
-        secondary.push(truncate_right(thread_name, 18), palette.overlay1);
+        secondary.push(truncate_right(thread_name, 22), palette.overlay1);
+    } else {
+        secondary.push("no thread", palette.surface2);
     }
 
     vec![
@@ -1299,6 +1298,44 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
                 bg,
             })
             .with_hit(hit),
+    ]
+}
+
+fn compact_agent_panel_block(
+    app: &App,
+    palette: &Palette,
+    entry: AgentPanelEntry<'_>,
+) -> Vec<StyledLine> {
+    let focused = app.panel_focus == crate::app::PanelFocus::Agents
+        && app.focused_agent_idx == entry.global_idx;
+    let hit = HitTarget::Agent(entry.global_idx);
+    let bg = focused.then_some(palette.surface1);
+    let mut line = StyledLine::with_bg(bg);
+    line.push("  ", palette.white);
+    let (icon, icon_color) = detail_status_icon_for_agent(
+        palette,
+        entry.agent,
+        entry.session.unseen,
+        spinner_clock(app),
+    );
+    line.push(icon, icon_color);
+    line.push(" ", palette.white);
+    line.push(entry.agent.agent.as_str(), palette.subtext1);
+    line.push(" · ", palette.overlay0);
+    line.push(
+        semantic_agent_status_text(entry.agent, entry.session.unseen),
+        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
+    );
+    if let Some(thread_name) = entry.agent.thread_name.as_deref() {
+        line.push(" · ", palette.overlay0);
+        line.push(truncate_right(thread_name, 10), palette.overlay1);
+    }
+    vec![
+        line.end(CellStyle {
+            fg: palette.white,
+            bg,
+        })
+        .with_hit(hit),
     ]
 }
 

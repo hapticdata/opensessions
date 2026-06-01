@@ -156,16 +156,16 @@ fn resolve_focused_session(
         return None;
     }
 
-    if let Some(focused) = focused_session {
-        if sessions.iter().any(|session| session.name == focused) {
-            return Some(focused);
-        }
+    if let Some(focused) = focused_session
+        && sessions.iter().any(|session| session.name == focused)
+    {
+        return Some(focused);
     }
 
-    if let Some(current) = current_session {
-        if sessions.iter().any(|session| session.name == current) {
-            return Some(current.to_string());
-        }
+    if let Some(current) = current_session
+        && sessions.iter().any(|session| session.name == current)
+    {
+        return Some(current.to_string());
     }
 
     sessions.first().map(|session| session.name.clone())

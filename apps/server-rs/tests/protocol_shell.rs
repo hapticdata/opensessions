@@ -2147,6 +2147,64 @@ async fn http_switch_index_follows_grouped_sidebar_order() {
     let _ = fs::remove_file(pid_file);
 }
 
+#[test]
+fn move_focus_follows_grouped_sidebar_order() {
+    let source = ReadOnlyMuxStateSource::new(vec![Arc::new(ServerMux {
+        current: Some("api".to_string()),
+        sessions: vec![
+            MuxSessionInfo {
+                name: "api".to_string(),
+                created_at: 1,
+                dir: "/standalone/api".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "feat-databases".to_string(),
+                created_at: 2,
+                dir: "/repo/plane-ee-wt/feat-databases".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "worker".to_string(),
+                created_at: 3,
+                dir: "/other/worker".to_string(),
+                windows: 1,
+            },
+            MuxSessionInfo {
+                name: "preview".to_string(),
+                created_at: 4,
+                dir: "/repo/plane-ee-wt/preview".to_string(),
+                windows: 1,
+            },
+        ],
+        panes: 1,
+        create_calls: Mutex::new(0),
+        switch_calls: Mutex::new(Vec::new()),
+        kill_calls: Mutex::new(Vec::new()),
+    })])
+    .with_now_ms(|| 5_000)
+    .with_git_command_runner(Arc::new(StaticGitRunner {
+        output: "main\n.git/worktrees/session\n---\n".to_string(),
+        calls: Mutex::new(Vec::new()),
+    }));
+
+    source.handle_client_command(&serde_json::json!({
+        "type": "focus-session",
+        "name": "feat-databases",
+    }));
+    let payload = source
+        .handle_client_command(&serde_json::json!({
+            "type": "move-focus",
+            "delta": 1,
+        }))
+        .expect("move-focus should produce focus payload");
+
+    assert_eq!(
+        payload, r#"{"type":"focus","focusedSession":"preview","currentSession":"api"}"#,
+        "focus movement should match the grouped sidebar order"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn http_resize_hooks_return_ok_for_tmux_hook_compatibility() {
     let pid_file = test_pid_file("http-resize-hooks");
@@ -2797,6 +2855,41 @@ fn state_source_focuses_and_kills_resolved_agent_panes() {
     assert_eq!(
         *mux.kill_pane_calls.lock().unwrap(),
         vec!["%agent".to_string()]
+    );
+}
+
+#[test]
+fn state_source_focuses_and_kills_explicit_agent_pane_id_without_resolution() {
+    let mux = Arc::new(AgentPaneMux {
+        focus_calls: Mutex::new(Vec::new()),
+        kill_pane_calls: Mutex::new(Vec::new()),
+        resolve_calls: Mutex::new(Vec::new()),
+    });
+    let source = ReadOnlyMuxStateSource::new(vec![mux.clone()]);
+
+    source.handle_client_command(&serde_json::json!({
+        "type": "focus-agent-pane",
+        "session": "api",
+        "agent": "amp",
+        "threadName": "migrate server",
+        "paneId": "%direct"
+    }));
+    source.handle_client_command(&serde_json::json!({
+        "type": "kill-agent-pane",
+        "session": "api",
+        "agent": "amp",
+        "threadName": "migrate server",
+        "paneId": "%direct"
+    }));
+
+    assert_eq!(*mux.resolve_calls.lock().unwrap(), Vec::new());
+    assert_eq!(
+        *mux.focus_calls.lock().unwrap(),
+        vec!["%direct".to_string()]
+    );
+    assert_eq!(
+        *mux.kill_pane_calls.lock().unwrap(),
+        vec!["%direct".to_string()]
     );
 }
 

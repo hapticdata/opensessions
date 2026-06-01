@@ -383,16 +383,21 @@ pub enum ClientCommand {
 }
 ```
 
-## Codegen path (Phase 0)
+## Protocol type ownership (current)
 
-To prevent type drift between TS and Rust, the recommended Phase 0 work:
+Rust protocol types are owned in `packages/runtime-rs/src/protocol.rs`. The
+sidebar re-exports those types from `packages/sidebar-core-rs/src/generated/protocol.rs`
+so server, sidebar core, and TUI code compile against one Rust source of truth.
+
+## Codegen path (future TS sync)
+
+To prevent type drift between TS and Rust, the recommended follow-up work:
 
 1. Annotate every TS interface in `packages/runtime/src/shared.ts` and
    `contracts/agent.ts` with `ts-rs` (or `specta`).
-2. Add a `pnpm run gen-types` script that emits Rust code into
-   `apps/tui-rs/src/generated/protocol.rs`.
-3. Wire it into the Cargo build via `build.rs` so a stale TS schema fails the
-   Rust build immediately.
+2. Add a `pnpm run gen-types` script that emits TypeScript declarations from the
+   Rust protocol or verifies the TypeScript mirror against it.
+3. Wire it into CI so a stale TS schema fails immediately.
 
 If we don't want runtime TS deps, alternatively use `typeshare` or hand-maintain
 this file with a snapshot test in TS that asserts the wire format hasn't changed.

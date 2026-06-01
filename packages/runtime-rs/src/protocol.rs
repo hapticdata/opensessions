@@ -294,6 +294,8 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
     KillAgentPane {
         session: String,
@@ -302,6 +304,8 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
     ReportWidth {
         width: u32,

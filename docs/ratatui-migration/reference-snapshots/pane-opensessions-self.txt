@@ -12,10 +12,12 @@
    3 learning
      main
 
- ▌ 4 opensessions                ⚙
+
+ ⚙ 4 opensessions
      devpulse
 
- ▌ 5 plane-pdf-word-formatting   ●
+
+ ● 5 plane-pdf-word-formatting
      pdf-word-formatting
      chore-relation-pqls
 
@@ -34,22 +36,20 @@
 
 
 
-
-
  ──────────────────────────────────
+ agents 2                 a:current
  …ments/work/opensessions
 
-  ⚙ amp                    tools ✕
-  Query tmux for open sessions
+  ⚙ amp · working
+    Query tmux for open s…
 
-  ○ amp                          ✕
-
-
+  ○ amp · idle
+    no thread
 
 
 
 
  ──────────────────────────────────
- ⇥ cycle  ⏎ go  → agents  f filter
-  d hide  x kill
+ ⇥ cycle  ⏎ go  → agents  f
+ filter  d hide  x kill
 

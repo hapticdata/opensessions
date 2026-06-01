@@ -4,6 +4,8 @@ use crate::protocol::{
     MetadataLogEntry, MetadataProgress, MetadataStatus, MetadataTone, SessionMetadata,
 };
 
+type ProgressUpdate = Option<(Option<u64>, Option<u64>, Option<f64>, Option<String>)>;
+
 const MAX_LOGS: usize = 50;
 const MAX_MESSAGE_LENGTH: usize = 500;
 
@@ -43,11 +45,7 @@ impl SessionMetadataStore {
         }
     }
 
-    pub fn set_progress(
-        &mut self,
-        session: &str,
-        progress: Option<(Option<u64>, Option<u64>, Option<f64>, Option<String>)>,
-    ) {
+    pub fn set_progress(&mut self, session: &str, progress: ProgressUpdate) {
         match progress {
             Some((current, total, percent, label)) => {
                 let meta = self.get_or_create(session);

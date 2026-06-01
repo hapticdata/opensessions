@@ -62,7 +62,7 @@ impl AgentTracker {
                 event
             })
             .collect::<Vec<_>>();
-        agents.sort_by(|a, b| b.ts.cmp(&a.ts));
+        agents.sort_by_key(|agent| std::cmp::Reverse(agent.ts));
         agents
     }
 
@@ -378,9 +378,7 @@ impl AgentTracker {
                 }
 
                 let generic_synthetic_key = synthetic_pane_key(&pane.agent, &pane.pane_id, None);
-                if self.remove_instance(session, &generic_synthetic_key) {
-                    changed = true;
-                }
+                self.remove_instance(session, &generic_synthetic_key);
 
                 let synthetic = AgentEvent {
                     agent: pane.agent,
@@ -409,6 +407,52 @@ impl AgentTracker {
                 .filter(|(key, event)| event.agent == pane.agent && !is_synthetic_pane_key(key))
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
+
+            let named_watcher_entries = self
+                .instances
+                .get(session)
+                .expect("session instances exist")
+                .iter()
+                .filter(|(key, event)| {
+                    event.agent == pane.agent
+                        && !is_synthetic_pane_key(key)
+                        && event.thread_name.is_some()
+                        && event.thread_name == pane.thread_name
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+
+            if named_watcher_entries.len() == 1 {
+                if self.stamp_alive(session, &named_watcher_entries[0], &pane.pane_id) {
+                    changed = true;
+                }
+                let synthetic_key = synthetic_pane_key(&pane.agent, &pane.pane_id, None);
+                changed = self.remove_instance(session, &synthetic_key) || changed;
+                continue;
+            }
+
+            if pane.thread_name.is_some()
+                && watcher_entries.len() == 1
+                && self
+                    .instances
+                    .get(session)
+                    .and_then(|instances| instances.get(&watcher_entries[0]))
+                    .and_then(|event| event.thread_name.as_ref())
+                    .is_some()
+            {
+                let synthetic_key = synthetic_pane_key(&pane.agent, &pane.pane_id, None);
+                if self
+                    .instances
+                    .get(session)
+                    .and_then(|instances| instances.get(&synthetic_key))
+                    .is_some()
+                {
+                    if self.stamp_alive(session, &synthetic_key, &pane.pane_id) {
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
 
             if watcher_entries.len() == 1 {
                 if self.stamp_alive(session, &watcher_entries[0], &pane.pane_id) {
@@ -519,7 +563,17 @@ impl AgentTracker {
             }
         }
 
-        let match_to_merge = if exact_matches.len() == 1 {
+        let pane_match = event.pane_id.as_deref().and_then(|pane_id| {
+            exact_matches
+                .iter()
+                .chain(generic_matches.iter())
+                .find(|(_, candidate_event)| candidate_event.pane_id.as_deref() == Some(pane_id))
+                .cloned()
+        });
+
+        let match_to_merge = if pane_match.is_some() {
+            pane_match
+        } else if exact_matches.len() == 1 {
             exact_matches.pop()
         } else if exact_matches.is_empty() && generic_matches.len() == 1 {
             generic_matches.pop()

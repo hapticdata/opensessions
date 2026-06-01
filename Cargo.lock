@@ -499,6 +499,7 @@ dependencies = [
 name = "opensessions-sidebar-core"
 version = "0.1.0"
 dependencies = [
+ "opensessions-runtime",
  "ratatui",
  "serde",
  "unicode-width",

@@ -674,7 +674,12 @@ impl StateSource for ReadOnlyMuxStateSource {
             "reorder-session" => {
                 let name = command.get("name")?.as_str()?;
                 let delta = command.get("delta")?.as_i64()? as i8;
-                self.session_order.lock().unwrap().reorder(name, delta);
+                if let Some(names) = self.sidebar_display_session_names() {
+                    self.session_order
+                        .lock()
+                        .unwrap()
+                        .reorder_visible(&names, name, delta);
+                }
                 Some(self.snapshot_json())
             }
             "set-theme" => {
@@ -766,8 +771,9 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let agent = command.get("agent")?.as_str()?;
                 let thread_id = command.get("threadId").and_then(Value::as_str);
                 let thread_name = command.get("threadName").and_then(Value::as_str);
+                let pane_id = command.get("paneId").and_then(Value::as_str);
                 if let Some((provider, pane_id)) =
-                    self.resolve_agent_pane(session, agent, thread_id, thread_name)
+                    self.resolve_agent_pane(session, agent, thread_id, thread_name, pane_id)
                 {
                     provider.focus_pane(&pane_id);
                 }
@@ -778,8 +784,9 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let agent = command.get("agent")?.as_str()?;
                 let thread_id = command.get("threadId").and_then(Value::as_str);
                 let thread_name = command.get("threadName").and_then(Value::as_str);
+                let pane_id = command.get("paneId").and_then(Value::as_str);
                 if let Some((provider, pane_id)) =
-                    self.resolve_agent_pane(session, agent, thread_id, thread_name)
+                    self.resolve_agent_pane(session, agent, thread_id, thread_name, pane_id)
                 {
                     provider.kill_pane(&pane_id);
                 }
@@ -1065,6 +1072,10 @@ impl ReadOnlyMuxStateSource {
             .get("ts")
             .and_then(Value::as_u64)
             .unwrap_or_else(|| (self.now_ms)());
+        let pane_id = body
+            .get("paneId")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
             session,
@@ -1079,8 +1090,8 @@ impl ReadOnlyMuxStateSource {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
             unseen: None,
-            pane_id: None,
-            liveness: None,
+            liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
+            pane_id,
         });
         Ok(())
     }
@@ -1136,19 +1147,21 @@ impl ReadOnlyMuxStateSource {
             .flat_map(|provider| provider.list_sessions())
             .collect::<Vec<_>>();
 
-        if let Some(tmux_session) = body.get("tmuxSession").and_then(Value::as_str) {
-            if sessions.iter().any(|session| session.name == tmux_session) {
-                return Some(tmux_session.to_string());
+        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str) {
+            let dir_session_map = build_dir_session_map(
+                sessions
+                    .iter()
+                    .map(|session| (session.name.clone(), session.dir.clone())),
+            );
+            if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
+                return Some(session);
             }
         }
 
-        let project_dir = body.get("projectDir")?.as_str()?;
-        let dir_session_map = build_dir_session_map(
-            sessions
-                .into_iter()
-                .map(|session| (session.name, session.dir)),
-        );
-        resolve_session_for_project_dir(project_dir, &dir_session_map)
+        body.get("tmuxSession")
+            .and_then(Value::as_str)
+            .filter(|tmux_session| sessions.iter().any(|session| session.name == *tmux_session))
+            .map(ToString::to_string)
     }
 
     fn resolve_agent_pane(
@@ -1157,8 +1170,12 @@ impl ReadOnlyMuxStateSource {
         agent: &str,
         thread_id: Option<&str>,
         thread_name: Option<&str>,
+        pane_id: Option<&str>,
     ) -> Option<(Arc<dyn MuxProvider>, String)> {
         let provider = self.provider_for_session(session)?;
+        if let Some(pane_id) = pane_id {
+            return Some((provider, pane_id.to_string()));
+        }
         if let Some(pane_id) = self.resolve_tracked_agent_pane(session, agent, thread_id) {
             return Some((provider, pane_id));
         }
@@ -1249,9 +1266,7 @@ impl ReadOnlyMuxStateSource {
             .and_then(|provider| provider.get_current_session());
         let now = (self.now_ms)();
         let mut handoff = self.switch_handoff.lock().unwrap();
-        let Some(intent) = handoff.as_ref() else {
-            return None;
-        };
+        let intent = handoff.as_ref()?;
         if provider_current.as_deref() == Some(intent.session.as_str()) || intent.until <= now {
             handoff.take();
             return None;
@@ -1281,16 +1296,16 @@ impl ReadOnlyMuxStateSource {
             }
         };
         let mut changed = false;
-        if let Some(intent) = switch {
-            if let Some(provider) = self.providers.first() {
-                self.begin_switch_handoff(&intent.name);
-                provider.switch_session(&intent.name, intent.client_tty.as_deref());
-                self.agent_tracker
-                    .lock()
-                    .unwrap()
-                    .handle_focus(&intent.name);
-                changed = true;
-            }
+        if let Some(intent) = switch
+            && let Some(provider) = self.providers.first()
+        {
+            self.begin_switch_handoff(&intent.name);
+            provider.switch_session(&intent.name, intent.client_tty.as_deref());
+            self.agent_tracker
+                .lock()
+                .unwrap()
+                .handle_focus(&intent.name);
+            changed = true;
         }
 
         let width = {
@@ -1485,10 +1500,10 @@ impl ReadOnlyMuxStateSource {
         }
 
         let now = (self.now_ms)();
-        if let Some(cached) = self.git_info_cache.lock().unwrap().get(dir).cloned() {
-            if now.saturating_sub(cached.ts) < GIT_CACHE_TTL_MS {
-                return cached.info;
-            }
+        if let Some(cached) = self.git_info_cache.lock().unwrap().get(dir).cloned()
+            && now.saturating_sub(cached.ts) < GIT_CACHE_TTL_MS
+        {
+            return cached.info;
         }
 
         let output = self.git_command_runner.git_info_output(dir);
@@ -1514,12 +1529,11 @@ impl ReadOnlyMuxStateSource {
             .map(|names| names.to_vec())
             .unwrap_or_else(|| self.sorted_session_names());
         let now = (self.now_ms)();
-        if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone() {
-            if cached.session_names == session_names
-                && now.saturating_sub(cached.ts) < PORT_POLL_INTERVAL_MS
-            {
-                return Some(cached.ports_by_session);
-            }
+        if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone()
+            && cached.session_names == session_names
+            && now.saturating_sub(cached.ts) < PORT_POLL_INTERVAL_MS
+        {
+            return Some(cached.ports_by_session);
         }
 
         if session_names.is_empty() {
@@ -1680,19 +1694,11 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
-        let Some(provider) = self.providers.first() else {
-            return None;
-        };
-        let Some(target_index) = index.checked_sub(1).map(|index| index as usize) else {
-            return None;
-        };
-        let Some(name) = app_from_state_json(&self.snapshot_json()).and_then(|app| {
-            app.display_sessions()
-                .get(target_index)
-                .map(|session| session.name.clone())
-        }) else {
-            return None;
-        };
+        let provider = self.providers.first()?;
+        let target_index = index.checked_sub(1).map(|index| index as usize)?;
+        let name = self
+            .sidebar_display_session_names()
+            .and_then(|names| names.get(target_index).cloned())?;
         self.begin_switch_handoff(&name);
         provider.switch_session(&name, client_tty);
         *self.focused_session.lock().unwrap() = Some(name.clone());
@@ -1703,7 +1709,7 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
-        let mut names = self.visible_session_names()?;
+        let mut names = self.sidebar_display_session_names()?;
         if names.is_empty() {
             *self.focused_session.lock().unwrap() = None;
             return None;
@@ -1726,7 +1732,7 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn session_before(&self, name: &str) -> Option<String> {
-        let names = self.visible_session_names()?;
+        let names = self.sidebar_display_session_names()?;
         let index = names.iter().position(|candidate| candidate == name)?;
         index
             .checked_sub(1)
@@ -1734,9 +1740,18 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn session_after(&self, name: &str) -> Option<String> {
-        let names = self.visible_session_names()?;
+        let names = self.sidebar_display_session_names()?;
         let index = names.iter().position(|candidate| candidate == name)?;
         names.get(index + 1).cloned()
+    }
+
+    fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
+        app_from_state_json(&self.snapshot_json()).map(|app| {
+            app.display_sessions()
+                .into_iter()
+                .map(|session| session.name.clone())
+                .collect()
+        })
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
@@ -2774,21 +2789,21 @@ async fn handle_shim_connection(
                         // the render model without adding Ratatui to the shim.
                     }
                     ShimToServer::Key(key) => {
-                        if let Some(app) = &mut app {
-                            if let Some(ui_key) = ui_key_from_shim(key.code, key.modifiers) {
-                                apply_ui_key(app, ui_key);
-                                if drain_sidebar_commands(
-                                    app,
-                                    &state_source,
-                                    &state_updates,
-                                    &mut context,
-                                    &shutdown,
-                                )? {
-                                    frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
-                                    return Ok(());
-                                }
-                                dirty = true;
+                        if let Some(app) = &mut app
+                            && let Some(ui_key) = ui_key_from_shim(key.code, key.modifiers)
+                        {
+                            apply_ui_key(app, ui_key);
+                            if drain_sidebar_commands(
+                                app,
+                                &state_source,
+                                &state_updates,
+                                &mut context,
+                                &shutdown,
+                            )? {
+                                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
+                                return Ok(());
                             }
+                            dirty = true;
                         }
                     }
                 }
@@ -2934,10 +2949,10 @@ async fn handle_connection(
             return Ok(());
         };
         let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source {
-            if let Some(payload) = state_source.handle_switch_index(index, &body) {
-                let _ = state_updates.send(payload);
-            }
+        if let Some(state_source) = &state_source
+            && let Some(payload) = state_source.handle_switch_index(index, &body)
+        {
+            let _ = state_updates.send(payload);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -3003,21 +3018,21 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source {
-            if let Err(err) = state_source.handle_pi_runtime_upsert(&body) {
-                let body = err.body();
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
+        if let Some(state_source) = &state_source
+            && let Err(err) = state_source.handle_pi_runtime_upsert(&body)
+        {
+            let body = err.body();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
                     )
-                    .await?;
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
+                    .as_bytes(),
+                )
+                .await?;
+            let _ = stream.shutdown().await;
+            return Ok(());
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -3034,21 +3049,21 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source {
-            if let Err(err) = state_source.handle_pi_runtime_delete(&body) {
-                let body = err.body();
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .as_bytes(),
+        if let Some(state_source) = &state_source
+            && let Err(err) = state_source.handle_pi_runtime_delete(&body)
+        {
+            let body = err.body();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
                     )
-                    .await?;
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
+                    .as_bytes(),
+                )
+                .await?;
+            let _ = stream.shutdown().await;
+            return Ok(());
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -3161,10 +3176,10 @@ async fn handle_connection(
                                 request_shutdown(&state_source, &state_updates, &shutdown);
                                 return Ok(());
                             }
-                            if is_command_type(&message, "refresh") {
-                                if let Some(state_source) = &state_source {
-                                    let _ = state_updates.send(state_source.snapshot_json());
-                                }
+                            if is_command_type(&message, "refresh")
+                                && let Some(state_source) = &state_source
+                            {
+                                let _ = state_updates.send(state_source.snapshot_json());
                             }
                             if let Some(command) = parse_command(&message) {
                                 if let Some(reply) = state_source
@@ -3303,16 +3318,15 @@ async fn handle_rendered_sidebar_connection(
                                             request_shutdown(&state_source, &state_updates, &shutdown);
                                             return Ok(());
                                         }
-                                        if let Ok(command) = serde_json::to_value(command) {
-                                            if let Some(payload) = state_source
+                                        if let Ok(command) = serde_json::to_value(command)
+                                            && let Some(payload) = state_source
                                                 .as_ref()
                                                 .and_then(|state_source| state_source.handle_client_command(&command))
-                                            {
-                                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
-                                                    app.apply_server_message(message);
-                                                }
-                                                let _ = state_updates.send(payload);
+                                        {
+                                            if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                                app.apply_server_message(message);
                                             }
+                                            let _ = state_updates.send(payload);
                                         }
                                     }
                                     dirty = true;

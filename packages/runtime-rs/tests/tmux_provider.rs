@@ -322,7 +322,7 @@ fn tmux_provider_kills_orphaned_and_duplicate_sidebar_panes() {
 fn tmux_provider_detects_more_agent_panes_from_titles_and_commands() {
     let runner = RecordingRunner::new(HashMap::from([(
         "list-panes".to_string(),
-        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tnode\tπ - task\t80\t24\t0\t79\n%2\talpha\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tgemini\tshell\t80\t24\t0\t79\n%3\talpha\t@1\t0\t2\t0\t/dev/ttys3\t125\t/repo\tcursor-agent\tshell\t80\t24\t0\t79\n%4\talpha\t@1\t0\t3\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25".to_string(),
+        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tnode\tπ - task\t80\t24\t0\t79\n%2\talpha\t@1\t0\t1\t0\t/dev/ttys2\t124\t/repo\tgemini\tshell\t80\t24\t0\t79\n%3\talpha\t@1\t0\t2\t0\t/dev/ttys3\t125\t/repo\tcursor-agent\tshell\t80\t24\t0\t79\n%4\talpha\t@1\t0\t3\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%5\talpha\t@1\t0\t4\t0\t/dev/ttys5\t127\t/repo\tamp\tBuild better panel - amp - ~/repo\t80\t24\t0\t79".to_string(),
     )]));
     let provider = TmuxProvider::new(Arc::new(runner));
 
@@ -331,9 +331,18 @@ fn tmux_provider_detects_more_agent_panes_from_titles_and_commands() {
     assert_eq!(
         agents
             .iter()
-            .map(|pane| (pane.agent.as_str(), pane.pane_id.as_str()))
+            .map(|pane| (
+                pane.agent.as_str(),
+                pane.pane_id.as_str(),
+                pane.thread_name.as_deref()
+            ))
             .collect::<Vec<_>>(),
-        vec![("pi", "%1"), ("gemini", "%2"), ("cursor", "%3")]
+        vec![
+            ("pi", "%1", None),
+            ("gemini", "%2", None),
+            ("cursor", "%3", None),
+            ("amp", "%5", Some("Build better panel")),
+        ]
     );
 }
 
@@ -361,7 +370,7 @@ fn tmux_provider_spawns_sidebar_against_edge_pane_and_titles_it() {
         .iter()
         .find(|call| call.first().map(String::as_str) == Some("split-window"))
         .expect("split-window should be called");
-    assert!(split_call.starts_with(&vec![
+    assert!(split_call.starts_with(&[
         "split-window".to_string(),
         "-hb".to_string(),
         "-f".to_string(),

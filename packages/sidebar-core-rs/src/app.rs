@@ -626,6 +626,7 @@ impl App {
             agent: agent.agent,
             thread_id: agent.thread_id,
             thread_name: agent.thread_name,
+            pane_id: agent.pane_id,
         });
     }
 
@@ -662,6 +663,7 @@ impl App {
             agent: agent.agent,
             thread_id: agent.thread_id,
             thread_name: agent.thread_name,
+            pane_id: agent.pane_id,
         });
     }
 

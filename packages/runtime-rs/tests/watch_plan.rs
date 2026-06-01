@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use opensessions_runtime::watch_plan::{WatchKind, builtin_provider_specs, coalesce_watch_roots};
@@ -69,15 +69,15 @@ fn coalesces_duplicate_and_child_roots_for_more_efficient_watching() {
 
     assert_eq!(roots.len(), 3);
     assert!(roots.iter().any(
-        |root| root.path == PathBuf::from("/Users/alice/.claude/projects")
+        |root| root.path == Path::new("/Users/alice/.claude/projects")
             && root.providers == vec!["claude-code"]
     ));
     assert!(roots.iter().any(
-        |root| root.path == PathBuf::from("/Users/alice/.codex/sessions")
+        |root| root.path == Path::new("/Users/alice/.codex/sessions")
             && root.providers == vec!["codex"]
     ));
     assert!(roots.iter().any(
-        |root| root.path == PathBuf::from("/Users/alice/.pi/agent/sessions")
+        |root| root.path == Path::new("/Users/alice/.pi/agent/sessions")
             && root.providers == vec!["pi"]
     ));
 }
