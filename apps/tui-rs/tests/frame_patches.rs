@@ -15,7 +15,7 @@ fn first_render_produces_full_frame_rows() {
         "every transport row must reset style before writing or clear-to-EOL leaks backgrounds"
     );
     assert!(
-        rows.rows[1]
+        rows.rows[0]
             .windows(b"Sessions".len())
             .any(|w| w == b"Sessions")
     );
@@ -24,11 +24,11 @@ fn first_render_produces_full_frame_rows() {
 #[test]
 fn row_diff_only_includes_changed_lines_and_can_be_applied() {
     let mut before_app = App::reference_fixture("pane-attached-session-list");
-    before_app.focused_session = Some("opensessions".into());
+    before_app.set_focused_session("opensessions");
     let before = render_rows(&mut before_app, 35, 56);
 
     let mut after_app = App::reference_fixture("pane-attached-session-list");
-    after_app.focused_session = Some("plane-pdf-word-formatting".into());
+    after_app.set_focused_session("plane-pdf-word-formatting");
     let after = render_rows(&mut after_app, 35, 56);
 
     let diff = diff_rows(&before, &after);

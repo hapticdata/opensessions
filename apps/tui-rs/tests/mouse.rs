@@ -21,7 +21,7 @@ fn scroll_down_in_sessions_panel_moves_viewport_without_queueing_focus_command()
         session.branch = "main".into();
         app.sessions.push(session);
     }
-    app.focused_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.set_focused_session("plane-feat-edit-pages-from-pi");
 
     apply_ui_mouse(
         &mut app,
@@ -35,19 +35,22 @@ fn scroll_down_in_sessions_panel_moves_viewport_without_queueing_focus_command()
 
     assert_eq!(app.session_scroll_offset(), 1);
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-feat-edit-pages-from-pi")
     );
     assert!(app.drain_commands().is_empty());
 
     let buffer = render_to_buffer(&mut app, W, H);
-    let mut first_card_row = String::new();
-    for x in 0..W {
-        first_card_row.push_str(&buffer_symbol_at(&buffer, x, 3));
+    let mut visible_session_rows = String::new();
+    for y in 0..detail_separator_row(&app, W, H) {
+        for x in 0..W {
+            visible_session_rows.push_str(&buffer_symbol_at(&buffer, x, y));
+        }
+        visible_session_rows.push('\n');
     }
     assert!(
-        first_card_row.contains("plane-feat-background-exports"),
-        "wheel scroll should move the viewport immediately instead of forcing the focused row back into view; got {first_card_row:?}",
+        visible_session_rows.contains("plane-feat-background-expo"),
+        "wheel scroll should move the viewport immediately instead of forcing the focused row back into view; got {visible_session_rows:?}",
     );
 }
 
@@ -101,7 +104,7 @@ fn compute_hit_map_marks_session_rows_with_session_targets() {
 fn click_on_session_row_switches_to_that_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.current_session = Some("opensessions".into());
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     let hits = compute_hit_map(&app, W, H);
     let target_row = hits
@@ -119,7 +122,7 @@ fn click_on_session_row_switches_to_that_session() {
         },
     );
 
-    assert_eq!(app.focused_session.as_deref(), Some("learning"));
+    assert_eq!(app.focused_session_name(), Some("learning"));
     assert_eq!(app.current_session.as_deref(), Some("learning"));
     assert_eq!(
         app.drain_commands(),
@@ -168,7 +171,7 @@ fn click_on_diff_count_launches_lazydiffs_for_that_session() {
         },
     );
 
-    assert_eq!(app.focused_session.as_deref(), Some("learning"));
+    assert_eq!(app.focused_session_name(), Some("learning"));
     assert!(app.drain_commands().is_empty());
     assert_eq!(app.drain_launches().len(), 1);
 }
@@ -219,7 +222,7 @@ fn hover_on_diff_count_highlights_diff_stats() {
 #[test]
 fn click_on_agent_scope_label_toggles_between_current_and_all() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     let mut target = None;
     for y in 0..H {
@@ -249,9 +252,65 @@ fn click_on_agent_scope_label_toggles_between_current_and_all() {
 }
 
 #[test]
+fn click_on_worktree_group_first_focuses_then_toggles() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    let first = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-edit-pages-from-pi")
+        .unwrap();
+    first.dir = "/Users/me/work/plane-ee-wt/feat-databases".into();
+    first.is_worktree = true;
+    let second = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-background-exports")
+        .unwrap();
+    second.dir = "/Users/me/work/plane-ee-wt/preview".into();
+    second.is_worktree = true;
+    let group_key = "/Users/me/work/plane-ee-wt";
+
+    let target = (0..H)
+        .flat_map(|y| (0..W).map(move |x| (x, y)))
+        .find(|(x, y)| {
+            compute_hit_target(&app, *x, *y, W, H) == Some(HitTarget::Group(group_key.into()))
+        })
+        .expect("worktree group header should be clickable");
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Click {
+            x: target.0,
+            y: target.1,
+            width: W,
+            height: H,
+        },
+    );
+    assert_eq!(app.focused_group_key(), Some(group_key));
+    assert!(!app.is_group_collapsed(group_key));
+
+    apply_ui_mouse(
+        &mut app,
+        UiMouse::Click {
+            x: target.0,
+            y: target.1,
+            width: W,
+            height: H,
+        },
+    );
+    assert!(!app.is_group_collapsed(group_key));
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::ToggleWorktreeGroup {
+            key: group_key.into(),
+        }]
+    );
+}
+
+#[test]
 fn click_on_agent_row_focuses_agents_panel_and_switches_pane() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     let w: u16 = 35;
     let h: u16 = 55;

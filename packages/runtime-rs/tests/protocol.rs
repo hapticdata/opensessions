@@ -138,6 +138,7 @@ fn serializes_server_state_with_typescript_fields_and_omits_undefined_optionals(
         sidebar_width: 35,
         initializing: false,
         init_label: None,
+        collapsed_worktree_groups: Vec::new(),
         ts: 3,
     };
 

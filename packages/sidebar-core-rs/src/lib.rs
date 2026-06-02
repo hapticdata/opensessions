@@ -1,4 +1,5 @@
 pub mod app;
+mod fixtures;
 pub mod frame;
 pub mod generated;
 pub mod input;

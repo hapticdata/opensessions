@@ -87,7 +87,7 @@ fn tab_switches_to_next_visible_session_optimistically() {
         Some("plane-pdf-word-formatting")
     );
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-pdf-word-formatting")
     );
     assert_eq!(app.panel_focus, PanelFocus::Sessions);
@@ -120,24 +120,124 @@ fn number_key_queues_one_based_switch_index_command() {
 #[test]
 fn navigation_keys_move_focus_locally_without_server_echo() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     app.move_focus(1);
 
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-pdf-word-formatting")
     );
     assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 }
 
 #[test]
+fn worktree_group_is_focusable_and_enter_toggles_collapse() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    let first = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-edit-pages-from-pi")
+        .unwrap();
+    first.dir = "/Users/me/work/plane-ee-wt/feat-databases".into();
+    first.is_worktree = true;
+    let second = app
+        .sessions
+        .iter_mut()
+        .find(|session| session.name == "plane-feat-background-exports")
+        .unwrap();
+    second.dir = "/Users/me/work/plane-ee-wt/preview".into();
+    second.is_worktree = true;
+    let group_key = "/Users/me/work/plane-ee-wt";
+
+    app.set_focused_session("plane-feat-edit-pages-from-pi");
+    app.move_focus(-1);
+
+    assert_eq!(app.focused_group_key(), Some(group_key));
+    assert_eq!(app.focused_session_name(), None);
+    app.activate_focused_item();
+    assert!(!app.is_group_collapsed(group_key));
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::ToggleWorktreeGroup {
+            key: group_key.into(),
+        }]
+    );
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-feat-edit-pages-from-pi".into()),
+        current_session: app.current_session.clone(),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: vec![group_key.into()],
+        ts: 1,
+    }));
+    assert!(app.is_group_collapsed(group_key));
+    assert_eq!(app.focused_group_key(), Some(group_key));
+
+    app.activate_focused_item();
+    assert!(app.is_group_collapsed(group_key));
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::ToggleWorktreeGroup {
+            key: group_key.into(),
+        }]
+    );
+}
+
+#[test]
+fn collapsed_worktree_state_focuses_visible_group_when_server_focus_is_hidden_child() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    for (name, dir) in [
+        (
+            "plane-feat-edit-pages-from-pi",
+            "/Users/me/work/plane-ee-wt/feat-databases",
+        ),
+        (
+            "plane-feat-background-exports",
+            "/Users/me/work/plane-ee-wt/preview",
+        ),
+    ] {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.name == name)
+            .unwrap();
+        session.dir = dir.into();
+        session.is_worktree = true;
+    }
+    let group_key = "/Users/me/work/plane-ee-wt";
+
+    let state = ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-feat-edit-pages-from-pi".into()),
+        current_session: Some("plane-feat-edit-pages-from-pi".into()),
+        theme: None,
+        session_filter: Some(SessionFilterMode::All),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: vec![group_key.into()],
+        ts: 1,
+    };
+
+    let app = App::from_state(state);
+
+    assert_eq!(app.focused_group_key(), Some(group_key));
+    assert_eq!(app.focused_session_name(), None);
+}
+
+#[test]
 fn state_refresh_preserves_local_session_list_cursor() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
     app.move_focus(1);
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-pdf-word-formatting")
     );
 
@@ -150,12 +250,13 @@ fn state_refresh_preserves_local_session_list_cursor() {
         sidebar_width: 26,
         initializing: false,
         init_label: None,
+        collapsed_worktree_groups: Vec::new(),
         ts: 1,
     };
     app.apply_server_message(ServerMessage::State(state));
 
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-pdf-word-formatting")
     );
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
@@ -164,7 +265,7 @@ fn state_refresh_preserves_local_session_list_cursor() {
 #[test]
 fn agent_panel_navigation_and_actions_match_typescript_key_model() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     app.focus_agents_panel();
     assert_eq!(app.panel_focus, PanelFocus::Agents);
@@ -213,7 +314,7 @@ fn agent_panel_navigation_and_actions_match_typescript_key_model() {
 #[test]
 fn agent_panel_actions_prefer_exact_pane_id_when_available() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
     let agent = app
         .sessions
         .iter_mut()
@@ -240,7 +341,7 @@ fn agent_panel_actions_prefer_exact_pane_id_when_available() {
 #[test]
 fn agent_panel_scope_toggle_exposes_all_session_agents() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("learning".into());
+    app.set_focused_session("learning");
 
     app.handle_key_char('a');
 
@@ -252,7 +353,7 @@ fn agent_panel_scope_toggle_exposes_all_session_agents() {
 #[test]
 fn pane_focus_controls_switch_between_sessions_and_agents() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     app.focus_agents_panel();
     assert_eq!(app.panel_focus, PanelFocus::Agents);
@@ -264,7 +365,7 @@ fn pane_focus_controls_switch_between_sessions_and_agents() {
 #[test]
 fn extra_typescript_key_commands_are_available() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
 
     app.handle_key_char('u');
     app.handle_key_char('c');
@@ -291,7 +392,7 @@ fn extra_typescript_key_commands_are_available() {
 #[test]
 fn enter_switches_to_focused_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
 
     app.activate_focused_session();
 
@@ -312,7 +413,7 @@ fn enter_switches_to_focused_session() {
 #[test]
 fn action_keys_queue_basic_session_commands() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
 
     app.handle_key_char('r');
     app.handle_key_char('n');
@@ -385,7 +486,7 @@ fn applies_focus_and_your_session_messages_without_replacing_sessions() {
     }));
 
     assert_eq!(app.my_session.as_deref(), Some("opensessions"));
-    assert_eq!(app.focused_session.as_deref(), Some("learning"));
+    assert_eq!(app.focused_session_name(), Some("learning"));
     assert_eq!(app.current_session.as_deref(), Some("learning"));
     assert_eq!(app.sessions.len(), 7);
 }

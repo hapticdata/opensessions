@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AgentPanelScope, App, DisplaySessionEntry, Modal, SESSION_CARD_HEIGHT};
+use crate::app::{AgentPanelScope, App, DisplaySessionEntry, Modal};
 use crate::generated::protocol::{AgentEvent, AgentStatus, MetadataTone, SessionData};
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App) {
@@ -22,6 +22,7 @@ pub fn render_app(frame: &mut Frame<'_>, app: &App) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitTarget {
     Session(String),
+    Group(String),
     DiffCount(String),
     Agent(usize),
     AgentScopeToggle,
@@ -58,11 +59,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
         .map(|value| value as usize)
         .unwrap_or(width);
     let layout = sidebar_layout(app, width as u16, height as u16);
-    let mut lines = vec![
-        StyledLine::marker(CellStyle::fg(palette.white)),
-        header(app, &palette, width),
-        StyledLine::blank(),
-    ];
+    let mut lines = vec![header(app, &palette, width), StyledLine::blank()];
     let detail_separator_row = layout.detail_separator.y as usize;
     let session_scrollbar = render_sessions(app, &palette, &mut lines, detail_separator_row, width);
 
@@ -104,7 +101,7 @@ struct SidebarLayout {
 }
 
 fn sidebar_layout(app: &App, width: u16, height: u16) -> SidebarLayout {
-    const HEADER_ROWS: u16 = 3;
+    const HEADER_ROWS: u16 = 2;
     const DETAIL_SEPARATOR_ROWS: u16 = 1;
     const FOOTER_SEPARATOR_ROWS: u16 = 1;
     const FOOTER_ROWS: u16 = 2;
@@ -297,9 +294,6 @@ impl RenderModel {
         let mut markers = HashMap::new();
         for (y, line) in self.lines.iter().take(height as usize).enumerate() {
             let y = y as u16;
-            if let Some(style) = line.start_style {
-                markers.insert((0, y), style);
-            }
             if let Some(style) = line.end_style {
                 let x = line.width().min(width as usize) as u16;
                 if x < width {
@@ -326,13 +320,11 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
     let unseen = app.sessions.iter().filter(|session| session.unseen).count();
 
     let mut line = StyledLine::blank();
-    line.push(" ", palette.white);
-    line.push("  ", palette.overlay1);
     line.push("Sessions", palette.subtext0);
 
     if app.initializing {
         let label = app.init_label.as_deref().unwrap_or("warming up…");
-        let spinner_glyph = spinner(spinner_clock(app));
+        let spinner_glyph = agent_spinner(spinner_clock(app));
         let init_cells = 1 + spinner_glyph.width() + 1 + label.width();
         let count = format!(" {sessions}");
         if line.width() + count.width() + init_cells <= width {
@@ -345,7 +337,12 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
             line.push(label, palette.peach);
         }
     } else {
-        line.push(format!(" {sessions}"), palette.overlay0);
+        let count = sessions.to_string();
+        let spaces = width.saturating_sub(line.width() + count.width());
+        if spaces > 0 {
+            line.push(" ".repeat(spaces), palette.white);
+        }
+        line.push(count, palette.overlay0);
     }
 
     if running > 0 {
@@ -377,12 +374,29 @@ fn render_sessions(
     }
 
     let entries = app.display_session_entries();
+    if entries.is_empty() && app.initializing {
+        push_loader_rows(
+            lines,
+            palette,
+            width,
+            available,
+            app.init_label.as_deref().unwrap_or("warming up…"),
+            "reading tmux + git state",
+            spinner_clock(app),
+        );
+        return None;
+    }
+
     let blocks: Vec<Vec<StyledLine>> = entries
         .iter()
         .map(|entry| match entry {
-            DisplaySessionEntry::Group { label, count } => {
-                build_group_block(palette, label, *count, width)
-            }
+            DisplaySessionEntry::Group {
+                key,
+                label,
+                count,
+                collapsed,
+                summary,
+            } => build_group_block(app, palette, key, label, *count, *collapsed, summary, width),
             DisplaySessionEntry::Session {
                 index,
                 session,
@@ -394,27 +408,33 @@ fn render_sessions(
         return None;
     }
 
-    let focused_block_idx = app
-        .focused_session
-        .as_deref()
-        .and_then(|focused| {
-            entries.iter().position(|entry| {
-                matches!(entry, DisplaySessionEntry::Session { session, .. } if session.name == focused)
-            })
+    let focused_block_idx = entries
+        .iter()
+        .position(|entry| match entry {
+            DisplaySessionEntry::Session { session, .. } => {
+                app.focused_session_name() == Some(session.name.as_str())
+            }
+            DisplaySessionEntry::Group { key, .. } => app.focused_group_key() == Some(key.as_str()),
         })
         .unwrap_or(0);
 
-    let visible_cards = available.div_ceil(SESSION_CARD_HEIGHT).max(1);
+    let total_rows: usize = (0..blocks.len())
+        .map(|idx| session_entry_height(&blocks, &entries, idx))
+        .sum();
+    let visible_cards = available.div_ceil(2).max(1);
     let max_first_visible = blocks.len().saturating_sub(visible_cards);
-    let first_visible = if app.session_scroll_follows_focus() {
-        compute_session_window_start_for_focus(focused_block_idx, visible_cards, max_first_visible)
+    let first_visible = if total_rows <= available {
+        0
+    } else if app.session_scroll_follows_focus() {
+        compute_session_window_start_for_focus(&blocks, &entries, focused_block_idx, available)
     } else {
         app.session_scroll_offset().min(max_first_visible)
     };
 
     let body_capacity = available;
     let mut used = 0;
-    'outer: for block in blocks[first_visible..].iter() {
+    'outer: for (offset, block) in blocks[first_visible..].iter().enumerate() {
+        let entry_idx = first_visible + offset;
         for line in block {
             if used >= body_capacity {
                 break 'outer;
@@ -422,18 +442,28 @@ fn render_sessions(
             lines.push(line.clone());
             used += 1;
         }
+        if used >= body_capacity {
+            break;
+        }
+        if let Some(spacer) =
+            session_entry_spacer(palette, entries.get(entry_idx), entries.get(entry_idx + 1))
+        {
+            lines.push(spacer);
+            used += 1;
+        }
     }
 
     while lines.len() - start_offset < available {
-        lines.push(StyledLine::blank());
+        lines.push(rail_blank(palette));
     }
 
-    let total_rows: usize = blocks.iter().map(Vec::len).sum();
     if total_rows > available {
         Some(ScrollbarSpec {
             area: Rect::new(0, start_offset as u16, width as u16, available as u16),
             content_length: total_rows,
-            position: blocks[..first_visible].iter().map(Vec::len).sum(),
+            position: (0..first_visible)
+                .map(|idx| session_entry_height(&blocks, &entries, idx))
+                .sum(),
             viewport_length: available,
             track: palette.surface2,
             thumb: palette.overlay1,
@@ -444,47 +474,189 @@ fn render_sessions(
 }
 
 fn build_group_block(
+    app: &App,
     palette: &Palette,
+    key: &str,
     label: &str,
     count: usize,
+    collapsed: bool,
+    summary: &crate::session_display::GroupSummary,
     width: usize,
 ) -> Vec<StyledLine> {
-    let mut row = StyledLine::blank();
-    row.push(" ", palette.white);
-    row.push("▾", palette.overlay0);
-    row.push(" ", palette.white);
-    row.push(label, palette.subtext1);
+    let hit = HitTarget::Group(key.to_string());
+    let focused =
+        app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
+    let flashed = app.active_flash_target() == Some(&hit);
+    let bg = (focused || flashed).then_some(palette.surface1);
 
-    let mut meta = StyledLine::blank();
-    meta.push("   ", palette.white);
-    meta.push(format!("{count} worktrees"), palette.overlay0);
+    let mut row = StyledLine::with_bg(bg);
+    row.push("   ", palette.surface2);
+    row.push(if collapsed { "▸" } else { "▾" }, palette.overlay0);
+    row.push(" ", palette.white);
+    row.push(
+        label,
+        if focused {
+            palette.text
+        } else {
+            palette.subtext1
+        },
+    );
+    let count_text = format!("{count}wt");
+    let spaces = 25usize.saturating_sub(row.width());
+    if spaces > 0 {
+        row.push(" ".repeat(spaces), palette.white);
+    }
+    if row.width() + count_text.width() <= width {
+        row.push(count_text, palette.overlay0);
+    }
+    push_group_summary(&mut row, palette, summary, collapsed, width);
 
-    let spacer = StyledLine::blank();
-    vec![
-        row.end(CellStyle::fg(palette.white)),
-        meta.end(CellStyle::fg(palette.white)),
-        spacer,
-    ]
+    vec![row.end(CellStyle {
+        fg: palette.white,
+        bg,
+    })]
     .into_iter()
     .map(|mut line| {
         let remaining = width.saturating_sub(line.width());
         if remaining > 0 {
             line.push(" ".repeat(remaining), palette.white);
         }
-        line
+        line.with_hit(hit.clone())
     })
     .collect()
 }
 
-fn compute_session_window_start_for_focus(
-    focused_idx: usize,
-    visible_cards: usize,
-    max_first_visible: usize,
+fn session_entry_spacer(
+    palette: &Palette,
+    current: Option<&DisplaySessionEntry<'_>>,
+    next: Option<&DisplaySessionEntry<'_>>,
+) -> Option<StyledLine> {
+    match current {
+        Some(DisplaySessionEntry::Group { .. }) => None,
+        Some(DisplaySessionEntry::Session { indented: true, .. }) => {
+            let next_is_group_child = matches!(
+                next,
+                Some(DisplaySessionEntry::Session { indented: true, .. })
+            );
+            Some(if next_is_group_child {
+                inner_rail_blank(palette)
+            } else {
+                rail_blank(palette)
+            })
+        }
+        Some(DisplaySessionEntry::Session { .. }) => Some(rail_blank(palette)),
+        None => None,
+    }
+}
+
+fn session_entry_height(
+    blocks: &[Vec<StyledLine>],
+    entries: &[DisplaySessionEntry<'_>],
+    idx: usize,
 ) -> usize {
-    focused_idx
-        .saturating_add(1)
-        .saturating_sub(visible_cards)
-        .min(max_first_visible)
+    let block_height = blocks.get(idx).map(Vec::len).unwrap_or_default();
+    let spacer_height = match entries.get(idx) {
+        Some(DisplaySessionEntry::Session { .. }) => 1,
+        _ => 0,
+    };
+    block_height + spacer_height
+}
+
+fn push_loader_rows(
+    lines: &mut Vec<StyledLine>,
+    palette: &Palette,
+    width: usize,
+    available: usize,
+    label: &str,
+    detail: &str,
+    spinner_ts: u64,
+) {
+    if available == 0 {
+        return;
+    }
+
+    let start_len = lines.len();
+    let mut primary = StyledLine::blank();
+    primary.push("   ", palette.white);
+    primary.push(agent_spinner(spinner_ts), palette.yellow);
+    primary.push("  ", palette.white);
+    let available_label = width.saturating_sub(primary.width());
+    primary.push(truncate_right(label, available_label), palette.subtext0);
+    lines.push(primary.end(CellStyle::fg(palette.white)));
+
+    if available > 1 {
+        let mut secondary = StyledLine::blank();
+        secondary.push("      ", palette.white);
+        let available_detail = width.saturating_sub(secondary.width());
+        secondary.push(truncate_right(detail, available_detail), palette.overlay0);
+        lines.push(secondary.end(CellStyle::fg(palette.white)));
+    }
+
+    while lines.len() - start_len < available {
+        lines.push(StyledLine::blank());
+    }
+}
+
+fn push_group_summary(
+    line: &mut StyledLine,
+    palette: &Palette,
+    summary: &crate::session_display::GroupSummary,
+    collapsed: bool,
+    width: usize,
+) {
+    let mut wrote = false;
+    if collapsed && summary.running_agents > 0 {
+        let text = format!("⚡{}", summary.running_agents);
+        if line.width() + text.width() <= width {
+            line.push(text, palette.yellow);
+            wrote = true;
+        }
+    }
+    if collapsed && summary.unseen > 0 {
+        let text = if wrote { " ●" } else { "●" };
+        if line.width() + text.width() <= width {
+            line.push(text, palette.teal);
+            wrote = true;
+        }
+    }
+    if collapsed && (summary.insertions > 0 || summary.deletions > 0) {
+        let text = format!(" +{} -{}", summary.insertions, summary.deletions);
+        if line.width() + text.width() <= width {
+            line.push(text, palette.green);
+            wrote = true;
+        }
+    }
+    if collapsed && let Some(port) = summary.first_port {
+        let text = if summary.extra_ports == 0 {
+            format!(" ⌁{port}")
+        } else {
+            format!(" ⌁{port}+{}", summary.extra_ports)
+        };
+        if line.width() + text.width() <= width {
+            line.push(text, palette.sky);
+            wrote = true;
+        }
+    }
+    let _ = wrote;
+}
+
+fn compute_session_window_start_for_focus(
+    blocks: &[Vec<StyledLine>],
+    entries: &[DisplaySessionEntry<'_>],
+    focused_idx: usize,
+    available_rows: usize,
+) -> usize {
+    let mut start = focused_idx;
+    let mut used = session_entry_height(blocks, entries, focused_idx);
+    while start > 0 {
+        let next = session_entry_height(blocks, entries, start - 1);
+        if used + next > available_rows {
+            break;
+        }
+        start -= 1;
+        used += next;
+    }
+    start
 }
 
 fn build_session_block(
@@ -495,12 +667,11 @@ fn build_session_block(
     indented: bool,
     width: usize,
 ) -> Vec<StyledLine> {
-    let mut block = Vec::with_capacity(4);
+    let mut block = Vec::with_capacity(3);
     let index = idx;
-    let focused = app.focused_session.as_deref() == Some(session.name.as_str());
+    let focused = app.focused_session_name() == Some(session.name.as_str());
     let current = app.current_session.as_deref() == Some(session.name.as_str());
     let bg = focused.then_some(palette.surface1);
-    let accent = accent_color(palette, session, focused, current);
     let index_color = if focused {
         palette.subtext0
     } else {
@@ -519,24 +690,13 @@ fn build_session_block(
     let bg = if flashed { Some(palette.surface1) } else { bg };
 
     let mut row = StyledLine::with_bg(bg);
-    row.push(if indented { "   " } else { " " }, palette.white);
-    let (attention_icon, attention_color) =
-        session_attention_icon(palette, session, spinner_clock(app));
-    let icon_color = if attention_icon == "·" {
-        accent
+    if indented {
+        row.push("   │", palette.surface2);
+        row.push(if focused { "▌ " } else { " " }, palette.blue);
     } else {
-        attention_color
-    };
-    let icon = if attention_icon == "·" && accent == palette.black {
-        " "
-    } else if attention_icon == "·" {
-        "▌"
-    } else {
-        attention_icon
-    };
-    row.push(icon, icon_color);
-    row.push(format!(" {index:>1}"), index_color);
-    row.push(" ", palette.white);
+        row.push(if focused { "▌  " } else { "   " }, palette.blue);
+    }
+    row.push(format!("{index:02}  "), index_color);
     row.push(&session.name, name_color);
     block.push(
         row.end(CellStyle {
@@ -546,26 +706,14 @@ fn build_session_block(
         .with_hit(hit.clone()),
     );
 
-    if let Some(dir) = dir_name(session) {
-        let color = if focused {
-            palette.teal
-        } else {
-            palette.overlay1
-        };
-        let mut line = StyledLine::with_bg(bg);
-        line.push(if indented { "       " } else { "     " }, palette.white);
-        line.push(dir, color);
-        block.push(
-            line.end(CellStyle {
-                fg: palette.white,
-                bg,
-            })
-            .with_hit(hit.clone()),
-        );
-    }
     let has_ports = !session.ports.is_empty();
     let has_diff_stats = session.insertions > 0 || session.deletions > 0;
-    if !session.branch.is_empty() || has_ports || has_diff_stats {
+    let detail_text = if !session.branch.is_empty() {
+        Some(session.branch.as_str())
+    } else {
+        dir_name(session)
+    };
+    if detail_text.is_some() || has_ports || has_diff_stats {
         let branch_color = if focused {
             palette.pink
         } else {
@@ -577,7 +725,10 @@ fn build_session_block(
             palette.overlay0
         };
         let mut line = StyledLine::with_bg(bg);
-        line.push(if indented { "       " } else { "     " }, palette.white);
+        line.push(
+            if indented { "   │     " } else { "       " },
+            palette.surface2,
+        );
         let mut suffix_width = 0;
         if has_ports {
             suffix_width += if session.ports.len() == 1 {
@@ -589,9 +740,9 @@ fn build_session_block(
         if has_diff_stats {
             suffix_width += diff_stats_width(session);
         }
-        if !session.branch.is_empty() {
+        if let Some(detail_text) = detail_text {
             let available = width.saturating_sub(line.width() + suffix_width);
-            line.push(truncate_right(&session.branch, available), branch_color);
+            line.push(truncate_right(detail_text, available), branch_color);
         }
         if has_ports {
             let port_text = if session.ports.len() == 1 {
@@ -619,75 +770,32 @@ fn build_session_block(
         );
     }
 
-    if let Some(metadata) = &session.metadata {
-        let mut summary_parts: Vec<(String, Rgb)> = Vec::new();
-        if let Some(status) = &metadata.status {
-            summary_parts.push((status.text.clone(), tone_color(palette, status.tone)));
-        }
-        if let Some(progress) = &metadata.progress {
-            let progress_text =
-                if let (Some(current), Some(total)) = (progress.current, progress.total) {
-                    format!("{current}/{total}")
-                } else if let Some(percent) = progress.percent {
-                    format!("{percent:.0}%")
-                } else {
-                    String::new()
-                };
-            if !progress_text.is_empty() {
-                summary_parts.push((progress_text, palette.sky));
-            }
-        }
-        if !summary_parts.is_empty() {
-            let mut line = StyledLine::with_bg(bg);
-            line.push("     ", palette.white);
-            for (i, (text, color)) in summary_parts.iter().enumerate() {
-                if i > 0 {
-                    line.push(" · ", palette.overlay0);
-                }
-                let max_text_len = width.saturating_sub(line.width() + 1);
-                if text.width() > max_text_len {
-                    let truncated: String =
-                        text.chars().take(max_text_len.saturating_sub(1)).collect();
-                    line.push(format!("{truncated}…"), *color);
-                    break;
-                } else {
-                    line.push(text, *color);
-                }
-            }
-            block.push(
-                line.end(CellStyle {
-                    fg: palette.white,
-                    bg,
-                })
-                .with_hit(hit.clone()),
-            );
-        }
-    }
-
-    while block.len() < SESSION_CARD_HEIGHT.saturating_sub(1) {
+    if block.len() == 1 {
+        let mut line = StyledLine::with_bg(bg);
+        line.push(
+            if indented { "   │     " } else { "       " },
+            palette.surface2,
+        );
         block.push(
-            StyledLine::with_bg(bg)
-                .with_hit(hit.clone())
-                .end(CellStyle {
-                    fg: palette.white,
-                    bg,
-                }),
+            line.end(CellStyle {
+                fg: palette.white,
+                bg,
+            })
+            .with_hit(hit),
         );
     }
 
-    block.truncate(SESSION_CARD_HEIGHT.saturating_sub(1));
-
-    let footer = if focused {
-        StyledLine::marker(CellStyle {
-            fg: palette.white,
-            bg: None,
-        })
-    } else {
-        StyledLine::blank()
-    };
-    block.push(footer.with_hit(hit));
-
     block
+}
+
+fn rail_blank(palette: &Palette) -> StyledLine {
+    StyledLine::blank().end(CellStyle::fg(palette.white))
+}
+
+fn inner_rail_blank(palette: &Palette) -> StyledLine {
+    let mut line = StyledLine::blank();
+    line.push("   │", palette.surface2);
+    line.end(CellStyle::fg(palette.white))
 }
 
 fn diff_stats_width(session: &SessionData) -> usize {
@@ -723,8 +831,7 @@ fn render_detail(
     width: usize,
 ) {
     let Some(session) = app
-        .focused_session
-        .as_deref()
+        .focused_session_name()
         .and_then(|focused| app.sessions.iter().find(|session| session.name == focused))
     else {
         return;
@@ -794,8 +901,7 @@ fn render_agent_panel_header(
     };
     let agent_count = match app.agent_panel_scope {
         AgentPanelScope::Current => app
-            .focused_session
-            .as_deref()
+            .focused_session_name()
             .and_then(|focused| app.sessions.iter().find(|session| session.name == focused))
             .map(|session| session.agents.len())
             .unwrap_or(0),
@@ -866,6 +972,15 @@ fn render_agent_blocks(
     entries: Vec<AgentPanelEntry<'_>>,
 ) {
     if entries.is_empty() || lines.len() >= max_lines {
+        if app.initializing && lines.len() + 2 <= max_lines {
+            lines.push(StyledLine::blank());
+            let mut primary = StyledLine::blank();
+            primary.push("  ", palette.white);
+            primary.push(agent_spinner(spinner_clock(app)), palette.yellow);
+            primary.push("  ", palette.white);
+            primary.push("checking agents", palette.subtext0);
+            lines.push(primary.end(CellStyle::fg(palette.white)));
+        }
         return;
     }
 
@@ -1263,27 +1378,34 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
     );
     primary.push(icon, icon_color);
     primary.push(" ", palette.white);
-    primary.push(
-        &entry.agent.agent,
-        if highlight {
-            palette.text
-        } else {
-            palette.subtext1
-        },
-    );
-    primary.push(" · ", palette.overlay0);
-    primary.push(
-        semantic_agent_status_text(entry.agent, entry.session.unseen),
-        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
-    );
+    if let Some(thread_name) = entry.agent.thread_name.as_deref() {
+        primary.push(
+            truncate_right(thread_name, 30),
+            if highlight {
+                palette.text
+            } else {
+                palette.subtext1
+            },
+        );
+    } else {
+        primary.push(
+            &entry.agent.agent,
+            if highlight {
+                palette.text
+            } else {
+                palette.subtext1
+            },
+        );
+    }
 
     let mut secondary = StyledLine::with_bg(bg);
     secondary.push("    ", palette.white);
-    if let Some(thread_name) = entry.agent.thread_name.as_deref() {
-        secondary.push(truncate_right(thread_name, 22), palette.overlay1);
-    } else {
-        secondary.push("no thread", palette.surface2);
-    }
+    secondary.push(
+        semantic_agent_status_text(entry.agent, entry.session.unseen),
+        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
+    );
+    secondary.push(" · ", palette.overlay0);
+    secondary.push(&entry.agent.agent, palette.overlay0);
 
     vec![
         primary
@@ -1320,15 +1442,19 @@ fn compact_agent_panel_block(
     );
     line.push(icon, icon_color);
     line.push(" ", palette.white);
-    line.push(entry.agent.agent.as_str(), palette.subtext1);
-    line.push(" · ", palette.overlay0);
-    line.push(
-        semantic_agent_status_text(entry.agent, entry.session.unseen),
-        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
-    );
     if let Some(thread_name) = entry.agent.thread_name.as_deref() {
+        line.push(truncate_right(thread_name, 26), palette.subtext1);
+    } else {
+        line.push(&entry.session.name, palette.subtext1);
         line.push(" · ", palette.overlay0);
-        line.push(truncate_right(thread_name, 10), palette.overlay1);
+        line.push(entry.agent.agent.as_str(), palette.overlay1);
+        return vec![
+            line.end(CellStyle {
+                fg: palette.white,
+                bg,
+            })
+            .with_hit(hit),
+        ];
     }
     vec![
         line.end(CellStyle {
@@ -1337,36 +1463,6 @@ fn compact_agent_panel_block(
         })
         .with_hit(hit),
     ]
-}
-
-fn session_attention_icon(
-    palette: &Palette,
-    session: &SessionData,
-    spinner_ts: u64,
-) -> (&'static str, Rgb) {
-    let attention = session
-        .agents
-        .iter()
-        .chain(session.agent_state.as_ref())
-        .max_by_key(|agent| agent_attention_priority(agent.status, session.unseen));
-
-    let Some(agent) = attention else {
-        return ("·", palette.surface2);
-    };
-
-    detail_status_icon_for_agent(palette, agent, session.unseen, spinner_ts)
-}
-
-fn agent_attention_priority(status: AgentStatus, unseen: bool) -> u8 {
-    match status {
-        AgentStatus::Error => 90,
-        AgentStatus::Waiting => 80,
-        AgentStatus::ToolRunning | AgentStatus::Running => 70,
-        AgentStatus::Stale | AgentStatus::Interrupted => 60,
-        AgentStatus::Done if unseen => 50,
-        AgentStatus::Done => 40,
-        AgentStatus::Idle => 10,
-    }
 }
 
 fn semantic_agent_status_text(agent: &AgentEvent, session_unseen: bool) -> &'static str {
@@ -1464,19 +1560,6 @@ fn separator(palette: &Palette, width: usize) -> StyledLine {
     line
 }
 
-fn accent_color(palette: &Palette, session: &SessionData, focused: bool, current: bool) -> Rgb {
-    if current {
-        return palette.green;
-    }
-    if session.unseen {
-        return palette.teal;
-    }
-    if focused {
-        return palette.lavender;
-    }
-    palette.black
-}
-
 fn is_terminal(agent: &AgentEvent) -> bool {
     matches!(
         agent.status,
@@ -1486,17 +1569,6 @@ fn is_terminal(agent: &AgentEvent) -> bool {
 
 fn is_unseen_terminal(agent: &AgentEvent, session_unseen: bool) -> bool {
     session_unseen && is_terminal(agent)
-}
-
-/// Initializing-header spinner (`◐◓◑◒`). Mirrors the inline glyph string in
-/// `apps/tui/src/index.tsx:896`. Frame cadence is 250ms.
-fn spinner(ts: u64) -> &'static str {
-    match (ts / 250) % 4 {
-        0 => "◐",
-        1 => "◓",
-        2 => "◑",
-        _ => "◒",
-    }
 }
 
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
@@ -1594,7 +1666,6 @@ fn tone_color(palette: &Palette, tone: Option<MetadataTone>) -> Rgb {
 struct StyledLine {
     parts: Vec<StyledPart>,
     bg: Option<Rgb>,
-    start_style: Option<CellStyle>,
     end_style: Option<CellStyle>,
     hit: Option<HitTarget>,
 }
@@ -1604,7 +1675,6 @@ impl StyledLine {
         Self {
             parts: Vec::new(),
             bg: None,
-            start_style: None,
             end_style: None,
             hit: None,
         }
@@ -1613,13 +1683,6 @@ impl StyledLine {
     fn with_bg(bg: Option<Rgb>) -> Self {
         Self {
             bg,
-            ..Self::blank()
-        }
-    }
-
-    fn marker(style: CellStyle) -> Self {
-        Self {
-            start_style: Some(style),
             ..Self::blank()
         }
     }

@@ -20,6 +20,7 @@ pub struct ReadOnlyStateInput<'a> {
     pub current_session_override: Option<String>,
     pub theme: Option<String>,
     pub session_filter: Option<SessionFilterMode>,
+    pub collapsed_worktree_groups: Vec<String>,
     pub sidebar_width: u32,
     pub initializing: bool,
     pub init_label: Option<String>,
@@ -143,6 +144,7 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
         sidebar_width: input.sidebar_width,
         initializing: input.initializing,
         init_label: input.init_label,
+        collapsed_worktree_groups: input.collapsed_worktree_groups,
         ts: input.now_ms,
     }
 }

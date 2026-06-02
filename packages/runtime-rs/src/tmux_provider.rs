@@ -226,6 +226,16 @@ impl TmuxClient {
         self.run(&["select-pane", "-t", target]);
     }
 
+    pub fn flash_pane(&self, target: &str) {
+        self.run(&["select-pane", "-t", target, "-P", "bg=colour238"]);
+        let quoted = shell_quote(target);
+        self.run(&[
+            "run-shell",
+            "-b",
+            &format!("sleep 0.18; tmux select-pane -t {quoted} -P default"),
+        ]);
+    }
+
     pub fn set_pane_title(&self, target: &str, title: &str) {
         self.run(&["select-pane", "-t", target, "-T", title]);
     }
@@ -592,6 +602,7 @@ impl MuxProvider for TmuxProvider {
             self.client.select_window(&window_id);
         }
         self.client.select_pane(pane_id);
+        self.client.flash_pane(pane_id);
     }
 
     fn kill_pane(&self, pane_id: &str) {
@@ -782,6 +793,10 @@ fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn parse_sessions(raw: &str) -> Vec<SessionInfo> {

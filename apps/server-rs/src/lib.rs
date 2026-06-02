@@ -372,6 +372,7 @@ pub struct ReadOnlyMuxStateSource {
     focused_session: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
+    collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
@@ -410,6 +411,7 @@ impl ReadOnlyMuxStateSource {
             focused_session: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
+            collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
@@ -564,6 +566,13 @@ impl StateSource for ReadOnlyMuxStateSource {
             current_session_override: self.current_session_override(),
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
+            collapsed_worktree_groups: self
+                .collapsed_worktree_groups
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
             sidebar_width: sidebar_state.width,
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
@@ -695,6 +704,15 @@ impl StateSource for ReadOnlyMuxStateSource {
                     _ => return None,
                 };
                 *self.session_filter.lock().unwrap() = Some(filter);
+                Some(self.snapshot_json())
+            }
+            "toggle-worktree-group" => {
+                let key = command.get("key")?.as_str()?.to_string();
+                let mut collapsed = self.collapsed_worktree_groups.lock().unwrap();
+                if !collapsed.insert(key) {
+                    collapsed.remove(command.get("key")?.as_str()?);
+                }
+                drop(collapsed);
                 Some(self.snapshot_json())
             }
             "report-width" => {

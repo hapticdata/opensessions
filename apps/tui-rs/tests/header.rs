@@ -11,9 +11,9 @@ fn header_renders_init_label_with_spinner_when_initializing() {
     let buffer = render_to_buffer(&mut app, 60, 56);
     let ansi = buffer_to_ansi(&buffer);
 
-    // Spinner glyph at ts=0 is "◐"; the label text must follow.
+    // Loader uses the same braille spinner as running agents.
     assert!(
-        ansi.contains("◐"),
+        ansi.contains("⠋"),
         "header must include a spinner glyph while initializing; got:\n{ansi}"
     );
     assert!(
@@ -27,13 +27,13 @@ fn header_falls_back_to_warming_up_when_init_label_missing() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.initializing = true;
     app.init_label = None;
-    app.ts = 250; // selects spinner index 1 = "◓"
+    app.ts = 250; // selects agent spinner index 2 = "⠹"
 
     let buffer = render_to_buffer(&mut app, 60, 56);
     let ansi = buffer_to_ansi(&buffer);
 
     assert!(
-        ansi.contains("◓"),
+        ansi.contains("⠹"),
         "spinner must advance frame with ts; got:\n{ansi}"
     );
     assert!(
@@ -56,7 +56,7 @@ fn header_at_narrow_width_preserves_short_init_label() {
 
     let mut header = String::new();
     for x in 0..26 {
-        header.push_str(&buffer_symbol_at(&buffer, x, 1));
+        header.push_str(&buffer_symbol_at(&buffer, x, 0));
     }
 
     assert!(
@@ -64,7 +64,7 @@ fn header_at_narrow_width_preserves_short_init_label() {
         "header at width=26 must show the lifecycle label; got: {header:?}",
     );
     assert!(
-        header.contains('◐'),
+        header.contains('⠋'),
         "header at width=26 must show the spinner with the label; got: {header:?}",
     );
     assert!(
@@ -83,17 +83,43 @@ fn header_omits_spinner_when_not_initializing() {
 
     let buffer = render_to_buffer(&mut app, 60, 56);
 
-    // The header line is row 1 (after marker line).
     let mut header = String::new();
     for x in 0..60 {
-        header.push_str(&buffer_symbol_at(&buffer, x, 1));
+        header.push_str(&buffer_symbol_at(&buffer, x, 0));
     }
     assert!(
-        !header.contains('◐'),
+        !header.contains('⠋'),
         "spinner must not appear when initializing=false; got header: {header:?}"
     );
     assert!(
         !header.contains("ignored"),
         "init_label must be hidden when initializing=false; got header: {header:?}"
+    );
+}
+
+#[test]
+fn empty_initializing_session_list_renders_inline_loader_rows() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.sessions.clear();
+    app.initializing = true;
+    app.init_label = Some("warming up…".into());
+    app.ts = 0;
+
+    let buffer = render_to_buffer(&mut app, 35, 12);
+
+    let mut first_loader = String::new();
+    let mut second_loader = String::new();
+    for x in 0..35 {
+        first_loader.push_str(&buffer_symbol_at(&buffer, x, 2));
+        second_loader.push_str(&buffer_symbol_at(&buffer, x, 3));
+    }
+
+    assert!(
+        first_loader.contains("   ⠋  warming up"),
+        "session loader must align with the list rail and use the agent spinner; got: {first_loader:?}"
+    );
+    assert!(
+        second_loader.contains("      reading tmux + git"),
+        "session loader must show the secondary loading step; got: {second_loader:?}"
     );
 }

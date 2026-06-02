@@ -1,14 +1,16 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::fixtures::{fixture_static_name, reference_sessions};
 use crate::generated::protocol::{
-    AgentEvent, AgentLiveness, AgentStatus, ClientCommand, LocalLink, ServerMessage, ServerState,
-    SessionData, SessionFilterMode,
+    AgentEvent, AgentStatus, ClientCommand, ServerMessage, ServerState, SessionData,
+    SessionFilterMode,
 };
 use crate::renderer::HitTarget;
 pub use crate::session_display::DisplaySessionEntry;
-use crate::session_display::session_display_entries;
+use crate::session_display::{session_display_entries, worktree_group_key};
 
-pub const SESSION_CARD_HEIGHT: usize = 4;
+pub const SESSION_CARD_HEIGHT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelFocus {
@@ -30,6 +32,28 @@ pub enum LaunchTarget {
     LazydiffTerminal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarFocus {
+    Session(String),
+    WorktreeGroup(String),
+}
+
+impl SidebarFocus {
+    pub fn session_name(&self) -> Option<&str> {
+        match self {
+            Self::Session(name) => Some(name),
+            Self::WorktreeGroup(_) => None,
+        }
+    }
+
+    pub fn worktree_group_key(&self) -> Option<&str> {
+        match self {
+            Self::Session(_) => None,
+            Self::WorktreeGroup(key) => Some(key),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     None,
@@ -46,7 +70,7 @@ pub enum Modal {
 #[derive(Debug)]
 pub struct App {
     pub sessions: Vec<SessionData>,
-    pub focused_session: Option<String>,
+    pub sidebar_focus: Option<SidebarFocus>,
     pub current_session: Option<String>,
     pub my_session: Option<String>,
     pub initializing: bool,
@@ -71,6 +95,7 @@ pub struct App {
     pub session_scroll_offset: usize,
     session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
+    collapsed_worktree_groups: HashSet<String>,
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
@@ -88,9 +113,10 @@ pub struct PaneIdentity {
 
 impl App {
     pub fn from_state(state: ServerState) -> Self {
-        Self {
+        let focused_session = state.focused_session.clone();
+        let mut app = Self {
             sessions: state.sessions,
-            focused_session: state.focused_session,
+            sidebar_focus: None,
             current_session: state.current_session,
             my_session: None,
             initializing: state.initializing,
@@ -111,13 +137,19 @@ impl App {
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
+            collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             fixture_name: None,
             terminal_width: None,
             pane_identity: None,
             optimistic_current_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
-        }
+        };
+        app.sidebar_focus = focused_session
+            .as_deref()
+            .and_then(|name| app.visible_focus_for_session(name))
+            .or_else(|| app.display_session_entries().first().map(entry_focus));
+        app
     }
 
     pub fn set_terminal_width(&mut self, width: u16) {
@@ -174,7 +206,7 @@ impl App {
     pub fn apply_server_message(&mut self, message: ServerMessage) {
         match message {
             ServerMessage::State(state) => {
-                let previous_focused_session = self.focused_session.clone();
+                let previous_focus = self.sidebar_focus.clone();
                 self.sessions = state.sessions;
                 self.current_session = match self.optimistic_current_session.as_deref() {
                     Some(optimistic)
@@ -195,24 +227,38 @@ impl App {
                         state.current_session
                     }
                 };
-                self.focused_session = previous_focused_session
-                    .filter(|focused| self.sessions.iter().any(|session| session.name == *focused))
-                    .or(state.focused_session);
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
+                self.collapsed_worktree_groups =
+                    state.collapsed_worktree_groups.into_iter().collect();
+                let focus_still_exists = previous_focus
+                    .as_ref()
+                    .is_some_and(|focus| self.focus_exists(focus));
+                if !focus_still_exists {
+                    self.sidebar_focus = state
+                        .focused_session
+                        .as_deref()
+                        .and_then(|focused| self.visible_focus_for_session(focused))
+                        .or_else(|| self.display_session_entries().first().map(entry_focus));
+                    self.session_scroll_follows_focus = true;
+                }
                 self.clamp_session_scroll_offset(0);
-                self.session_scroll_follows_focus = true;
             }
             ServerMessage::Focus(update) => {
-                self.focused_session = update.focused_session;
+                let next_focus = update
+                    .focused_session
+                    .as_deref()
+                    .and_then(|focused| self.visible_focus_for_session(focused));
                 self.current_session = update.current_session;
                 if self.optimistic_current_session.as_deref() == self.current_session.as_deref() {
                     self.optimistic_current_session = None;
                 }
-                self.session_scroll_follows_focus = true;
+                if let Some(next_focus) = next_focus {
+                    self.set_sidebar_focus(next_focus);
+                }
             }
             ServerMessage::YourSession { name, .. } => {
                 self.my_session = Some(name);
@@ -239,7 +285,7 @@ impl App {
 
         let mut app = Self {
             sessions: reference_sessions(),
-            focused_session: focused_session.map(str::to_string),
+            sidebar_focus: focused_session.map(|name| SidebarFocus::Session(name.to_string())),
             current_session: current_session.map(str::to_string),
             my_session: current_session.map(str::to_string),
             initializing: false,
@@ -260,6 +306,7 @@ impl App {
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
+            collapsed_worktree_groups: HashSet::new(),
             fixture_name: fixture_static_name(name),
             terminal_width: None,
             pane_identity: None,
@@ -312,7 +359,10 @@ impl App {
     }
 
     pub fn display_session_entries(&self) -> Vec<DisplaySessionEntry<'_>> {
-        session_display_entries(self.filtered_sessions().collect())
+        session_display_entries(
+            self.filtered_sessions().collect(),
+            &self.collapsed_worktree_groups,
+        )
     }
 
     pub fn display_sessions(&self) -> Vec<&SessionData> {
@@ -323,6 +373,41 @@ impl App {
                 DisplaySessionEntry::Group { .. } => None,
             })
             .collect()
+    }
+
+    pub fn focused_session_name(&self) -> Option<&str> {
+        self.sidebar_focus.as_ref()?.session_name()
+    }
+
+    pub fn focused_group_key(&self) -> Option<&str> {
+        self.sidebar_focus.as_ref()?.worktree_group_key()
+    }
+
+    pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
+        self.sidebar_focus = Some(focus);
+        self.panel_focus = PanelFocus::Sessions;
+        self.focused_agent_idx = 0;
+        self.session_scroll_follows_focus = true;
+    }
+
+    pub fn set_focused_session(&mut self, name: impl Into<String>) {
+        self.set_sidebar_focus(SidebarFocus::Session(name.into()));
+    }
+
+    fn focus_exists(&self, focus: &SidebarFocus) -> bool {
+        self.display_session_entries()
+            .iter()
+            .any(|entry| &entry_focus(entry) == focus)
+    }
+
+    fn visible_focus_for_session(&self, name: &str) -> Option<SidebarFocus> {
+        let session_focus = SidebarFocus::Session(name.to_string());
+        if self.focus_exists(&session_focus) {
+            return Some(session_focus);
+        }
+        let session = self.sessions.iter().find(|session| session.name == name)?;
+        let group_focus = SidebarFocus::WorktreeGroup(worktree_group_key(session)?);
+        self.focus_exists(&group_focus).then_some(group_focus)
     }
 
     pub fn handle_key_char(&mut self, key: char) {
@@ -343,14 +428,14 @@ impl App {
             'd' => {
                 if self.panel_focus == PanelFocus::Agents {
                     self.dismiss_focused_agent();
-                } else if let Some(name) = self.focused_session.clone() {
+                } else if let Some(name) = self.focused_session_name().map(str::to_string) {
                     self.commands.push(ClientCommand::HideSession { name });
                 }
             }
             'x' => {
                 if self.panel_focus == PanelFocus::Agents {
                     self.kill_focused_agent_pane();
-                } else if let Some(name) = self.focused_session.clone() {
+                } else if let Some(name) = self.focused_session_name().map(str::to_string) {
                     self.modal = Modal::KillConfirm { session_name: name };
                 }
             }
@@ -406,13 +491,10 @@ impl App {
         if next_idx == current_idx {
             return;
         }
-        let Some(name) = self.filtered_session_name_at(next_idx) else {
+        let Some(target) = self.filtered_focus_target_at(next_idx) else {
             return;
         };
-        self.focused_session = Some(name.clone());
-        self.panel_focus = PanelFocus::Sessions;
-        self.focused_agent_idx = 0;
-        self.session_scroll_follows_focus = true;
+        self.set_sidebar_focus(target);
     }
 
     pub fn session_scroll_offset(&self) -> usize {
@@ -424,14 +506,14 @@ impl App {
     }
 
     pub fn scroll_sessions(&mut self, delta: i8, viewport_rows: usize) {
-        let len = self.display_sessions().len();
+        let entries = self.display_session_entries();
+        let len = entries.len();
         if len == 0 || viewport_rows == 0 {
             self.session_scroll_offset = 0;
             return;
         }
 
-        let visible_cards = visible_session_cards(viewport_rows);
-        let max_offset = len.saturating_sub(visible_cards);
+        let max_offset = max_scroll_offset(&entries, viewport_rows);
         let next_offset = if delta < 0 {
             self.session_scroll_offset
                 .saturating_sub(delta.unsigned_abs() as usize)
@@ -504,13 +586,17 @@ impl App {
     pub fn activate_focused_item(&mut self) {
         if self.panel_focus == PanelFocus::Agents {
             self.activate_focused_agent();
-        } else {
-            self.activate_focused_session();
+            return;
+        }
+        match self.sidebar_focus.clone() {
+            Some(SidebarFocus::Session(name)) => self.switch_to_session(name),
+            Some(SidebarFocus::WorktreeGroup(key)) => self.toggle_worktree_group(&key),
+            None => {}
         }
     }
 
     pub fn activate_focused_session(&mut self) {
-        if let Some(name) = self.focused_session.clone() {
+        if let Some(name) = self.focused_session_name().map(str::to_string) {
             self.switch_to_session(name);
         }
     }
@@ -520,15 +606,21 @@ impl App {
     /// `apps/tui/src/index.tsx::SessionCard`.
     pub fn click_session(&mut self, name: String) {
         self.trigger_flash(HitTarget::Session(name.clone()));
-        self.focused_session = Some(name.clone());
-        self.session_scroll_follows_focus = true;
         self.switch_to_session(name);
+    }
+
+    pub fn click_group(&mut self, key: String) {
+        self.trigger_flash(HitTarget::Group(key.clone()));
+        if self.focused_group_key() == Some(key.as_str()) {
+            self.toggle_worktree_group(&key);
+            return;
+        }
+        self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key));
     }
 
     pub fn click_diff_count(&mut self, name: String) {
         self.trigger_flash(HitTarget::DiffCount(name.clone()));
-        self.focused_session = Some(name);
-        self.session_scroll_follows_focus = true;
+        self.set_sidebar_focus(SidebarFocus::Session(name));
         self.pending_launches.push(LaunchTarget::LazydiffTmux);
     }
 
@@ -668,7 +760,7 @@ impl App {
     }
 
     pub fn reorder_focused_session(&mut self, delta: i8) {
-        if let Some(name) = self.focused_session.clone() {
+        if let Some(name) = self.focused_session_name().map(str::to_string) {
             self.commands
                 .push(ClientCommand::ReorderSession { name, delta });
         }
@@ -678,10 +770,7 @@ impl App {
         self.my_session = Some(name.clone());
         self.current_session = Some(name.clone());
         self.optimistic_current_session = Some(name.clone());
-        self.focused_session = Some(name.clone());
-        self.panel_focus = PanelFocus::Sessions;
-        self.focused_agent_idx = 0;
-        self.session_scroll_follows_focus = true;
+        self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
@@ -693,10 +782,7 @@ impl App {
         self.my_session = Some(name.clone());
         self.current_session = Some(name.clone());
         self.optimistic_current_session = Some(name.clone());
-        self.focused_session = Some(name.clone());
-        self.panel_focus = PanelFocus::Sessions;
-        self.focused_agent_idx = 0;
-        self.session_scroll_follows_focus = true;
+        self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
@@ -717,19 +803,28 @@ impl App {
     }
 
     fn clamp_session_scroll_offset(&mut self, viewport_rows: usize) {
-        let len = self.filtered_sessions().count();
-        let visible_cards = visible_session_cards(viewport_rows);
+        let entries = self.display_session_entries();
         self.session_scroll_offset = self
             .session_scroll_offset
-            .min(len.saturating_sub(visible_cards));
+            .min(max_scroll_offset(&entries, viewport_rows));
+    }
+
+    pub fn is_group_collapsed(&self, key: &str) -> bool {
+        self.collapsed_worktree_groups.contains(key)
+    }
+
+    fn toggle_worktree_group(&mut self, key: &str) {
+        self.commands.push(ClientCommand::ToggleWorktreeGroup {
+            key: key.to_string(),
+        });
     }
 
     fn focused_filtered_index_and_len(&self) -> Option<(usize, usize)> {
-        let focused = self.focused_session.as_deref();
+        let focused = self.sidebar_focus.as_ref();
         let mut focused_idx = None;
         let mut len = 0;
-        for (idx, session) in self.display_sessions().into_iter().enumerate() {
-            if Some(session.name.as_str()) == focused {
+        for (idx, entry) in self.display_session_entries().into_iter().enumerate() {
+            if Some(&entry_focus(&entry)) == focused {
                 focused_idx = Some(idx);
             }
             len += 1;
@@ -737,14 +832,12 @@ impl App {
         (len > 0).then_some((focused_idx.unwrap_or(0), len))
     }
 
-    fn filtered_session_name_at(&self, index: usize) -> Option<String> {
-        self.display_sessions()
-            .get(index)
-            .map(|session| session.name.clone())
+    fn filtered_focus_target_at(&self, index: usize) -> Option<SidebarFocus> {
+        self.display_session_entries().get(index).map(entry_focus)
     }
 
     fn focused_session_data(&self) -> Option<&SessionData> {
-        let focused = self.focused_session.as_deref()?;
+        let focused = self.focused_session_name()?;
         self.sessions.iter().find(|session| session.name == focused)
     }
 
@@ -782,165 +875,29 @@ fn visible_session_cards(viewport_rows: usize) -> usize {
     viewport_rows.div_ceil(SESSION_CARD_HEIGHT).max(1)
 }
 
-fn fixture_static_name(name: &str) -> Option<&'static str> {
-    match name {
-        "pane-attached-session-list" => Some("pane-attached-session-list"),
-        "pane-opensessions-self" => Some("pane-opensessions-self"),
-        "pane-multi-window" => Some("pane-multi-window"),
-        _ => None,
+fn max_scroll_offset(entries: &[DisplaySessionEntry<'_>], viewport_rows: usize) -> usize {
+    if entries.is_empty() || viewport_rows == 0 {
+        return 0;
     }
-}
-
-fn reference_sessions() -> Vec<SessionData> {
-    vec![
-        session("_os_stash", "/tmp/_os_stash", "", None, Vec::new()),
-        session(
-            "plane-feat-edit-pages-from-pi",
-            "/Users/palanikannanm/Documents/work/feat-edit-pages-from-pi",
-            "feat/edit-pages-from-pi",
-            None,
-            Vec::new(),
-        ),
-        session(
-            "plane-feat-background-exports",
-            "/Users/palanikannanm/Documents/work/feat-background-exports",
-            "feat-background-exports",
-            None,
-            Vec::new(),
-        ),
-        session(
-            "learning",
-            "/Users/palanikannanm/Documents/work/learning",
-            "main",
-            None,
-            Vec::new(),
-        ),
-        session(
-            "opensessions",
-            "/Users/palanikannanm/Documents/work/opensessions",
-            "devpulse",
-            Some(agent(
-                "amp",
-                "opensessions",
-                AgentStatus::ToolRunning,
-                Some("Query tmux for open sessions"),
-                None,
-            )),
-            vec![
-                agent(
-                    "amp",
-                    "opensessions",
-                    AgentStatus::ToolRunning,
-                    Some("Query tmux for open sessions"),
-                    None,
-                ),
-                agent("amp", "opensessions", AgentStatus::Idle, None, None),
-            ],
-        ),
-        session(
-            "plane-pdf-word-formatting",
-            "/Users/palanikannanm/Documents/work/plane-ee-wt/pdf-word-formatting",
-            "chore-relation-pqls",
-            Some(agent_with_liveness(
-                "amp",
-                "plane-pdf-word-formatting",
-                AgentStatus::Done,
-                Some("Review GitHub PR for Plane"),
-                Some(true),
-                None,
-            )),
-            vec![
-                agent_with_liveness(
-                    "amp",
-                    "plane-pdf-word-formatting",
-                    AgentStatus::Done,
-                    Some("Review GitHub PR for Plane"),
-                    Some(true),
-                    None,
-                ),
-                agent(
-                    "amp",
-                    "plane-pdf-word-formatting",
-                    AgentStatus::Idle,
-                    None,
-                    None,
-                ),
-            ],
-        ),
-        session(
-            "dotfiles_public",
-            "/Users/palanikannanm/Documents/work/dotfiles.public",
-            "main",
-            None,
-            Vec::new(),
-        ),
-    ]
-}
-
-fn session(
-    name: &str,
-    dir: &str,
-    branch: &str,
-    agent_state: Option<AgentEvent>,
-    agents: Vec<AgentEvent>,
-) -> SessionData {
-    SessionData {
-        name: name.to_string(),
-        created_at: 0,
-        dir: dir.to_string(),
-        branch: branch.to_string(),
-        dirty: false,
-        changed_files: 0,
-        insertions: 0,
-        deletions: 0,
-        is_worktree: false,
-        unseen: name == "plane-pdf-word-formatting",
-        panes: 1,
-        ports: Vec::new(),
-        local_links: Vec::<LocalLink>::new(),
-        windows: 1,
-        uptime: String::new(),
-        agent_state,
-        agents,
-        event_timestamps: Vec::new(),
-        metadata: None,
+    let total_rows = entries
+        .iter()
+        .map(DisplaySessionEntry::row_height)
+        .sum::<usize>();
+    if total_rows <= viewport_rows {
+        return 0;
     }
+    let mut offset = 0;
+    let mut remaining_rows = total_rows;
+    while offset < entries.len() && remaining_rows > viewport_rows {
+        remaining_rows = remaining_rows.saturating_sub(entries[offset].row_height());
+        offset += 1;
+    }
+    offset.min(entries.len().saturating_sub(1))
 }
 
-fn agent(
-    agent_name: &str,
-    session: &str,
-    status: AgentStatus,
-    thread_name: Option<&str>,
-    unseen: Option<bool>,
-) -> AgentEvent {
-    agent_with_liveness(
-        agent_name,
-        session,
-        status,
-        thread_name,
-        unseen,
-        Some(AgentLiveness::Alive),
-    )
-}
-
-fn agent_with_liveness(
-    agent_name: &str,
-    session: &str,
-    status: AgentStatus,
-    thread_name: Option<&str>,
-    unseen: Option<bool>,
-    liveness: Option<AgentLiveness>,
-) -> AgentEvent {
-    AgentEvent {
-        agent: agent_name.to_string(),
-        session: session.to_string(),
-        status,
-        ts: 0,
-        thread_id: None,
-        thread_name: thread_name.map(str::to_string),
-        unseen,
-        pane_id: None,
-        liveness,
+fn entry_focus(entry: &DisplaySessionEntry<'_>) -> SidebarFocus {
+    match entry {
+        DisplaySessionEntry::Session { session, .. } => SidebarFocus::Session(session.name.clone()),
+        DisplaySessionEntry::Group { key, .. } => SidebarFocus::WorktreeGroup(key.clone()),
     }
 }

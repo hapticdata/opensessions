@@ -45,6 +45,9 @@ pub struct ServerState {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_label: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_worktree_groups: Vec<String>,
     pub ts: u64,
 }
 
@@ -276,6 +279,9 @@ pub enum ClientCommand {
     },
     SetFilter {
         filter: SessionFilterMode,
+    },
+    ToggleWorktreeGroup {
+        key: String,
     },
     Identify {
         client_tty: String,

@@ -25,7 +25,7 @@ fn render_to_buffer_exposes_ratatui_test_backend_cells() {
     let buffer = render_to_buffer(&mut app, 35, 56);
 
     assert_eq!(buffer_dimensions(&buffer), (35, 56));
-    assert_eq!(buffer_symbol_at(&buffer, 3, 1), "S");
+    assert_eq!(buffer_symbol_at(&buffer, 0, 0), "S");
     assert_eq!(buffer_symbol_at(&buffer, 1, 43), "─");
 }
 
@@ -52,7 +52,7 @@ fn focused_agent_row_uses_highlight_background() {
 #[test]
 fn focused_detail_panel_streams_agent_status_labels() {
     let mut app = App::reference_fixture("pane-opensessions-self");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
     let session = app
         .sessions
         .iter_mut()
@@ -101,14 +101,14 @@ fn worktree_sessions_render_under_parent_group() {
     let ansi = buffer_to_ansi(&buffer);
 
     assert!(ansi.contains("plane-ee-wt"));
-    assert!(ansi.contains("2 worktrees"));
+    assert!(ansi.contains("2wt"));
     let mut found_second_worktree = false;
     for y in 0..20 {
         let mut row = String::new();
         for x in 0..35 {
             row.push_str(&buffer_symbol_at(&buffer, x, y));
         }
-        if row.contains("2 plane-feat-background") {
+        if row.contains("02  plane-feat-background") {
             found_second_worktree = true;
             break;
         }
@@ -146,7 +146,7 @@ fn focused_session_far_down_list_is_scrolled_into_view() {
         session.branch = "main".into();
         app.sessions.push(session);
     }
-    app.focused_session = Some("extra-40".into());
+    app.set_focused_session("extra-40");
 
     let buffer = render_to_buffer(&mut app, 35, 56);
 
@@ -185,7 +185,7 @@ fn sessions_list_renders_scroll_indicator_when_overflow() {
         session.branch = "main".into();
         app.sessions.push(session);
     }
-    app.focused_session = Some("extra-40".into());
+    app.set_focused_session("extra-40");
 
     let buffer = render_to_buffer(&mut app, 35, 56);
 

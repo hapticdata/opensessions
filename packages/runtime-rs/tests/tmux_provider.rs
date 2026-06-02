@@ -278,6 +278,17 @@ fn tmux_provider_resolves_focuses_and_kills_agent_panes() {
     assert!(
         calls
             .iter()
+            .any(|call| call == &vec!["select-pane", "-t", "%2", "-P", "bg=colour238"])
+    );
+    assert!(calls.iter().any(|call| {
+        call.first().map(String::as_str) == Some("run-shell")
+            && call
+                .get(2)
+                .is_some_and(|command| command.contains("select-pane -t '%2' -P default"))
+    }));
+    assert!(
+        calls
+            .iter()
             .any(|call| call == &vec!["kill-pane", "-t", "%2"])
     );
 }

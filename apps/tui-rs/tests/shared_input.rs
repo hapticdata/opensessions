@@ -5,12 +5,12 @@ use opensessions_sidebar::input::{UiKey, apply_ui_key};
 #[test]
 fn shared_input_mapping_drives_existing_session_navigation() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
 
     apply_ui_key(&mut app, UiKey::Down);
 
     assert_eq!(
-        app.focused_session.as_deref(),
+        app.focused_session_name(),
         Some("plane-pdf-word-formatting")
     );
     assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
@@ -33,7 +33,7 @@ fn shared_input_mapping_preserves_agent_panel_bindings() {
 #[test]
 fn shared_input_mapping_keeps_reorder_and_switch_shortcuts() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
     app.current_session = Some("opensessions".into());
 
     apply_ui_key(&mut app, UiKey::AltUp);

@@ -15,6 +15,7 @@ fn empty_state(theme: Option<&str>) -> ServerState {
         sidebar_width: 35,
         initializing: false,
         init_label: None,
+        collapsed_worktree_groups: Vec::new(),
         ts: 0,
     }
 }

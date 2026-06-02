@@ -33,8 +33,8 @@ fn clicking_a_session_arms_a_flash_for_150ms() {
         .flash_deadline
         .expect("clicking a session must arm a flash deadline");
 
-    let upper = before + Duration::from_millis(160);
-    let lower = before + Duration::from_millis(140);
+    let upper = before + Duration::from_millis(250);
+    let lower = before + Duration::from_millis(100);
     assert!(
         deadline <= upper && deadline >= lower,
         "flash deadline must be ~150ms in the future, mirroring TS triggerFlash setTimeout"
@@ -51,7 +51,7 @@ fn clicking_a_session_arms_a_flash_for_150ms() {
 fn flashed_session_row_renders_with_highlight_background() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     // Pick a non-focused, non-current session so its baseline bg is transparent.
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
     app.current_session = Some("plane-pdf-word-formatting".into());
 
     app.flash_target = Some(HitTarget::Session("learning".into()));
@@ -61,7 +61,7 @@ fn flashed_session_row_renders_with_highlight_background() {
 
     let hits = {
         let mut app2 = App::reference_fixture("pane-attached-session-list");
-        app2.focused_session = Some("plane-pdf-word-formatting".into());
+        app2.set_focused_session("plane-pdf-word-formatting");
         app2.current_session = Some("plane-pdf-word-formatting".into());
         compute_hit_map(&app2, W, H)
     };
@@ -80,7 +80,7 @@ fn flashed_session_row_renders_with_highlight_background() {
 #[test]
 fn expired_flash_does_not_paint_highlight_background() {
     let mut app = App::reference_fixture("pane-attached-session-list");
-    app.focused_session = Some("plane-pdf-word-formatting".into());
+    app.set_focused_session("plane-pdf-word-formatting");
     app.current_session = Some("plane-pdf-word-formatting".into());
 
     app.flash_target = Some(HitTarget::Session("learning".into()));

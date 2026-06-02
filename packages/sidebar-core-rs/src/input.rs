@@ -86,8 +86,7 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
         UiKey::Right => {
             if app.panel_focus == PanelFocus::Sessions {
                 let agent_count = app
-                    .focused_session
-                    .as_deref()
+                    .focused_session_name()
                     .and_then(|name| app.sessions.iter().find(|s| s.name == name))
                     .map(|s| s.agents.len())
                     .unwrap_or(0);
@@ -249,6 +248,9 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             match target {
                 Some(HitTarget::Session(name)) => {
                     app.click_session(name);
+                }
+                Some(HitTarget::Group(key)) => {
+                    app.click_group(key);
                 }
                 Some(HitTarget::DiffCount(name)) => {
                     app.click_diff_count(name);

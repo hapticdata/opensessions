@@ -234,8 +234,7 @@ async fn main() -> Result<()> {
                     }
                     for launch in app.drain_launches() {
                         let session = app
-                            .focused_session
-                            .as_deref()
+                            .focused_session_name()
                             .and_then(|name| app.sessions.iter().find(|s| s.name == name));
                         let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
                         let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
@@ -293,8 +292,7 @@ async fn main() -> Result<()> {
                     }
                     for launch in app.drain_launches() {
                         let session = app
-                            .focused_session
-                            .as_deref()
+                            .focused_session_name()
                             .and_then(|name| app.sessions.iter().find(|s| s.name == name));
                         let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
                         let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
@@ -336,7 +334,7 @@ async fn main() -> Result<()> {
                             *slot = Some(new_app);
                         }
                         (Some(app), ServerMessage::State(state)) => {
-                            let previous_focus = app.focused_session.clone();
+                            let previous_focus = app.focused_session_name().map(str::to_string);
                             debug_log(format!(
                                 "ws: state update init={} init_label={:?} sessions={}",
                                 state.initializing,
@@ -344,7 +342,7 @@ async fn main() -> Result<()> {
                                 state.sessions.len(),
                             ));
                             app.apply_server_message(ServerMessage::State(state));
-                            if app.focused_session != previous_focus {
+                            if app.focused_session_name() != previous_focus.as_deref() {
                                 load_detail_height_for_focus(app);
                             }
                         }
@@ -442,7 +440,7 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn load_detail_height_for_focus(app: &mut App) {
-    let Some(session) = app.focused_session.as_deref() else {
+    let Some(session) = app.focused_session_name() else {
         return;
     };
     let Some(path) = config_path() else {
@@ -465,7 +463,7 @@ fn load_detail_height_for_focus(app: &mut App) {
 }
 
 fn persist_detail_height_for_focus(app: &App) {
-    let Some(session) = app.focused_session.as_deref() else {
+    let Some(session) = app.focused_session_name() else {
         return;
     };
     let Some(path) = config_path() else {
