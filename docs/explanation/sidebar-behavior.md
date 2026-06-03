@@ -139,10 +139,13 @@ That means:
 - the destination session/window should already have a sidebar at the current global width
 - switching must not trigger visible layout jumps
 - switching must not reset the width to an older value
+- transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - if the user resized immediately before switching, the just-resized width must survive the switch
 - switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
 
 One specific regression we already paid for: forcing `resize-window` during the session-switch path caused visible layout jumps. The fix was to stop doing that in the switch path and instead use targeted width enforcement plus background pre-layout where appropriate.
+
+Another regression: switching into a session can briefly resize the destination sidebar through impossible widths such as `1 → 20 → 58 → 20` while tmux restores layout. Those reports are layout-settle echoes, not user drags, even when they come from the active session/window/sidebar pane. Session handoff paths therefore arm a short width-report guard before accepting new user-authored sidebar width.
 
 ## Warmup And Adjusting Semantics
 

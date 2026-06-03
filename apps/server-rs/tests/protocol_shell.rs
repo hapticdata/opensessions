@@ -12,8 +12,8 @@ use opensessions_runtime::mux::{
     ActiveWindow, AgentPane, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
 use opensessions_server::{
-    GitCommandRunner, PortCommandRunner, ReadOnlyMuxStateSource, StateSource,
-    default_state_source_from_env,
+    ClientConnectionContext, GitCommandRunner, PortCommandRunner, ReadOnlyMuxStateSource,
+    StateSource, default_state_source_from_env,
 };
 use opensessions_server::{ServerConfig, start_server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -825,7 +825,12 @@ async fn debounced_switch_session_only_applies_latest_tmux_switch() {
             .expect("debounced switch command should send");
     }
 
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    for _ in 0..40 {
+        if !mux.switch_calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert_eq!(
         *mux.switch_calls.lock().unwrap(),
         vec![("bravo".to_string(), None)],
@@ -891,7 +896,12 @@ async fn debounced_switch_session_does_not_broadcast_current_session_to_other_cl
         .await
         .expect("debounced switch command should send");
 
-    tokio::time::sleep(Duration::from_millis(180)).await;
+    for _ in 0..40 {
+        if !mux.switch_calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert_eq!(
         *mux.switch_calls.lock().unwrap(),
         vec![("bravo".to_string(), None)]
@@ -1562,6 +1572,63 @@ async fn report_width_coalesces_background_sidebar_fanout_to_latest_width() {
 
     server.shutdown().await.expect("server should shut down");
     let _ = fs::remove_file(pid_file);
+}
+
+#[test]
+fn focus_handoff_width_reports_do_not_replace_user_sidebar_width() {
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+    let mux = Arc::new(HookMux {
+        sidebar_panes: vec![SidebarPane {
+            pane_id: "%1".to_string(),
+            session_name: "pi-config".to_string(),
+            window_id: "@1".to_string(),
+            width: Some(20),
+            window_width: Some(120),
+        }],
+        active_windows: vec![ActiveWindow {
+            id: "@1".to_string(),
+            session_name: "pi-config".to_string(),
+            active: true,
+        }],
+        spawn_calls: Mutex::new(Vec::new()),
+        hide_calls: Mutex::new(Vec::new()),
+        orphan_cleanup_calls: Mutex::new(0),
+        resize_calls: Mutex::new(Vec::new()),
+    });
+    let source = ReadOnlyMuxStateSource::new(vec![mux.clone()])
+        .with_sidebar_width(35)
+        .with_now_ms({
+            let now = Arc::clone(&now);
+            move || now.load(Ordering::SeqCst)
+        });
+    let mut context = ClientConnectionContext::default();
+
+    source.handle_sender_command_with_context(
+        &serde_json::json!({
+            "type": "identify-pane",
+            "paneId": "%1",
+            "sessionName": "pi-config",
+            "windowId": "@1",
+        }),
+        &mut context,
+    );
+    source.handle_http_text("/focus", "/dev/ttys-test|pi-config|@1");
+    now.store(1_100, Ordering::SeqCst);
+
+    let reply = source.handle_client_command_with_context(
+        &serde_json::json!({
+            "type": "report-width",
+            "width": 20,
+        }),
+        Some(&context),
+    );
+
+    assert_eq!(reply, None);
+    assert!(
+        source.snapshot_json().contains(r#""sidebarWidth":35"#),
+        "a session-switch/layout-settle resize report must not overwrite the user-owned width"
+    );
+    assert!(mux.resize_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

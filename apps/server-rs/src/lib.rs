@@ -78,6 +78,7 @@ const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const COALESCED_OP_TICK_MS: u64 = 25;
 const SWITCH_DEBOUNCE_MS: u64 = 80;
 const WIDTH_FANOUT_DEBOUNCE_MS: u64 = USER_DRAG_SETTLE_MS;
+const SESSION_SWITCH_WIDTH_GUARD_MS: u64 = 1_200;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -635,6 +636,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     self.schedule_session_switch(name, client_tty);
                 } else {
                     self.pending_session_switch.lock().unwrap().take();
+                    self.guard_width_reports_after_session_handoff((self.now_ms)());
                     provider.switch_session(name, client_tty);
                 }
                 // Visiting a session clears its unseen agents (turns ● back
@@ -675,6 +677,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                         .session_before(name)
                         .or_else(|| self.session_after(name))
                 {
+                    self.guard_width_reports_after_session_handoff((self.now_ms)());
                     provider.switch_session(&next, None);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
@@ -976,6 +979,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         if path != "/focus" {
             return None;
         }
+        self.guard_width_reports_after_session_handoff((self.now_ms)());
         let name = parse_context_session(body).or_else(|| parse_legacy_focus_session(body))?;
         *self.focused_session.lock().unwrap() = Some(name.clone());
         // Visiting (focusing) a session clears its unseen agents — `●`
@@ -1293,6 +1297,7 @@ impl ReadOnlyMuxStateSource {
         if let Some(intent) = switch
             && let Some(provider) = self.providers.first()
         {
+            self.guard_width_reports_after_session_handoff(now);
             provider.switch_session(&intent.name, intent.client_tty.as_deref());
             changed = self
                 .agent_tracker
@@ -1640,6 +1645,7 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn ensure_sidebar(&self, body: &str) {
+        self.guard_width_reports_after_session_handoff((self.now_ms)());
         let context = parse_context(body);
         // A window switch / new window makes tmux proportionally redistribute the
         // panes in that window, so the already-spawned sidebar panes can drift off
@@ -1693,11 +1699,19 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
+        self.guard_width_reports_after_session_handoff((self.now_ms)());
         provider.switch_session(&name, client_tty);
         self.agent_tracker.lock().unwrap().handle_focus(&name);
         Some(format!(
             r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
         ))
+    }
+
+    fn guard_width_reports_after_session_handoff(&self, now: u64) {
+        let guard_until = now.saturating_add(SESSION_SWITCH_WIDTH_GUARD_MS);
+        let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+        coordinator.focus_context_changed();
+        coordinator.note_client_resize_guard(guard_until);
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
