@@ -78,14 +78,11 @@ fn q_key_starts_quit_sequence_and_queues_quit_command() {
 }
 
 #[test]
-fn tab_switches_to_next_visible_session_optimistically() {
+fn tab_switch_queues_next_visible_session_without_changing_confirmed_current_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.current_session = Some("opensessions".into());
     app.handle_tab(false);
-    assert_eq!(
-        app.current_session.as_deref(),
-        Some("plane-pdf-word-formatting")
-    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(
         app.focused_session_name(),
         Some("plane-pdf-word-formatting")
@@ -98,6 +95,86 @@ fn tab_switches_to_next_visible_session_optimistically() {
             client_tty: None,
             debounce: Some(true),
         }]
+    );
+}
+
+#[test]
+fn session_switch_request_does_not_make_target_the_confirmed_active_session() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.set_pane_identity("%1".into(), "opensessions".into(), Some("@1".into()));
+    app.set_focused_session("opensessions");
+
+    app.click_session("learning".into());
+
+    assert_eq!(
+        app.current_session.as_deref(),
+        Some("opensessions"),
+        "the green/current row must stay on the confirmed tmux client session until tmux identifies the switched sidebar",
+    );
+    assert_eq!(
+        app.focused_session_name(),
+        Some("learning"),
+        "the clicked row may become the local cursor/flash target without becoming active",
+    );
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::SwitchSession {
+            name: "learning".into(),
+            client_tty: None,
+            debounce: None,
+        }]
+    );
+}
+
+#[test]
+fn local_pane_identity_overrides_stale_server_current_session_on_startup() {
+    let mut app = App::from_state(ServerState {
+        sessions: App::reference_fixture("pane-attached-session-list").sessions,
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+        theme: None,
+        session_filter: Some(SessionFilterMode::All),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 1,
+    });
+
+    app.set_pane_identity("%2".into(), "learning".into(), Some("@2".into()));
+
+    assert_eq!(app.current_session.as_deref(), Some("learning"));
+    assert_eq!(app.my_session.as_deref(), Some("learning"));
+    assert_eq!(
+        app.focused_session_name(),
+        Some("learning"),
+        "a newly attached sidebar should render its own session before stale shared focus/current state",
+    );
+}
+
+#[test]
+fn shared_state_current_session_is_not_a_confirmed_client_active_session() {
+    let app = App::from_state(ServerState {
+        sessions: App::reference_fixture("pane-attached-session-list").sessions,
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+        theme: None,
+        session_filter: Some(SessionFilterMode::All),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 1,
+    });
+
+    assert_eq!(
+        app.current_session, None,
+        "a shared server snapshot may include legacy currentSession, but the sidebar must not color an active row until local identity confirms it",
+    );
+    assert_eq!(
+        app.focused_session_name(),
+        Some("opensessions"),
+        "legacy focusedSession can still seed the local cursor before identity arrives",
     );
 }
 
@@ -392,14 +469,12 @@ fn extra_typescript_key_commands_are_available() {
 #[test]
 fn enter_switches_to_focused_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
     app.set_focused_session("plane-pdf-word-formatting");
 
     app.activate_focused_session();
 
-    assert_eq!(
-        app.current_session.as_deref(),
-        Some("plane-pdf-word-formatting")
-    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
@@ -487,6 +562,6 @@ fn applies_focus_and_your_session_messages_without_replacing_sessions() {
 
     assert_eq!(app.my_session.as_deref(), Some("opensessions"));
     assert_eq!(app.focused_session_name(), Some("learning"));
-    assert_eq!(app.current_session.as_deref(), Some("learning"));
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(app.sessions.len(), 7);
 }

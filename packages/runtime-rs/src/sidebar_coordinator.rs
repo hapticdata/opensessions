@@ -115,6 +115,9 @@ impl SidebarCoordinator {
     }
 
     pub fn begin_warmup(&mut self) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Warming;
         self.authority = SidebarResizeAuthority::None;
@@ -128,6 +131,9 @@ impl SidebarCoordinator {
     }
 
     pub fn warmup_done(&mut self) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Ready;
         self.warmup_until = None;
@@ -137,12 +143,18 @@ impl SidebarCoordinator {
     }
 
     pub fn mark_ready(&mut self) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = true;
         self.lifecycle = SidebarLifecycle::Ready;
         self.warmup_until = None;
     }
 
     pub fn acknowledge_sidebar_connected(&mut self) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = true;
         if self.lifecycle != SidebarLifecycle::Warming {
             self.lifecycle = SidebarLifecycle::Ready;
@@ -150,6 +162,9 @@ impl SidebarCoordinator {
     }
 
     pub fn hide(&mut self) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = false;
         self.lifecycle = SidebarLifecycle::Idle;
         self.authority = SidebarResizeAuthority::None;
@@ -168,6 +183,9 @@ impl SidebarCoordinator {
     }
 
     pub fn begin_client_resize_sync(&mut self, suppress_until: u64, guard_until: u64) {
+        if self.is_closing() {
+            return;
+        }
         self.visible = true;
         self.authority = SidebarResizeAuthority::ClientResizeSync;
         self.suppress_width_reports_until = self.suppress_width_reports_until.max(suppress_until);
@@ -192,6 +210,9 @@ impl SidebarCoordinator {
     /// from clobbering an active `UserDrag` and snapping the sidebar back to its
     /// previous width.
     pub fn begin_programmatic_adjustment(&mut self) -> bool {
+        if self.is_closing() {
+            return false;
+        }
         if !self.visible {
             return false;
         }
@@ -273,6 +294,11 @@ impl SidebarCoordinator {
         &mut self,
         report: SidebarWidthReportInput,
     ) -> SidebarWidthReportDecision {
+        if self.is_closing() {
+            let decision = self.reject("closing");
+            self.last_width_report_decision = Some(decision.clone());
+            return decision;
+        }
         let decision = self.decide_width_report(&report);
         if decision.accepted {
             self.width = decision.next_width;
@@ -328,6 +354,9 @@ impl SidebarCoordinator {
         if self.authority == SidebarResizeAuthority::ClientResizeSync {
             return self.reject("client-resize-sync");
         }
+        if self.authority == SidebarResizeAuthority::ProgrammaticAdjust {
+            return self.reject("programmatic-adjust");
+        }
         if self.suppress_width_reports_until > report.now
             && !continued_drag
             && (self.authority == SidebarResizeAuthority::UserDrag || !report.is_foreground_client)
@@ -368,5 +397,9 @@ impl SidebarCoordinator {
     fn clear_drag_owner(&mut self) {
         self.drag_owner_session = None;
         self.drag_owner_window_id = None;
+    }
+
+    fn is_closing(&self) -> bool {
+        self.lifecycle == SidebarLifecycle::Closing
     }
 }

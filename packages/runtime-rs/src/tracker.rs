@@ -38,7 +38,9 @@ impl AgentTracker {
     pub fn get_state(&self, session: &str) -> Option<AgentEvent> {
         let session_instances = self.instances.get(session)?;
         session_instances
-            .values()
+            .iter()
+            .filter(|(key, _)| !is_synthetic_pane_key(key))
+            .map(|(_, event)| event)
             .max_by_key(|event| status_priority(event.status))
             .cloned()
     }
@@ -49,8 +51,9 @@ impl AgentTracker {
         };
 
         let mut agents = session_instances
-            .values()
-            .map(|event| {
+            .iter()
+            .filter(|(key, _)| !is_synthetic_pane_key(key))
+            .map(|(_, event)| {
                 let mut event = event.clone();
                 let key = instance_key(&event.agent, event.thread_id.as_deref());
                 if self
@@ -455,6 +458,28 @@ impl AgentTracker {
             }
 
             if watcher_entries.len() == 1 {
+                let watcher_thread_name = self
+                    .instances
+                    .get(session)
+                    .and_then(|instances| instances.get(&watcher_entries[0]))
+                    .and_then(|event| event.thread_name.as_deref());
+                if pane.thread_name.is_some()
+                    && watcher_thread_name.is_some()
+                    && watcher_thread_name != pane.thread_name.as_deref()
+                {
+                    let synthetic_key = synthetic_pane_key(&pane.agent, &pane.pane_id, None);
+                    if self
+                        .instances
+                        .get(session)
+                        .and_then(|instances| instances.get(&synthetic_key))
+                        .is_some()
+                    {
+                        if self.stamp_alive(session, &synthetic_key, &pane.pane_id) {
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
                 if self.stamp_alive(session, &watcher_entries[0], &pane.pane_id) {
                     changed = true;
                 }
@@ -498,6 +523,7 @@ impl AgentTracker {
 
     fn apply_event_with_options(&mut self, event: &mut AgentEvent, seed: bool) {
         let key = instance_key(&event.agent, event.thread_id.as_deref());
+        let mut removed_unseen_keys = Vec::new();
 
         {
             let session_instances = self.instances.entry(event.session.clone()).or_default();
@@ -514,7 +540,37 @@ impl AgentTracker {
                     event.thread_name = prev.thread_name.clone();
                 }
             }
+            if event.thread_id.is_some()
+                && let Some(thread_name) = event.thread_name.as_deref()
+            {
+                let matching_provisional_keys = session_instances
+                    .iter()
+                    .filter(|(candidate_key, candidate_event)| {
+                        *candidate_key != &key
+                            && candidate_event.agent == event.agent
+                            && candidate_event.thread_id.is_none()
+                            && candidate_event.thread_name.as_deref() == Some(thread_name)
+                    })
+                    .map(|(candidate_key, _)| candidate_key.clone())
+                    .collect::<Vec<_>>();
+
+                for provisional_key in matching_provisional_keys {
+                    if let Some(provisional) = session_instances.remove(&provisional_key) {
+                        if event.pane_id.is_none() {
+                            event.pane_id = provisional.pane_id;
+                        }
+                        if event.liveness.is_none() {
+                            event.liveness = provisional.liveness;
+                        }
+                        removed_unseen_keys.push(format!("{}\0{provisional_key}", event.session));
+                    }
+                }
+            }
             session_instances.insert(key.clone(), event.clone());
+        }
+
+        for unseen_key in removed_unseen_keys {
+            self.unseen_instances.remove(&unseen_key);
         }
 
         let event_session = event.session.clone();

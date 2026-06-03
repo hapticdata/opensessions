@@ -99,7 +99,7 @@ pub struct App {
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
-    optimistic_current_session: Option<String>,
+    pending_switch_session: Option<String>,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -117,7 +117,7 @@ impl App {
         let mut app = Self {
             sessions: state.sessions,
             sidebar_focus: None,
-            current_session: state.current_session,
+            current_session: None,
             my_session: None,
             initializing: state.initializing,
             init_label: state.init_label,
@@ -141,7 +141,7 @@ impl App {
             fixture_name: None,
             terminal_width: None,
             pane_identity: None,
-            optimistic_current_session: None,
+            pending_switch_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -175,6 +175,7 @@ impl App {
             session_name,
             window_id,
         };
+        self.confirm_local_session(identity.session_name.clone(), true);
         self.commands.push(ClientCommand::IdentifyPane {
             pane_id: identity.pane_id.clone(),
             session_name: identity.session_name.clone(),
@@ -194,9 +195,21 @@ impl App {
     ) {
         self.pane_identity = Some(PaneIdentity {
             pane_id,
-            session_name,
+            session_name: session_name.clone(),
             window_id,
         });
+        self.confirm_local_session(session_name, true);
+    }
+
+    fn confirm_local_session(&mut self, session_name: String, update_focus: bool) {
+        self.my_session = Some(session_name.clone());
+        self.current_session = Some(session_name.clone());
+        if self.pending_switch_session.as_deref() == Some(session_name.as_str()) {
+            self.pending_switch_session = None;
+        }
+        if update_focus && let Some(focus) = self.visible_focus_for_session(&session_name) {
+            self.set_sidebar_focus(focus);
+        }
     }
 
     pub fn pane_identity(&self) -> Option<&PaneIdentity> {
@@ -208,25 +221,6 @@ impl App {
             ServerMessage::State(state) => {
                 let previous_focus = self.sidebar_focus.clone();
                 self.sessions = state.sessions;
-                self.current_session = match self.optimistic_current_session.as_deref() {
-                    Some(optimistic)
-                        if state.current_session.as_deref() != Some(optimistic)
-                            && self
-                                .sessions
-                                .iter()
-                                .any(|session| session.name == optimistic) =>
-                    {
-                        Some(optimistic.to_string())
-                    }
-                    _ => {
-                        if self.optimistic_current_session.as_deref()
-                            == state.current_session.as_deref()
-                        {
-                            self.optimistic_current_session = None;
-                        }
-                        state.current_session
-                    }
-                };
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.theme = state.theme;
@@ -252,16 +246,12 @@ impl App {
                     .focused_session
                     .as_deref()
                     .and_then(|focused| self.visible_focus_for_session(focused));
-                self.current_session = update.current_session;
-                if self.optimistic_current_session.as_deref() == self.current_session.as_deref() {
-                    self.optimistic_current_session = None;
-                }
                 if let Some(next_focus) = next_focus {
                     self.set_sidebar_focus(next_focus);
                 }
             }
             ServerMessage::YourSession { name, .. } => {
-                self.my_session = Some(name);
+                self.confirm_local_session(name, self.pane_identity.is_none());
             }
             ServerMessage::ReIdentify => {
                 if let Some(identity) = self.pane_identity.clone() {
@@ -310,7 +300,7 @@ impl App {
             fixture_name: fixture_static_name(name),
             terminal_width: None,
             pane_identity: None,
-            optimistic_current_session: None,
+            pending_switch_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -458,7 +448,10 @@ impl App {
             return;
         }
 
-        let current = self.current_session.as_deref();
+        let current = self
+            .pending_switch_session
+            .as_deref()
+            .or(self.current_session.as_deref());
         let current_idx = current
             .and_then(|name| names.iter().position(|candidate| candidate == name))
             .unwrap_or(0);
@@ -706,8 +699,6 @@ impl App {
         else {
             return;
         };
-        self.current_session = Some(session.clone());
-        self.optimistic_current_session = Some(session.clone());
         self.commands.push(ClientCommand::SwitchSession {
             name: session.clone(),
             client_tty: None,
@@ -767,9 +758,7 @@ impl App {
     }
 
     fn switch_to_session(&mut self, name: String) {
-        self.my_session = Some(name.clone());
-        self.current_session = Some(name.clone());
-        self.optimistic_current_session = Some(name.clone());
+        self.pending_switch_session = Some(name.clone());
         self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
         self.commands.push(ClientCommand::SwitchSession {
             name,
@@ -779,9 +768,7 @@ impl App {
     }
 
     fn switch_to_session_debounced(&mut self, name: String) {
-        self.my_session = Some(name.clone());
-        self.current_session = Some(name.clone());
-        self.optimistic_current_session = Some(name.clone());
+        self.pending_switch_session = Some(name.clone());
         self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
         self.commands.push(ClientCommand::SwitchSession {
             name,

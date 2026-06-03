@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -34,7 +35,7 @@ use opensessions_runtime::sidebar_coordinator::{
 };
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
-use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
+use opensessions_runtime::tracker::AgentTracker;
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::frame::{FrameDiff, RenderedRows, diff_rows, render_rows};
 use opensessions_sidebar_core::generated::protocol::{
@@ -76,11 +77,28 @@ const SIDEBAR_DRIFT_CORRECTION_MS: u64 = 300;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const COALESCED_OP_TICK_MS: u64 = 25;
 const SWITCH_DEBOUNCE_MS: u64 = 80;
-const SWITCH_HANDOFF_MS: u64 = 1_000;
 const WIDTH_FANOUT_DEBOUNCE_MS: u64 = USER_DRAG_SETTLE_MS;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
+
+#[derive(Debug, Default)]
+struct ShutdownAnnouncement {
+    announced: AtomicBool,
+}
+
+impl ShutdownAnnouncement {
+    fn announce_once(
+        &self,
+        state_source: &Option<Arc<dyn StateSource>>,
+        state_updates: &broadcast::Sender<String>,
+    ) {
+        if self.announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        announce_shutdown(state_source, state_updates);
+    }
+}
 
 /// Append a single debug line to the path in `OPENSESSIONS_DEBUG_LOG` (defaults
 /// to `/tmp/opensessions-debug.log`). Use sparingly to trace state-machine
@@ -351,12 +369,6 @@ struct PendingWidthFanout {
     due_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SwitchHandoff {
-    session: String,
-    until: u64,
-}
-
 pub struct ReadOnlyMuxStateSource {
     providers: Vec<Arc<dyn MuxProvider>>,
     port_command_runner: Arc<dyn PortCommandRunner>,
@@ -379,7 +391,6 @@ pub struct ReadOnlyMuxStateSource {
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     pending_session_switch: Mutex<Option<PendingSessionSwitch>>,
     pending_width_fanout: Mutex<Option<PendingWidthFanout>>,
-    switch_handoff: Mutex<Option<SwitchHandoff>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -418,7 +429,6 @@ impl ReadOnlyMuxStateSource {
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             pending_session_switch: Mutex::new(None),
             pending_width_fanout: Mutex::new(None),
-            switch_handoff: Mutex::new(None),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -500,7 +510,6 @@ impl StateSource for ReadOnlyMuxStateSource {
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
         let visible_session_names = self.visible_session_names();
-        self.refresh_agent_pane_presence(visible_session_names.as_deref());
         let metadata_by_session = visible_session_names.as_ref().map(|names| {
             names
                 .iter()
@@ -539,11 +548,18 @@ impl StateSource for ReadOnlyMuxStateSource {
                 })
                 .unwrap_or((None, None, None));
         let ports_by_session = self.discover_live_ports(visible_session_names.as_deref());
-        let sidebar_state = {
+        let mut sidebar_state = {
             let mut coordinator = self.sidebar_coordinator.lock().unwrap();
             coordinator.tick_user_drag_settle((self.now_ms)(), USER_DRAG_SETTLE_MS);
             coordinator.state()
         };
+        if sidebar_state.visible
+            && !sidebar_state.initializing
+            && self.sidebar_width_drifted(sidebar_state.width.min(u16::MAX as u32) as u16)
+        {
+            sidebar_state.initializing = true;
+            sidebar_state.init_label = "adjusting…".to_string();
+        }
         debug_log(format!(
             "snapshot_json mode={} init={} authority={:?} width={}",
             sidebar_state.mode,
@@ -563,7 +579,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             ports_by_session,
             portless_state: None,
             focused_session: self.focused_session.lock().unwrap().clone(),
-            current_session_override: self.current_session_override(),
+            current_session_override: None,
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
             collapsed_worktree_groups: self
@@ -619,17 +635,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                     self.schedule_session_switch(name, client_tty);
                 } else {
                     self.pending_session_switch.lock().unwrap().take();
-                    self.begin_switch_handoff(name);
                     provider.switch_session(name, client_tty);
                 }
-                *self.focused_session.lock().unwrap() = Some(name.to_string());
                 // Visiting a session clears its unseen agents (turns ● back
                 // into ✓). Mirrors `tracker.handleFocus` in
                 // `packages/runtime/src/server/index.ts:1964`.
-                let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(name);
-                if had_unseen {
-                    return Some(self.snapshot_json());
-                }
+                self.agent_tracker.lock().unwrap().handle_focus(name);
                 Some(format!(
                     r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
                 ))
@@ -664,7 +675,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                         .session_before(name)
                         .or_else(|| self.session_after(name))
                 {
-                    self.begin_switch_handoff(&next);
                     provider.switch_session(&next, None);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
@@ -719,6 +729,23 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
                 let width = clamp_sidebar_width(width) as u32;
                 let context = context?;
+                let current_width = self.current_sidebar_width_u16();
+                let coordinator_state = self.sidebar_coordinator.lock().unwrap().state();
+                let has_accepted_width_target = coordinator_state
+                    .last_width_report_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.accepted);
+                if self.sidebar_width_drifted(current_width)
+                    && has_accepted_width_target
+                    && coordinator_state.resize_authority != SidebarResizeAuthority::UserDrag
+                    && width != u32::from(current_width)
+                {
+                    debug_log(format!(
+                        "width-report: rejected stale converging report width={width} target_width={current_width} context_session={:?} context_window={:?}",
+                        context.session_name, context.window_id,
+                    ));
+                    return None;
+                }
                 let current_session = provider.get_current_session();
                 let current_window_id = provider.get_current_window_id();
                 let is_active_session =
@@ -1045,33 +1072,6 @@ impl StateSource for ReadOnlyMuxStateSource {
 }
 
 impl ReadOnlyMuxStateSource {
-    fn refresh_agent_pane_presence(&self, visible_session_names: Option<&[String]>) {
-        let visible =
-            visible_session_names.map(|names| names.iter().cloned().collect::<HashSet<_>>());
-        let mut tracker = self.agent_tracker.lock().unwrap();
-        for provider in &self.providers {
-            for session in provider.list_sessions() {
-                if visible
-                    .as_ref()
-                    .is_some_and(|visible| !visible.contains(&session.name))
-                {
-                    continue;
-                }
-                let panes = provider
-                    .list_agent_panes(&session.name)
-                    .into_iter()
-                    .map(|pane| PanePresenceInput {
-                        agent: pane.agent,
-                        pane_id: pane.pane_id,
-                        thread_id: pane.thread_id,
-                        thread_name: pane.thread_name,
-                    })
-                    .collect::<Vec<_>>();
-                tracker.apply_pane_presence(&session.name, panes);
-            }
-        }
-    }
-
     fn apply_agent_event(&self, body: &Value) -> Result<(), AgentEventError> {
         let agent = body
             .get("agent")
@@ -1261,35 +1261,11 @@ impl ReadOnlyMuxStateSource {
 
     fn schedule_session_switch(&self, name: &str, client_tty: Option<&str>) {
         let due_at = (self.now_ms)().saturating_add(SWITCH_DEBOUNCE_MS);
-        self.begin_switch_handoff(name);
         *self.pending_session_switch.lock().unwrap() = Some(PendingSessionSwitch {
             name: name.to_string(),
             client_tty: client_tty.map(ToString::to_string),
             due_at,
         });
-    }
-
-    fn begin_switch_handoff(&self, session: &str) {
-        let until = (self.now_ms)().saturating_add(SWITCH_HANDOFF_MS);
-        *self.switch_handoff.lock().unwrap() = Some(SwitchHandoff {
-            session: session.to_string(),
-            until,
-        });
-    }
-
-    fn current_session_override(&self) -> Option<String> {
-        let provider_current = self
-            .providers
-            .first()
-            .and_then(|provider| provider.get_current_session());
-        let now = (self.now_ms)();
-        let mut handoff = self.switch_handoff.lock().unwrap();
-        let intent = handoff.as_ref()?;
-        if provider_current.as_deref() == Some(intent.session.as_str()) || intent.until <= now {
-            handoff.take();
-            return None;
-        }
-        Some(intent.session.clone())
     }
 
     fn schedule_width_fanout(&self, width: u16, except_window_id: Option<&str>) {
@@ -1317,13 +1293,13 @@ impl ReadOnlyMuxStateSource {
         if let Some(intent) = switch
             && let Some(provider) = self.providers.first()
         {
-            self.begin_switch_handoff(&intent.name);
             provider.switch_session(&intent.name, intent.client_tty.as_deref());
-            self.agent_tracker
+            changed = self
+                .agent_tracker
                 .lock()
                 .unwrap()
-                .handle_focus(&intent.name);
-            changed = true;
+                .handle_focus(&intent.name)
+                || changed;
         }
 
         let width = {
@@ -1717,9 +1693,7 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
-        self.begin_switch_handoff(&name);
         provider.switch_session(&name, client_tty);
-        *self.focused_session.lock().unwrap() = Some(name.clone());
         self.agent_tracker.lock().unwrap().handle_focus(&name);
         Some(format!(
             r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
@@ -2521,6 +2495,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let (state_updates, _) = broadcast::channel(16);
+    let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
     if let Some(source) = config.state_source.clone() {
         let _background_tasks = source
             .clone()
@@ -2531,6 +2506,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     let state_source = config.state_source.clone();
     let cleanup_state_source = state_source.clone();
     let cleanup_shim_socket_path = shim_socket_path.clone();
+    let loop_shutdown_announcement = Arc::clone(&shutdown_announcement);
     let task = tokio::spawn(async move {
         let result = run_accept_loop(
             listener,
@@ -2539,6 +2515,7 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             state_source,
             state_updates,
             shim_listener,
+            loop_shutdown_announcement,
         )
         .await;
         if let Some(source) = cleanup_state_source.as_ref() {
@@ -2569,11 +2546,12 @@ async fn run_accept_loop(
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
     shim_listener: UnixListener,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                announce_shutdown(&state_source, &state_updates);
+                shutdown_announcement.announce_once(&state_source, &state_updates);
                 tokio::time::sleep(Duration::from_millis(SERVER_SHUTDOWN_DRAIN_MS)).await;
                 return Ok(());
             }
@@ -2582,12 +2560,14 @@ async fn run_accept_loop(
                 let connection_shutdown = shutdown.clone();
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
+                let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 tokio::spawn(async move {
                     let _ = handle_connection(
                         stream,
                         connection_shutdown,
                         connection_state_source,
                         connection_state_updates,
+                        connection_shutdown_announcement,
                     )
                     .await;
                 });
@@ -2597,12 +2577,14 @@ async fn run_accept_loop(
                 let connection_shutdown = shutdown.clone();
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
+                let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 tokio::spawn(async move {
                     let _ = handle_shim_connection(
                         stream,
                         connection_shutdown,
                         connection_state_source,
                         connection_state_updates,
+                        connection_shutdown_announcement,
                     )
                     .await;
                 });
@@ -2628,8 +2610,9 @@ fn request_shutdown(
     state_source: &Option<Arc<dyn StateSource>>,
     state_updates: &broadcast::Sender<String>,
     shutdown: &broadcast::Sender<()>,
+    shutdown_announcement: &ShutdownAnnouncement,
 ) {
-    announce_shutdown(state_source, state_updates);
+    shutdown_announcement.announce_once(state_source, state_updates);
     let _ = shutdown.send(());
 }
 
@@ -2638,6 +2621,7 @@ async fn handle_shim_connection(
     shutdown: broadcast::Sender<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     let (mut reader, mut writer) = stream.into_split();
     let first = read_protocol_frame(&mut reader).await?;
@@ -2817,6 +2801,7 @@ async fn handle_shim_connection(
                                 &state_updates,
                                 &mut context,
                                 &shutdown,
+                                &shutdown_announcement,
                             )? {
                                 frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
                                 return Ok(());
@@ -2899,10 +2884,11 @@ fn drain_sidebar_commands(
     state_updates: &broadcast::Sender<String>,
     context: &mut ClientConnectionContext,
     shutdown: &broadcast::Sender<()>,
+    shutdown_announcement: &ShutdownAnnouncement,
 ) -> Result<bool, ServerError> {
     for command in app.drain_commands() {
         if matches!(command, SidebarClientCommand::Quit) {
-            request_shutdown(state_source, state_updates, shutdown);
+            request_shutdown(state_source, state_updates, shutdown, shutdown_announcement);
             return Ok(true);
         }
         let command = serde_json::to_value(command)
@@ -2913,7 +2899,9 @@ fn drain_sidebar_commands(
             if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
                 app.apply_server_message(message);
             }
-            let _ = state_updates.send(payload);
+            if !is_client_view_command(&command) {
+                let _ = state_updates.send(payload);
+            }
         }
     }
     Ok(false)
@@ -2924,6 +2912,7 @@ async fn handle_connection(
     shutdown: broadcast::Sender<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     let mut request = read_http_header(&mut stream).await?;
     let parsed = parse_http_request(&request)?;
@@ -2967,10 +2956,8 @@ async fn handle_connection(
             return Ok(());
         };
         let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source
-            && let Some(payload) = state_source.handle_switch_index(index, &body)
-        {
-            let _ = state_updates.send(payload);
+        if let Some(state_source) = &state_source {
+            let _ = state_source.handle_switch_index(index, &body);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -3121,7 +3108,12 @@ async fn handle_connection(
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .await?;
         let _ = stream.shutdown().await;
-        request_shutdown(&state_source, &state_updates, &shutdown);
+        request_shutdown(
+            &state_source,
+            &state_updates,
+            &shutdown,
+            &shutdown_announcement,
+        );
         return Ok(());
     }
 
@@ -3132,6 +3124,7 @@ async fn handle_connection(
             shutdown,
             state_source,
             state_updates,
+            shutdown_announcement,
         )
         .await;
     }
@@ -3191,7 +3184,12 @@ async fn handle_connection(
                         Some(Ok(message)) if message.is_close() => return Ok(()),
                         Some(Ok(message)) => {
                             if is_quit_command(&message) {
-                                request_shutdown(&state_source, &state_updates, &shutdown);
+                                request_shutdown(
+                                    &state_source,
+                                    &state_updates,
+                                    &shutdown,
+                                    &shutdown_announcement,
+                                );
                                 return Ok(());
                             }
                             if is_command_type(&message, "refresh")
@@ -3210,7 +3208,11 @@ async fn handle_connection(
                                     .as_ref()
                                     .and_then(|state_source| state_source.handle_client_command_with_context(&command, Some(&client_context)))
                                 {
-                                    let _ = state_updates.send(payload);
+                                    if is_client_view_command(&command) {
+                                        websocket.send(Message::text(payload)).await?;
+                                    } else {
+                                        let _ = state_updates.send(payload);
+                                    }
                                 }
                             }
                         }
@@ -3234,6 +3236,7 @@ async fn handle_rendered_sidebar_connection(
     shutdown: broadcast::Sender<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
+    shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     let Some(key) = parsed.header("sec-websocket-key") else {
         stream
@@ -3308,7 +3311,12 @@ async fn handle_rendered_sidebar_connection(
                     Some(Ok(message)) if message.is_close() => return Ok(()),
                     Some(Ok(message)) => {
                         if is_quit_command(&message) {
-                            request_shutdown(&state_source, &state_updates, &shutdown);
+                            request_shutdown(
+                                &state_source,
+                                &state_updates,
+                                &shutdown,
+                                &shutdown_announcement,
+                            );
                             return Ok(());
                         }
 
@@ -3333,7 +3341,12 @@ async fn handle_rendered_sidebar_connection(
                                     apply_render_key(app, &command);
                                     for command in app.drain_commands() {
                                         if matches!(command, SidebarClientCommand::Quit) {
-                                            request_shutdown(&state_source, &state_updates, &shutdown);
+                                            request_shutdown(
+                                                &state_source,
+                                                &state_updates,
+                                                &shutdown,
+                                                &shutdown_announcement,
+                                            );
                                             return Ok(());
                                         }
                                         if let Ok(command) = serde_json::to_value(command)
@@ -3344,7 +3357,9 @@ async fn handle_rendered_sidebar_connection(
                                             if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
                                                 app.apply_server_message(message);
                                             }
-                                            let _ = state_updates.send(payload);
+                                            if !is_client_view_command(&command) {
+                                                let _ = state_updates.send(payload);
+                                            }
                                         }
                                     }
                                     dirty = true;
@@ -3359,7 +3374,9 @@ async fn handle_rendered_sidebar_connection(
                                 if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
                                     apply_sidebar_server_message(&mut app, message);
                                 }
-                                let _ = state_updates.send(payload);
+                                if !is_client_view_command(&command) {
+                                    let _ = state_updates.send(payload);
+                                }
                             }
                             dirty = true;
                         }
@@ -3605,6 +3622,13 @@ fn is_command_type(message: &Message, command_type: &str) -> bool {
         })
         .as_deref()
         == Some(command_type)
+}
+
+fn is_client_view_command(command: &Value) -> bool {
+    matches!(
+        command.get("type").and_then(Value::as_str),
+        Some("switch-session" | "switch-index")
+    )
 }
 
 fn parse_command(message: &Message) -> Option<Value> {

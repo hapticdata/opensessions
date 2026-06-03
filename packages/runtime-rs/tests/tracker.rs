@@ -69,7 +69,25 @@ fn get_agents_returns_newest_first_and_stamps_unseen() {
 }
 
 #[test]
-fn dismiss_removes_target_instance_and_synthetic_matches() {
+fn pane_presence_alone_does_not_create_canonical_agent_rows() {
+    let mut tracker = AgentTracker::new();
+
+    assert!(tracker.apply_pane_presence(
+        "sess-1",
+        vec![PanePresenceInput {
+            agent: "pi".to_string(),
+            pane_id: "%1".to_string(),
+            thread_id: Some("hidden".to_string()),
+            thread_name: Some("Hidden pane".to_string()),
+        }]
+    ));
+
+    assert_eq!(tracker.get_agents("sess-1"), Vec::<AgentEvent>::new());
+    assert_eq!(tracker.get_state("sess-1"), None);
+}
+
+#[test]
+fn dismiss_removes_hidden_pane_presence_without_creating_rows() {
     let mut tracker = AgentTracker::new();
 
     tracker.apply_pane_presence(
@@ -91,9 +109,7 @@ fn dismiss_removes_target_instance_and_synthetic_matches() {
     );
 
     assert!(tracker.dismiss("sess-1", "pi", Some("dead")));
-    let remaining = tracker.get_agents("sess-1");
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].thread_id.as_deref(), Some("live"));
+    assert_eq!(tracker.get_agents("sess-1"), Vec::<AgentEvent>::new());
 }
 
 #[test]
@@ -207,10 +223,7 @@ fn pane_presence_enriches_exact_thread_and_drops_missing_synthetic_threads() {
             thread_name: None,
         }]
     ));
-    let remaining = tracker.get_agents("sess-2");
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].thread_id.as_deref(), Some("live"));
-    assert_eq!(remaining[0].liveness, Some(AgentLiveness::Alive));
+    assert_eq!(tracker.get_agents("sess-2"), Vec::<AgentEvent>::new());
 }
 
 #[test]
@@ -263,7 +276,7 @@ fn synthetic_pane_entry_merges_by_pane_id_when_thread_names_drift() {
     tracker.apply_event(plugin_event);
 
     let agents = tracker.get_agents("sess-1");
-    assert_eq!(agents.len(), 2);
+    assert_eq!(agents.len(), 1);
     let matched = agents
         .iter()
         .find(|agent| agent.thread_id.as_deref() == Some("abc"))
@@ -299,8 +312,8 @@ fn pane_presence_uses_thread_name_to_avoid_duplicate_agent_rows() {
     tracker.apply_event(thread_b);
 
     let agents = tracker.get_agents("sess-1");
-    assert_eq!(agents.len(), 3);
-    assert!(tracker.apply_pane_presence(
+    assert_eq!(agents.len(), 1);
+    tracker.apply_pane_presence(
         "sess-1",
         vec![
             PanePresenceInput {
@@ -315,11 +328,11 @@ fn pane_presence_uses_thread_name_to_avoid_duplicate_agent_rows() {
                 thread_id: None,
                 thread_name: Some("Other task".to_string()),
             },
-        ]
-    ));
+        ],
+    );
 
     let agents = tracker.get_agents("sess-1");
-    assert_eq!(agents.len(), 2);
+    assert_eq!(agents.len(), 1);
     let matched = agents
         .iter()
         .find(|agent| agent.thread_id.as_deref() == Some("thread-b"))

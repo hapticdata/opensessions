@@ -101,7 +101,7 @@ fn compute_hit_map_marks_session_rows_with_session_targets() {
 }
 
 #[test]
-fn click_on_session_row_switches_to_that_session() {
+fn click_on_session_row_queues_switch_without_changing_confirmed_active_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.current_session = Some("opensessions".into());
     app.set_focused_session("opensessions");
@@ -123,7 +123,11 @@ fn click_on_session_row_switches_to_that_session() {
     );
 
     assert_eq!(app.focused_session_name(), Some("learning"));
-    assert_eq!(app.current_session.as_deref(), Some("learning"));
+    assert_eq!(
+        app.current_session.as_deref(),
+        Some("opensessions"),
+        "mouse clicks request a tmux switch, but only pane identity / your-session confirms the active row",
+    );
     assert_eq!(
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
