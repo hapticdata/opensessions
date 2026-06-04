@@ -248,8 +248,60 @@ fn tmux_sidebar_resize_then_immediate_window_switch_keeps_new_width_authority() 
         format!("opensessions:{alt_window}").as_str(),
     ]);
     lab.tmux_ok(["select-pane", "-t", stale.as_str()]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{source_window}").as_str(),
+    ]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{alt_window}").as_str(),
+    ]);
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{alt_window}").as_str(),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", stale.as_str()]);
 
     lab.wait_for_capture_pane(&stale, |text| text.contains("adjusting…"));
+    lab.wait_for_all_sidebar_widths(42);
+    sleep(Duration::from_millis(900));
+    lab.wait_for_all_sidebar_widths(42);
+}
+
+#[test]
+fn tmux_sidebar_competing_resize_during_adjustment_does_not_steal_authority() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-competing-resize");
+    let source_window = lab.current_window_index("opensessions");
+    let alt_window = lab.spawn_window_with_sidebar("opensessions", "alt");
+    let source = lab.sidebar_pane_in_window("opensessions", &source_window);
+    let competing = lab.sidebar_pane_in_window("opensessions", &alt_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{source_window}").as_str(),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_all_sidebar_widths(36);
+    sleep(Duration::from_millis(1500));
+
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{alt_window}").as_str(),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", competing.as_str()]);
+    lab.wait_for_capture_pane(&competing, |text| text.contains("adjusting…"));
+
+    lab.tmux_ok(["resize-pane", "-t", competing.as_str(), "-x", "44"]);
+
     lab.wait_for_all_sidebar_widths(42);
     sleep(Duration::from_millis(900));
     lab.wait_for_all_sidebar_widths(42);
