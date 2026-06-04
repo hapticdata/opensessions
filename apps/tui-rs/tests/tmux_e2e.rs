@@ -218,6 +218,8 @@ fn tmux_sidebar_resize_immediately_before_switch_survives_handoff() {
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
 
     lab.wait_for_client_to_leave_session("opensessions");
+    let destination = lab.current_client_session();
+    lab.wait_for_capture(&destination, |text| text.contains("adjusting…"));
     lab.wait_for_all_sidebar_widths(42);
 }
 
@@ -654,6 +656,26 @@ time.sleep(300)
             ]),
             self.logs(),
         );
+    }
+
+    fn current_client_session(&self) -> String {
+        self.tmux(["list-clients", "-F", "#{client_session}"])
+            .lines()
+            .find_map(|line| {
+                let session = line.trim();
+                (!session.is_empty()).then(|| session.to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no attached client session found; clients:\n{}\n\nlogs:\n{}",
+                    self.tmux([
+                        "list-clients",
+                        "-F",
+                        "#{client_name} #{client_tty} #{client_session}"
+                    ]),
+                    self.logs(),
+                )
+            })
     }
 
     fn wait_for_all_sidebar_widths(&self, expected: u16) {

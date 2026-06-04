@@ -86,7 +86,8 @@ impl SidebarCoordinator {
     pub fn state(&self) -> SidebarCoordinatorState {
         let mode = match (self.visible, self.lifecycle, self.authority) {
             (true, SidebarLifecycle::Closing, _) => "closing",
-            (_, _, SidebarResizeAuthority::ClientResizeSync)
+            (_, _, SidebarResizeAuthority::UserDrag)
+            | (_, _, SidebarResizeAuthority::ClientResizeSync)
             | (_, _, SidebarResizeAuthority::ProgrammaticAdjust) => "resizing",
             (false, _, _) => "hidden",
             (true, SidebarLifecycle::Warming, _) => "warming",
