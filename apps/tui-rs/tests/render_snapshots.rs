@@ -30,6 +30,23 @@ fn render_to_buffer_exposes_ratatui_test_backend_cells() {
 }
 
 #[test]
+fn temporary_session_focus_uses_weaker_marker_than_active_session() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("plane-pdf-word-formatting");
+
+    let buffer = render_to_buffer(&mut app, 35, 56);
+    let active_row = row_containing(&buffer, 35, 56, "opensessions")
+        .expect("active opensessions row should be visible");
+    let temp_focus_row = row_containing(&buffer, 35, 56, "plane-pdf-word-formatting")
+        .expect("temporary focused row should be visible");
+
+    assert_eq!(buffer_symbol_at(&buffer, 0, active_row), "▌");
+    assert_eq!(buffer_symbol_at(&buffer, 0, temp_focus_row), "›");
+}
+
+#[test]
 fn focused_agent_row_uses_highlight_background() {
     let mut app = App::reference_fixture("pane-opensessions-self");
     app.focus_agents_panel();
@@ -330,4 +347,22 @@ fn assert_snapshot(name: &str, width: u16, height: u16) {
         _ => unreachable!(),
     };
     assert_eq!(actual, expected);
+}
+
+fn row_containing(
+    buffer: &opensessions_sidebar::snapshot::RenderedBuffer,
+    width: u16,
+    height: u16,
+    needle: &str,
+) -> Option<u16> {
+    for y in 0..height {
+        let mut row = String::new();
+        for x in 0..width {
+            row.push_str(&buffer_symbol_at(buffer, x, y));
+        }
+        if row.contains(needle) {
+            return Some(y);
+        }
+    }
+    None
 }

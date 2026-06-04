@@ -122,7 +122,11 @@ fn click_on_session_row_queues_switch_without_changing_confirmed_active_session(
         },
     );
 
-    assert_eq!(app.focused_session_name(), Some("learning"));
+    assert_eq!(
+        app.focused_session_name(),
+        Some("opensessions"),
+        "mouse clicks request a switch and flash the target, but the keyboard cursor stays on the confirmed active session",
+    );
     assert_eq!(
         app.current_session.as_deref(),
         Some("opensessions"),
@@ -141,6 +145,9 @@ fn click_on_session_row_queues_switch_without_changing_confirmed_active_session(
 #[test]
 fn click_on_diff_count_launches_lazydiffs_for_that_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("opensessions");
     let session = app
         .sessions
         .iter_mut()
@@ -175,9 +182,15 @@ fn click_on_diff_count_launches_lazydiffs_for_that_session() {
         },
     );
 
-    assert_eq!(app.focused_session_name(), Some("learning"));
+    assert_eq!(
+        app.focused_session_name(),
+        Some("opensessions"),
+        "diff-count clicks launch for the clicked session without moving durable session focus",
+    );
     assert!(app.drain_commands().is_empty());
-    assert_eq!(app.drain_launches().len(), 1);
+    let launches = app.drain_launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].session_name(), Some("learning"));
 }
 
 #[test]
@@ -256,7 +269,7 @@ fn click_on_agent_scope_label_toggles_between_current_and_all() {
 }
 
 #[test]
-fn click_on_worktree_group_first_focuses_then_toggles() {
+fn click_on_worktree_group_toggles_like_enter() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     let first = app
         .sessions
@@ -291,17 +304,6 @@ fn click_on_worktree_group_first_focuses_then_toggles() {
         },
     );
     assert_eq!(app.focused_group_key(), Some(group_key));
-    assert!(!app.is_group_collapsed(group_key));
-
-    apply_ui_mouse(
-        &mut app,
-        UiMouse::Click {
-            x: target.0,
-            y: target.1,
-            width: W,
-            height: H,
-        },
-    );
     assert!(!app.is_group_collapsed(group_key));
     assert_eq!(
         app.drain_commands(),

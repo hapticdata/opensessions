@@ -233,9 +233,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     for launch in app.drain_launches() {
+                        let target_session = launch
+                            .session_name()
+                            .or_else(|| app.focused_session_name());
                         let session = app
-                            .focused_session_name()
-                            .and_then(|name| app.sessions.iter().find(|s| s.name == name));
+                            .sessions
+                            .iter()
+                            .find(|s| Some(s.name.as_str()) == target_session);
                         let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
                         let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
                         maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
@@ -291,9 +295,13 @@ async fn main() -> Result<()> {
                         ws.send(Message::text(encode_client_command(&command)?)).await?;
                     }
                     for launch in app.drain_launches() {
+                        let target_session = launch
+                            .session_name()
+                            .or_else(|| app.focused_session_name());
                         let session = app
-                            .focused_session_name()
-                            .and_then(|name| app.sessions.iter().find(|s| s.name == name));
+                            .sessions
+                            .iter()
+                            .find(|s| Some(s.name.as_str()) == target_session);
                         let dir = session.map(|s| s.dir.as_str()).unwrap_or(".");
                         let branch = session.map(|s| s.branch.as_str()).unwrap_or_default();
                         maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
@@ -323,7 +331,6 @@ async fn main() -> Result<()> {
                                 state.sessions.len(),
                             ));
                             let mut new_app = App::from_state(state);
-                            load_detail_height_for_focus(&mut new_app);
                             if let Some(identity) = identity.clone() {
                                 new_app.set_pane_identity(
                                     identity.pane_id,
@@ -331,6 +338,7 @@ async fn main() -> Result<()> {
                                     identity.window_id,
                                 );
                             }
+                            load_detail_height_for_focus(&mut new_app);
                             *slot = Some(new_app);
                         }
                         (Some(app), ServerMessage::State(state)) => {
@@ -576,7 +584,7 @@ fn do_startup_refocus(pane_id: &str) {
 fn launch_lazydiff(target: LaunchTarget, dir: &str, branch: &str) {
     let command = lazydiffs_command(branch);
     match target {
-        LaunchTarget::LazydiffTmux => {
+        LaunchTarget::LazydiffTmux { .. } => {
             let _ = std::process::Command::new("tmux")
                 .args([
                     "display-popup",
@@ -591,7 +599,7 @@ fn launch_lazydiff(target: LaunchTarget, dir: &str, branch: &str) {
                 ])
                 .output();
         }
-        LaunchTarget::LazydiffTerminal => {
+        LaunchTarget::LazydiffTerminal { .. } => {
             #[cfg(target_os = "macos")]
             {
                 // Open a new Terminal.app window and run lazydiff in the session dir.

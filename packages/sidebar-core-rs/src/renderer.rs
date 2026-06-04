@@ -387,70 +387,30 @@ fn render_sessions(
         return None;
     }
 
-    let blocks: Vec<Vec<StyledLine>> = entries
-        .iter()
-        .map(|entry| match entry {
-            DisplaySessionEntry::Group {
-                key,
-                label,
-                count,
-                collapsed,
-                summary,
-            } => build_group_block(app, palette, key, label, *count, *collapsed, summary, width),
-            DisplaySessionEntry::Session {
-                index,
-                session,
-                indented,
-            } => build_session_block(app, palette, *index, session, *indented, width),
-        })
-        .collect();
-    if blocks.is_empty() {
+    let rows = flatten_session_rows(&entries);
+    if rows.is_empty() {
         return None;
     }
 
-    let focused_block_idx = entries
+    let focused_row_idx = rows
         .iter()
-        .position(|entry| match entry {
-            DisplaySessionEntry::Session { session, .. } => {
-                app.focused_session_name() == Some(session.name.as_str())
-            }
-            DisplaySessionEntry::Group { key, .. } => app.focused_group_key() == Some(key.as_str()),
-        })
+        .position(|row| row.is_focus_row(app))
         .unwrap_or(0);
 
-    let total_rows: usize = (0..blocks.len())
-        .map(|idx| session_entry_height(&blocks, &entries, idx))
-        .sum();
+    let total_rows = rows.len();
     let visible_cards = available.div_ceil(2).max(1);
-    let max_first_visible = blocks.len().saturating_sub(visible_cards);
+    let max_first_visible = entries.len().saturating_sub(visible_cards);
     let first_visible = if total_rows <= available {
         0
     } else if app.session_scroll_follows_focus() {
-        compute_session_window_start_for_focus(&blocks, &entries, focused_block_idx, available)
+        compute_session_window_start_for_focus(&rows, focused_row_idx, available)
     } else {
-        app.session_scroll_offset().min(max_first_visible)
+        row_index_for_entry(&rows, app.session_scroll_offset().min(max_first_visible))
     };
 
     let body_capacity = available;
-    let mut used = 0;
-    'outer: for (offset, block) in blocks[first_visible..].iter().enumerate() {
-        let entry_idx = first_visible + offset;
-        for line in block {
-            if used >= body_capacity {
-                break 'outer;
-            }
-            lines.push(line.clone());
-            used += 1;
-        }
-        if used >= body_capacity {
-            break;
-        }
-        if let Some(spacer) =
-            session_entry_spacer(palette, entries.get(entry_idx), entries.get(entry_idx + 1))
-        {
-            lines.push(spacer);
-            used += 1;
-        }
+    for row in rows.iter().skip(first_visible).take(body_capacity) {
+        lines.push(row.render(app, palette, width));
     }
 
     while lines.len() - start_offset < available {
@@ -461,9 +421,7 @@ fn render_sessions(
         Some(ScrollbarSpec {
             area: Rect::new(0, start_offset as u16, width as u16, available as u16),
             content_length: total_rows,
-            position: (0..first_visible)
-                .map(|idx| session_entry_height(&blocks, &entries, idx))
-                .sum(),
+            position: first_visible,
             viewport_length: available,
             track: palette.surface2,
             thumb: palette.overlay1,
@@ -473,7 +431,137 @@ fn render_sessions(
     }
 }
 
-fn build_group_block(
+#[derive(Clone, Copy)]
+enum SessionListRow<'a> {
+    Group {
+        entry_idx: usize,
+        key: &'a str,
+        label: &'a str,
+        count: usize,
+        collapsed: bool,
+        summary: &'a crate::session_display::GroupSummary,
+    },
+    SessionName {
+        entry_idx: usize,
+        index: usize,
+        session: &'a SessionData,
+        indented: bool,
+    },
+    SessionDetail {
+        entry_idx: usize,
+        session: &'a SessionData,
+        indented: bool,
+    },
+    Spacer {
+        entry_idx: usize,
+        group_rail: bool,
+    },
+}
+
+impl<'a> SessionListRow<'a> {
+    fn entry_idx(self) -> usize {
+        match self {
+            Self::Group { entry_idx, .. }
+            | Self::SessionName { entry_idx, .. }
+            | Self::SessionDetail { entry_idx, .. }
+            | Self::Spacer { entry_idx, .. } => entry_idx,
+        }
+    }
+
+    fn is_focus_row(self, app: &App) -> bool {
+        match self {
+            Self::Group { key, .. } => app.focused_group_key() == Some(key),
+            Self::SessionName { session, .. } => {
+                app.focused_session_name() == Some(session.name.as_str())
+            }
+            Self::SessionDetail { .. } | Self::Spacer { .. } => false,
+        }
+    }
+
+    fn render(self, app: &App, palette: &Palette, width: usize) -> StyledLine {
+        match self {
+            Self::Group {
+                key,
+                label,
+                count,
+                collapsed,
+                summary,
+                ..
+            } => build_group_row(app, palette, key, label, count, collapsed, summary, width),
+            Self::SessionName {
+                index,
+                session,
+                indented,
+                ..
+            } => build_session_name_row(app, palette, index, session, indented),
+            Self::SessionDetail {
+                session, indented, ..
+            } => build_session_detail_row(app, palette, session, indented, width),
+            Self::Spacer {
+                group_rail: true, ..
+            } => inner_rail_blank(palette),
+            Self::Spacer {
+                group_rail: false, ..
+            } => rail_blank(palette),
+        }
+    }
+}
+
+fn flatten_session_rows<'a>(entries: &'a [DisplaySessionEntry<'a>]) -> Vec<SessionListRow<'a>> {
+    let mut rows = Vec::new();
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        match entry {
+            DisplaySessionEntry::Group {
+                key,
+                label,
+                count,
+                collapsed,
+                summary,
+            } => rows.push(SessionListRow::Group {
+                entry_idx,
+                key,
+                label,
+                count: *count,
+                collapsed: *collapsed,
+                summary,
+            }),
+            DisplaySessionEntry::Session {
+                index,
+                session,
+                indented,
+            } => {
+                rows.push(SessionListRow::SessionName {
+                    entry_idx,
+                    index: *index,
+                    session,
+                    indented: *indented,
+                });
+                rows.push(SessionListRow::SessionDetail {
+                    entry_idx,
+                    session,
+                    indented: *indented,
+                });
+                let next_is_group_child = matches!(
+                    entries.get(entry_idx + 1),
+                    Some(DisplaySessionEntry::Session { indented: true, .. })
+                );
+                rows.push(SessionListRow::Spacer {
+                    entry_idx,
+                    group_rail: *indented && next_is_group_child,
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn row_index_for_entry(rows: &[SessionListRow<'_>], entry_idx: usize) -> usize {
+    rows.iter()
+        .position(|row| row.entry_idx() >= entry_idx)
+        .unwrap_or(0)
+}
+
+fn build_group_row(
     app: &App,
     palette: &Palette,
     key: &str,
@@ -482,7 +570,7 @@ fn build_group_block(
     collapsed: bool,
     summary: &crate::session_display::GroupSummary,
     width: usize,
-) -> Vec<StyledLine> {
+) -> StyledLine {
     let hit = HitTarget::Group(key.to_string());
     let focused =
         app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
@@ -511,55 +599,15 @@ fn build_group_block(
     }
     push_group_summary(&mut row, palette, summary, collapsed, width);
 
-    vec![row.end(CellStyle {
+    let mut line = row.end(CellStyle {
         fg: palette.white,
         bg,
-    })]
-    .into_iter()
-    .map(|mut line| {
-        let remaining = width.saturating_sub(line.width());
-        if remaining > 0 {
-            line.push(" ".repeat(remaining), palette.white);
-        }
-        line.with_hit(hit.clone())
-    })
-    .collect()
-}
-
-fn session_entry_spacer(
-    palette: &Palette,
-    current: Option<&DisplaySessionEntry<'_>>,
-    next: Option<&DisplaySessionEntry<'_>>,
-) -> Option<StyledLine> {
-    match current {
-        Some(DisplaySessionEntry::Group { .. }) => None,
-        Some(DisplaySessionEntry::Session { indented: true, .. }) => {
-            let next_is_group_child = matches!(
-                next,
-                Some(DisplaySessionEntry::Session { indented: true, .. })
-            );
-            Some(if next_is_group_child {
-                inner_rail_blank(palette)
-            } else {
-                rail_blank(palette)
-            })
-        }
-        Some(DisplaySessionEntry::Session { .. }) => Some(rail_blank(palette)),
-        None => None,
+    });
+    let remaining = width.saturating_sub(line.width());
+    if remaining > 0 {
+        line.push(" ".repeat(remaining), palette.white);
     }
-}
-
-fn session_entry_height(
-    blocks: &[Vec<StyledLine>],
-    entries: &[DisplaySessionEntry<'_>],
-    idx: usize,
-) -> usize {
-    let block_height = blocks.get(idx).map(Vec::len).unwrap_or_default();
-    let spacer_height = match entries.get(idx) {
-        Some(DisplaySessionEntry::Session { .. }) => 1,
-        _ => 0,
-    };
-    block_height + spacer_height
+    line.with_hit(hit)
 }
 
 fn push_loader_rows(
@@ -641,33 +689,37 @@ fn push_group_summary(
 }
 
 fn compute_session_window_start_for_focus(
-    blocks: &[Vec<StyledLine>],
-    entries: &[DisplaySessionEntry<'_>],
+    rows: &[SessionListRow<'_>],
     focused_idx: usize,
     available_rows: usize,
 ) -> usize {
     let mut start = focused_idx;
-    let mut used = session_entry_height(blocks, entries, focused_idx);
+    let mut used = 1;
     while start > 0 {
-        let next = session_entry_height(blocks, entries, start - 1);
-        if used + next > available_rows {
+        if used + 1 > available_rows {
             break;
         }
         start -= 1;
-        used += next;
+        used += 1;
+    }
+    while start < rows.len()
+        && matches!(
+            rows[start],
+            SessionListRow::SessionDetail { .. } | SessionListRow::Spacer { .. }
+        )
+    {
+        start += 1;
     }
     start
 }
 
-fn build_session_block(
+fn build_session_name_row(
     app: &App,
     palette: &Palette,
     idx: usize,
     session: &SessionData,
     indented: bool,
-    width: usize,
-) -> Vec<StyledLine> {
-    let mut block = Vec::with_capacity(3);
+) -> StyledLine {
     let index = idx;
     let focused = app.focused_session_name() == Some(session.name.as_str());
     let current = app.current_session.as_deref() == Some(session.name.as_str());
@@ -690,22 +742,45 @@ fn build_session_block(
     let bg = if flashed { Some(palette.surface1) } else { bg };
 
     let mut row = StyledLine::with_bg(bg);
+    let marker_color = if current {
+        palette.green
+    } else {
+        palette.lavender
+    };
+    let marker = if current {
+        "▌"
+    } else if focused {
+        "›"
+    } else {
+        " "
+    };
     if indented {
         row.push("   │", palette.surface2);
-        row.push(if focused { "▌ " } else { " " }, palette.blue);
+        row.push(marker, marker_color);
     } else {
-        row.push(if focused { "▌  " } else { "   " }, palette.blue);
+        row.push(format!("{marker}  "), marker_color);
     }
     row.push(format!("{index:02}  "), index_color);
     row.push(&session.name, name_color);
-    block.push(
-        row.end(CellStyle {
-            fg: palette.white,
-            bg,
-        })
-        .with_hit(hit.clone()),
-    );
+    row.end(CellStyle {
+        fg: palette.white,
+        bg,
+    })
+    .with_hit(hit)
+}
 
+fn build_session_detail_row(
+    app: &App,
+    palette: &Palette,
+    session: &SessionData,
+    indented: bool,
+    width: usize,
+) -> StyledLine {
+    let focused = app.focused_session_name() == Some(session.name.as_str());
+    let bg = focused.then_some(palette.surface1);
+    let hit = HitTarget::Session(session.name.clone());
+    let flashed = app.active_flash_target() == Some(&hit);
+    let bg = if flashed { Some(palette.surface1) } else { bg };
     let has_ports = !session.ports.is_empty();
     let has_diff_stats = session.insertions > 0 || session.deletions > 0;
     let detail_text = if !session.branch.is_empty() {
@@ -713,79 +788,58 @@ fn build_session_block(
     } else {
         dir_name(session)
     };
-    if detail_text.is_some() || has_ports || has_diff_stats {
-        let branch_color = if focused {
-            palette.pink
+    let branch_color = if focused {
+        palette.pink
+    } else {
+        palette.overlay0
+    };
+    let port_color = if focused {
+        palette.sky
+    } else {
+        palette.overlay0
+    };
+    let mut line = StyledLine::with_bg(bg);
+    line.push(
+        if indented { "   │     " } else { "       " },
+        palette.surface2,
+    );
+    let mut suffix_width = 0;
+    if has_ports {
+        suffix_width += if session.ports.len() == 1 {
+            format!("  ⌁{}", session.ports[0]).width()
         } else {
-            palette.overlay0
+            format!("  ⌁{}+{}", session.ports[0], session.ports.len() - 1).width()
         };
-        let port_color = if focused {
-            palette.sky
+    }
+    if has_diff_stats {
+        suffix_width += diff_stats_width(session);
+    }
+    if let Some(detail_text) = detail_text {
+        let available = width.saturating_sub(line.width() + suffix_width);
+        line.push(truncate_right(detail_text, available), branch_color);
+    }
+    if has_ports {
+        let port_text = if session.ports.len() == 1 {
+            format!("  ⌁{}", session.ports[0])
         } else {
-            palette.overlay0
+            format!("  ⌁{}+{}", session.ports[0], session.ports.len() - 1)
         };
-        let mut line = StyledLine::with_bg(bg);
-        line.push(
-            if indented { "   │     " } else { "       " },
-            palette.surface2,
-        );
-        let mut suffix_width = 0;
-        if has_ports {
-            suffix_width += if session.ports.len() == 1 {
-                format!("  ⌁{}", session.ports[0]).width()
-            } else {
-                format!("  ⌁{}+{}", session.ports[0], session.ports.len() - 1).width()
-            };
-        }
-        if has_diff_stats {
-            suffix_width += diff_stats_width(session);
-        }
-        if let Some(detail_text) = detail_text {
-            let available = width.saturating_sub(line.width() + suffix_width);
-            line.push(truncate_right(detail_text, available), branch_color);
-        }
-        if has_ports {
-            let port_text = if session.ports.len() == 1 {
-                format!("  ⌁{}", session.ports[0])
-            } else {
-                format!("  ⌁{}+{}", session.ports[0], session.ports.len() - 1)
-            };
-            line.push(port_text, port_color);
-        }
-        if has_diff_stats {
-            let spaces = width.saturating_sub(line.width() + diff_stats_width(session));
-            line.push_hit(
-                " ".repeat(spaces),
-                palette.white,
-                HitTarget::DiffCount(session.name.clone()),
-            );
-            push_diff_stats(&mut line, palette, session, app);
-        }
-        block.push(
-            line.end(CellStyle {
-                fg: palette.white,
-                bg,
-            })
-            .with_hit(hit.clone()),
-        );
+        line.push(port_text, port_color);
     }
-
-    if block.len() == 1 {
-        let mut line = StyledLine::with_bg(bg);
-        line.push(
-            if indented { "   │     " } else { "       " },
-            palette.surface2,
+    if has_diff_stats {
+        let spaces = width.saturating_sub(line.width() + diff_stats_width(session));
+        line.push_hit(
+            " ".repeat(spaces),
+            palette.white,
+            HitTarget::DiffCount(session.name.clone()),
         );
-        block.push(
-            line.end(CellStyle {
-                fg: palette.white,
-                bg,
-            })
-            .with_hit(hit),
-        );
+        push_diff_stats(&mut line, palette, session, app);
     }
-
-    block
+    line.end(CellStyle {
+        fg: palette.white,
+        bg,
+    })
+    .with_hit(hit)
 }
 
 fn rail_blank(palette: &Palette) -> StyledLine {

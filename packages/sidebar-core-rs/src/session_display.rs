@@ -32,7 +32,7 @@ impl DisplaySessionEntry<'_> {
     pub fn row_height(&self) -> usize {
         match self {
             Self::Group { .. } => 1,
-            Self::Session { .. } => 2,
+            Self::Session { .. } => 3,
         }
     }
 }

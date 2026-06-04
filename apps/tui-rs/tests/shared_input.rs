@@ -11,7 +11,8 @@ fn shared_input_mapping_drives_existing_session_navigation() {
 
     assert_eq!(
         app.focused_session_name(),
-        Some("plane-pdf-word-formatting")
+        Some("plane-pdf-word-formatting"),
+        "session navigation moves temporary focus; it does not switch until Enter",
     );
     assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 }
@@ -53,7 +54,7 @@ fn shared_input_mapping_keeps_reorder_and_switch_shortcuts() {
                 debounce: None,
             },
             ClientCommand::SwitchSession {
-                name: "plane-feat-edit-pages-from-pi".into(),
+                name: "learning".into(),
                 client_tty: None,
                 debounce: Some(true),
             },

@@ -27,7 +27,8 @@ Each tmux server/socket gets its own opensessions server and its own sidebar sta
 
 The practical product behavior is:
 
-- every sidebar pane inside the same tmux server shows the same session list, current focus, filter, and width
+- every sidebar pane inside the same tmux server shows the same session list, filters, lifecycle state, collapsed groups, and width
+- each attached tmux client owns its own confirmed active row and temporary keyboard focus
 - changing width in one window updates the sidebars in sibling windows/sessions inside that tmux server
 - a different tmux server may have a different opensessions width/state/server without conflict
 - stale hooks or sidebars talking to another port are considered broken configuration, not valid mixed-server behavior
@@ -142,6 +143,14 @@ That means:
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - if the user resized immediately before switching, the just-resized width must survive the switch
 - switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
+
+The sidebar session list has one durable local active row: this tmux client's confirmed active session. The keyboard-focused row may temporarily diverge while the user browses with `j`/`k`/arrow keys, but that temporary selection is local-only and must not be server-synced. `Enter` switches to the temporary selection and keeps that row visible as the pending switch target until `YourSession`/pane identity confirms the new context; it must not snap back to the old active row for an intermediate frame. `Tab`/`Shift-Tab` are the only keys that immediately switch to the next/previous visible session without first moving temporary focus. Mouse clicks may flash the clicked target, but the durable active row stays on the confirmed active session until confirmation.
+
+Temporary focus must not look like active focus. The confirmed active row owns the strong green active marker; a temporary keyboard selection uses a weaker cursor marker. Otherwise a normal `j`/`k` browse shows two active-looking rows and feels like focus randomly split.
+
+When `Enter` switches from session A to session B, the old A sidebar remains alive in the background. If A keeps `pending=B` forever, returning to A later replays stale focus and feels random. A server `Focus`/`State` broadcast for B is therefore allowed to settle only this one local case: if a sidebar has `pending=B` but its own local session is still A, it clears pending and rehomes focus to A. This does not make server focus authoritative; it only cleans up the source pane after its switch request moved the attached tmux client elsewhere.
+
+This keeps per-window state simple: every attached tmux client can show a different active session row if that client is in a different tmux session, while shared server state still provides the common session list, width, filters, collapsed groups, and lifecycle labels. Server focus broadcasts are compatibility hints only; they must not move a client's local active/focused session row.
 
 One specific regression we already paid for: forcing `resize-window` during the session-switch path caused visible layout jumps. The fix was to stop doing that in the switch path and instead use targeted width enforcement plus background pre-layout where appropriate.
 

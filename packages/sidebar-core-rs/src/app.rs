@@ -24,12 +24,22 @@ pub enum AgentPanelScope {
     All,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchTarget {
     /// Open lazydiffs in a tmux popup.
-    LazydiffTmux,
+    LazydiffTmux { session_name: Option<String> },
     /// Open lazydiff in a new terminal window.
-    LazydiffTerminal,
+    LazydiffTerminal { session_name: Option<String> },
+}
+
+impl LaunchTarget {
+    pub fn session_name(&self) -> Option<&str> {
+        match self {
+            Self::LazydiffTmux { session_name } | Self::LazydiffTerminal { session_name } => {
+                session_name.as_deref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,11 +105,11 @@ pub struct App {
     pub session_scroll_offset: usize,
     session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
+    pub pending_switch_session: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
-    pending_switch_session: Option<String>,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -113,7 +123,6 @@ pub struct PaneIdentity {
 
 impl App {
     pub fn from_state(state: ServerState) -> Self {
-        let focused_session = state.focused_session.clone();
         let mut app = Self {
             sessions: state.sessions,
             sidebar_focus: None,
@@ -137,18 +146,15 @@ impl App {
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
+            pending_switch_session: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             fixture_name: None,
             terminal_width: None,
             pane_identity: None,
-            pending_switch_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
-        app.sidebar_focus = focused_session
-            .as_deref()
-            .and_then(|name| app.visible_focus_for_session(name))
-            .or_else(|| app.display_session_entries().first().map(entry_focus));
+        app.sidebar_focus = app.display_session_entries().first().map(entry_focus);
         app
     }
 
@@ -207,8 +213,11 @@ impl App {
         if self.pending_switch_session.as_deref() == Some(session_name.as_str()) {
             self.pending_switch_session = None;
         }
-        if update_focus && let Some(focus) = self.visible_focus_for_session(&session_name) {
-            self.set_sidebar_focus(focus);
+        if update_focus {
+            self.set_focus_if_changed(
+                self.visible_focus_for_session(&session_name)
+                    .unwrap_or_else(|| SidebarFocus::Session(session_name)),
+            );
         }
     }
 
@@ -220,6 +229,8 @@ impl App {
         match message {
             ServerMessage::State(state) => {
                 let previous_focus = self.sidebar_focus.clone();
+                let server_current = state.current_session.clone();
+                let server_focused = state.focused_session.clone();
                 self.sessions = state.sessions;
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
@@ -232,26 +243,18 @@ impl App {
                     .as_ref()
                     .is_some_and(|focus| self.focus_exists(focus));
                 if !focus_still_exists {
-                    self.sidebar_focus = state
-                        .focused_session
-                        .as_deref()
-                        .and_then(|focused| self.visible_focus_for_session(focused))
-                        .or_else(|| self.display_session_entries().first().map(entry_focus));
-                    self.session_scroll_follows_focus = true;
+                    self.rehome_focus_to_local_session();
                 }
+                self.clear_background_pending_switch(server_current.as_deref());
+                self.clear_background_pending_switch(server_focused.as_deref());
                 self.clamp_session_scroll_offset(0);
             }
             ServerMessage::Focus(update) => {
-                let next_focus = update
-                    .focused_session
-                    .as_deref()
-                    .and_then(|focused| self.visible_focus_for_session(focused));
-                if let Some(next_focus) = next_focus {
-                    self.set_sidebar_focus(next_focus);
-                }
+                self.clear_background_pending_switch(update.current_session.as_deref());
+                self.clear_background_pending_switch(update.focused_session.as_deref());
             }
             ServerMessage::YourSession { name, .. } => {
-                self.confirm_local_session(name, self.pane_identity.is_none());
+                self.confirm_local_session(name, true);
             }
             ServerMessage::ReIdentify => {
                 if let Some(identity) = self.pane_identity.clone() {
@@ -296,11 +299,11 @@ impl App {
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
+            pending_switch_session: None,
             collapsed_worktree_groups: HashSet::new(),
             fixture_name: fixture_static_name(name),
             terminal_width: None,
             pane_identity: None,
-            pending_switch_session: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -310,22 +313,6 @@ impl App {
         }
 
         app
-    }
-
-    pub fn resolve_synced_focus(
-        next_focused_session: Option<&str>,
-        next_current_session: Option<&str>,
-        local_session_name: Option<&str>,
-    ) -> Option<String> {
-        if let (Some(local), Some(current)) = (local_session_name, next_current_session)
-            && current != local
-        {
-            return Some(local.to_string());
-        }
-
-        next_focused_session
-            .or(local_session_name)
-            .map(str::to_string)
     }
 
     pub fn filtered_sessions(&self) -> impl Iterator<Item = &SessionData> {
@@ -380,6 +367,12 @@ impl App {
         self.session_scroll_follows_focus = true;
     }
 
+    fn set_focus_if_changed(&mut self, focus: SidebarFocus) {
+        if self.sidebar_focus.as_ref() != Some(&focus) {
+            self.set_sidebar_focus(focus);
+        }
+    }
+
     pub fn set_focused_session(&mut self, name: impl Into<String>) {
         self.set_sidebar_focus(SidebarFocus::Session(name.into()));
     }
@@ -398,6 +391,15 @@ impl App {
         let session = self.sessions.iter().find(|session| session.name == name)?;
         let group_focus = SidebarFocus::WorktreeGroup(worktree_group_key(session)?);
         self.focus_exists(&group_focus).then_some(group_focus)
+    }
+
+    fn local_session_focus(&self) -> Option<SidebarFocus> {
+        let name = self
+            .my_session
+            .as_deref()
+            .or(self.current_session.as_deref())?;
+        self.visible_focus_for_session(name)
+            .or_else(|| Some(SidebarFocus::Session(name.to_string())))
     }
 
     pub fn handle_key_char(&mut self, key: char) {
@@ -429,8 +431,12 @@ impl App {
                     self.modal = Modal::KillConfirm { session_name: name };
                 }
             }
-            'l' => self.pending_launches.push(LaunchTarget::LazydiffTmux),
-            'L' => self.pending_launches.push(LaunchTarget::LazydiffTerminal),
+            'l' => self.pending_launches.push(LaunchTarget::LazydiffTmux {
+                session_name: self.local_session_name().map(str::to_string),
+            }),
+            'L' => self.pending_launches.push(LaunchTarget::LazydiffTerminal {
+                session_name: self.local_session_name().map(str::to_string),
+            }),
             't' => self.open_theme_picker(),
             'f' => self.cycle_filter(),
             'a' => self.toggle_agent_panel_scope(),
@@ -439,28 +445,7 @@ impl App {
     }
 
     pub fn handle_tab(&mut self, shift: bool) {
-        let names: Vec<String> = self
-            .display_sessions()
-            .into_iter()
-            .map(|session| session.name.clone())
-            .collect();
-        if names.is_empty() {
-            return;
-        }
-
-        let current = self
-            .pending_switch_session
-            .as_deref()
-            .or(self.current_session.as_deref());
-        let current_idx = current
-            .and_then(|name| names.iter().position(|candidate| candidate == name))
-            .unwrap_or(0);
-        let next_idx = if shift {
-            (current_idx + names.len() - 1) % names.len()
-        } else {
-            (current_idx + 1) % names.len()
-        };
-        self.switch_to_session_debounced(names[next_idx].clone());
+        self.switch_to_relative_session(if shift { -1 } else { 1 }, true);
     }
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {
@@ -476,18 +461,24 @@ impl App {
     }
 
     pub fn move_focus(&mut self, delta: i8) {
-        let Some((current_idx, len)) = self.focused_filtered_index_and_len() else {
-            return;
-        };
-        let max_idx = len - 1;
-        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
-        if next_idx == current_idx {
+        let targets = self.session_focus_targets();
+        if targets.is_empty() {
             return;
         }
-        let Some(target) = self.filtered_focus_target_at(next_idx) else {
-            return;
-        };
-        self.set_sidebar_focus(target);
+        let current_idx = self
+            .sidebar_focus
+            .as_ref()
+            .and_then(|focus| targets.iter().position(|target| target == focus))
+            .or_else(|| {
+                self.local_session_focus()
+                    .and_then(|focus| targets.iter().position(|target| target == &focus))
+            })
+            .unwrap_or(0);
+        let max_idx = targets.len() - 1;
+        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
+        if next_idx != current_idx {
+            self.set_sidebar_focus(targets[next_idx].clone());
+        }
     }
 
     pub fn session_scroll_offset(&self) -> usize {
@@ -582,15 +573,17 @@ impl App {
             return;
         }
         match self.sidebar_focus.clone() {
-            Some(SidebarFocus::Session(name)) => self.switch_to_session(name),
-            Some(SidebarFocus::WorktreeGroup(key)) => self.toggle_worktree_group(&key),
+            Some(SidebarFocus::Session(_)) => self.activate_focused_session(),
+            Some(SidebarFocus::WorktreeGroup(key)) => {
+                self.activate_hit_target(HitTarget::Group(key))
+            }
             None => {}
         }
     }
 
     pub fn activate_focused_session(&mut self) {
         if let Some(name) = self.focused_session_name().map(str::to_string) {
-            self.switch_to_session(name);
+            self.request_session_switch(name, false, true);
         }
     }
 
@@ -598,34 +591,47 @@ impl App {
     /// `onSelect={() => switchToSession(session.name)}` handler in
     /// `apps/tui/src/index.tsx::SessionCard`.
     pub fn click_session(&mut self, name: String) {
-        self.trigger_flash(HitTarget::Session(name.clone()));
-        self.switch_to_session(name);
+        self.activate_hit_target(HitTarget::Session(name));
     }
 
     pub fn click_group(&mut self, key: String) {
-        self.trigger_flash(HitTarget::Group(key.clone()));
-        if self.focused_group_key() == Some(key.as_str()) {
-            self.toggle_worktree_group(&key);
-            return;
-        }
-        self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key));
+        self.activate_hit_target(HitTarget::Group(key));
     }
 
     pub fn click_diff_count(&mut self, name: String) {
-        self.trigger_flash(HitTarget::DiffCount(name.clone()));
-        self.set_sidebar_focus(SidebarFocus::Session(name));
-        self.pending_launches.push(LaunchTarget::LazydiffTmux);
+        self.activate_hit_target(HitTarget::DiffCount(name));
     }
 
     /// Click on an agent row in the detail panel. Mirrors the TS
     /// `onFocusPane`/`onFocusAgentPane` flow that switches to the agent's
     /// session and sends `focus-agent-pane`.
     pub fn click_agent(&mut self, idx: usize) {
+        self.activate_hit_target(HitTarget::Agent(idx));
+    }
+
+    pub fn activate_hit_target(&mut self, target: HitTarget) {
+        self.trigger_flash(target.clone());
+        match target {
+            HitTarget::Session(name) => self.switch_to_session(name),
+            HitTarget::Group(key) => {
+                self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key.clone()));
+                self.toggle_worktree_group(&key);
+            }
+            HitTarget::DiffCount(name) => {
+                self.pending_launches.push(LaunchTarget::LazydiffTmux {
+                    session_name: Some(name),
+                });
+            }
+            HitTarget::Agent(idx) => self.activate_agent_target(idx),
+            HitTarget::AgentScopeToggle => self.toggle_agent_panel_scope(),
+        }
+    }
+
+    fn activate_agent_target(&mut self, idx: usize) {
         let agent_count = self.focused_agents_len();
         if idx >= agent_count {
             return;
         }
-        self.trigger_flash(HitTarget::Agent(idx));
         self.panel_focus = PanelFocus::Agents;
         self.focused_agent_idx = idx;
         self.activate_focused_agent();
@@ -758,23 +764,92 @@ impl App {
     }
 
     fn switch_to_session(&mut self, name: String) {
+        self.request_session_switch(name, false, false);
+    }
+
+    fn request_session_switch(&mut self, name: String, debounce: bool, preserve_focus: bool) {
         self.pending_switch_session = Some(name.clone());
-        self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
+        if !preserve_focus {
+            self.rehome_focus_to_local_session();
+        }
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
-            debounce: None,
+            debounce: debounce.then_some(true),
         });
     }
 
-    fn switch_to_session_debounced(&mut self, name: String) {
-        self.pending_switch_session = Some(name.clone());
-        self.set_sidebar_focus(SidebarFocus::Session(name.clone()));
-        self.commands.push(ClientCommand::SwitchSession {
-            name,
-            client_tty: None,
-            debounce: Some(true),
-        });
+    fn rehome_focus_to_local_session(&mut self) {
+        if let Some(focus) = self.local_session_focus() {
+            self.set_focus_if_changed(focus);
+        } else if self
+            .sidebar_focus
+            .as_ref()
+            .is_none_or(|focus| !self.focus_exists(focus))
+        {
+            self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
+            self.session_scroll_follows_focus = true;
+        }
+    }
+
+    fn clear_background_pending_switch(&mut self, broadcast_session: Option<&str>) {
+        let Some(broadcast_session) = broadcast_session else {
+            return;
+        };
+        if self.pending_switch_session.as_deref() != Some(broadcast_session) {
+            return;
+        }
+        if self.confirmed_local_session_name() == Some(broadcast_session) {
+            return;
+        }
+        self.pending_switch_session = None;
+        self.rehome_focus_to_local_session();
+    }
+
+    fn confirmed_local_session_name(&self) -> Option<&str> {
+        self.my_session
+            .as_deref()
+            .or(self.current_session.as_deref())
+    }
+
+    fn local_session_name(&self) -> Option<&str> {
+        self.confirmed_local_session_name()
+            .or_else(|| self.focused_session_name())
+    }
+
+    fn switch_to_relative_session(&mut self, delta: i8, debounce: bool) {
+        let names: Vec<String> = self
+            .display_sessions()
+            .into_iter()
+            .map(|session| session.name.clone())
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+
+        let anchor = self.local_session_name();
+        let current_idx = anchor
+            .and_then(|name| names.iter().position(|candidate| candidate == name))
+            .unwrap_or(0);
+        let max_idx = names.len() - 1;
+        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
+        if next_idx == current_idx {
+            self.rehome_focus_to_local_session();
+            return;
+        }
+        self.request_session_switch(names[next_idx].clone(), debounce, false);
+    }
+
+    fn session_focus_targets(&self) -> Vec<SidebarFocus> {
+        self.display_session_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                DisplaySessionEntry::Session { session, .. } => {
+                    Some(SidebarFocus::Session(session.name.clone()))
+                }
+                DisplaySessionEntry::Group { .. } => None,
+            })
+            .collect()
     }
 
     fn cycle_filter(&mut self) {
@@ -817,10 +892,6 @@ impl App {
             len += 1;
         }
         (len > 0).then_some((focused_idx.unwrap_or(0), len))
-    }
-
-    fn filtered_focus_target_at(&self, index: usize) -> Option<SidebarFocus> {
-        self.display_session_entries().get(index).map(entry_focus)
     }
 
     fn focused_session_data(&self) -> Option<&SessionData> {

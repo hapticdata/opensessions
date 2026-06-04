@@ -1,6 +1,6 @@
 use crate::app::{App, Modal, PanelFocus};
 use crate::generated::protocol::ClientCommand;
-use crate::renderer::{HitTarget, THEME_NAMES, compute_hit_target, detail_separator_row};
+use crate::renderer::{THEME_NAMES, compute_hit_target, detail_separator_row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiKey {
@@ -245,23 +245,8 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             }
 
             let target = compute_hit_target(app, x, y, width, height);
-            match target {
-                Some(HitTarget::Session(name)) => {
-                    app.click_session(name);
-                }
-                Some(HitTarget::Group(key)) => {
-                    app.click_group(key);
-                }
-                Some(HitTarget::DiffCount(name)) => {
-                    app.click_diff_count(name);
-                }
-                Some(HitTarget::Agent(idx)) => {
-                    app.click_agent(idx);
-                }
-                Some(HitTarget::AgentScopeToggle) => {
-                    app.toggle_agent_panel_scope();
-                }
-                None => {}
+            if let Some(target) = target {
+                app.activate_hit_target(target);
             }
         }
         UiMouse::Move {

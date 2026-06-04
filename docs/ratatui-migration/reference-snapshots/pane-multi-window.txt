@@ -3,13 +3,13 @@ Sessions                          6
    01  plane-feat-edit-pages-from-p
        feat/edit-pages-from-pi
 
-▌  02  plane-feat-background-export
+›  02  plane-feat-background-export
        feat-background-exports
 
    03  learning
        main
 
-   04  opensessions
+▌  04  opensessions
        devpulse
 
    05  plane-pdf-word-formatting

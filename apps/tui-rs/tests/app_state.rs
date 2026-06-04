@@ -43,22 +43,6 @@ fn re_identify_without_stored_identity_emits_no_command() {
 }
 
 #[test]
-fn resolve_synced_focus_keeps_background_sidebar_pinned_to_local_session() {
-    assert_eq!(
-        App::resolve_synced_focus(Some("alpha"), Some("alpha"), Some("beta")),
-        Some("beta".into())
-    );
-    assert_eq!(
-        App::resolve_synced_focus(Some("beta"), Some("beta"), Some("beta")),
-        Some("beta".into())
-    );
-    assert_eq!(
-        App::resolve_synced_focus(None, None, Some("beta")),
-        Some("beta".into())
-    );
-}
-
-#[test]
 fn filters_sessions_and_omits_os_stash() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.session_filter = SessionFilterMode::Running;
@@ -85,7 +69,8 @@ fn tab_switch_queues_next_visible_session_without_changing_confirmed_current_ses
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(
         app.focused_session_name(),
-        Some("plane-pdf-word-formatting")
+        Some("opensessions"),
+        "tab sends a switch request but snaps the local cursor back to the confirmed active session",
     );
     assert_eq!(app.panel_focus, PanelFocus::Sessions);
     assert_eq!(
@@ -113,8 +98,8 @@ fn session_switch_request_does_not_make_target_the_confirmed_active_session() {
     );
     assert_eq!(
         app.focused_session_name(),
-        Some("learning"),
-        "the clicked row may become the local cursor/flash target without becoming active",
+        Some("opensessions"),
+        "the click target may flash, but the keyboard cursor snaps back to the confirmed active session",
     );
     assert_eq!(
         app.drain_commands(),
@@ -173,8 +158,8 @@ fn shared_state_current_session_is_not_a_confirmed_client_active_session() {
     );
     assert_eq!(
         app.focused_session_name(),
-        Some("opensessions"),
-        "legacy focusedSession can still seed the local cursor before identity arrives",
+        Some("plane-feat-edit-pages-from-pi"),
+        "legacy focusedSession must not seed this client's cursor before local identity arrives",
     );
 }
 
@@ -195,7 +180,7 @@ fn number_key_queues_one_based_switch_index_command() {
 }
 
 #[test]
-fn navigation_keys_move_focus_locally_without_server_echo() {
+fn navigation_keys_move_temporary_session_selection_without_switching() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.set_focused_session("opensessions");
 
@@ -203,13 +188,14 @@ fn navigation_keys_move_focus_locally_without_server_echo() {
 
     assert_eq!(
         app.focused_session_name(),
-        Some("plane-pdf-word-formatting")
+        Some("plane-pdf-word-formatting"),
+        "keyboard navigation moves a temporary selection but does not switch tmux sessions",
     );
     assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 }
 
 #[test]
-fn worktree_group_is_focusable_and_enter_toggles_collapse() {
+fn keyboard_navigation_skips_worktree_group_headers() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     let first = app
         .sessions
@@ -227,19 +213,17 @@ fn worktree_group_is_focusable_and_enter_toggles_collapse() {
     second.is_worktree = true;
     let group_key = "/Users/me/work/plane-ee-wt";
 
+    app.current_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.my_session = Some("plane-feat-edit-pages-from-pi".into());
     app.set_focused_session("plane-feat-edit-pages-from-pi");
     app.move_focus(-1);
 
-    assert_eq!(app.focused_group_key(), Some(group_key));
-    assert_eq!(app.focused_session_name(), None);
-    app.activate_focused_item();
-    assert!(!app.is_group_collapsed(group_key));
+    assert_eq!(app.focused_group_key(), None);
     assert_eq!(
-        app.drain_commands(),
-        vec![ClientCommand::ToggleWorktreeGroup {
-            key: group_key.into(),
-        }]
+        app.focused_session_name(),
+        Some("plane-feat-edit-pages-from-pi")
     );
+    assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 
     app.apply_server_message(ServerMessage::State(ServerState {
         sessions: app.sessions.clone(),
@@ -254,16 +238,14 @@ fn worktree_group_is_focusable_and_enter_toggles_collapse() {
         ts: 1,
     }));
     assert!(app.is_group_collapsed(group_key));
-    assert_eq!(app.focused_group_key(), Some(group_key));
-
-    app.activate_focused_item();
-    assert!(app.is_group_collapsed(group_key));
     assert_eq!(
-        app.drain_commands(),
-        vec![ClientCommand::ToggleWorktreeGroup {
-            key: group_key.into(),
-        }]
+        app.focused_group_key(),
+        Some(group_key),
+        "if the active session is hidden by a collapsed group, focus the visible group representing it",
     );
+    assert_eq!(app.focused_session_name(), None);
+    assert!(app.is_group_collapsed(group_key));
+    assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 }
 
 #[test]
@@ -309,14 +291,16 @@ fn collapsed_worktree_state_focuses_visible_group_when_server_focus_is_hidden_ch
 }
 
 #[test]
-fn state_refresh_preserves_local_session_list_cursor() {
+fn state_refresh_preserves_temporary_session_selection() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.set_focused_session("opensessions");
     app.move_focus(1);
     assert_eq!(
         app.focused_session_name(),
-        Some("plane-pdf-word-formatting")
+        Some("plane-pdf-word-formatting"),
+        "keyboard navigation can keep a temporary selection until Enter, Tab, or local session confirmation resolves it",
     );
+    assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
 
     let state = ServerState {
         sessions: app.sessions.clone(),
@@ -334,9 +318,102 @@ fn state_refresh_preserves_local_session_list_cursor() {
 
     assert_eq!(
         app.focused_session_name(),
-        Some("plane-pdf-word-formatting")
+        Some("plane-pdf-word-formatting"),
+        "server state refresh must not stomp an in-progress temporary keyboard selection",
     );
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
+}
+
+#[test]
+fn focus_broadcast_from_another_client_does_not_move_local_session_list_cursor() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.set_pane_identity("%2".into(), "learning".into(), Some("@2".into()));
+    assert_eq!(app.focused_session_name(), Some("learning"));
+
+    app.apply_server_message(ServerMessage::Focus(FocusUpdate {
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+    }));
+
+    assert_eq!(
+        app.focused_session_name(),
+        Some("learning"),
+        "server focus is a cross-client hint; it must not overwrite this client's keyboard cursor",
+    );
+    assert_eq!(app.current_session.as_deref(), Some("learning"));
+    assert_eq!(app.my_session.as_deref(), Some("learning"));
+}
+
+#[test]
+fn your_session_confirmation_rehomes_focus_even_with_pane_identity() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.set_pane_identity("%2".into(), "opensessions".into(), Some("@2".into()));
+    app.set_focused_session("plane-pdf-word-formatting");
+
+    app.apply_server_message(ServerMessage::YourSession {
+        name: "learning".into(),
+        client_tty: Some("/dev/ttys002".into()),
+    });
+
+    assert_eq!(app.current_session.as_deref(), Some("learning"));
+    assert_eq!(app.my_session.as_deref(), Some("learning"));
+    assert_eq!(
+        app.focused_session_name(),
+        Some("learning"),
+        "tmux confirmation resolves any temporary selection to the newly active local session",
+    );
+}
+
+#[test]
+fn state_refresh_preserves_agent_panel_when_session_focus_is_unchanged() {
+    let mut app = App::reference_fixture("pane-opensessions-self");
+    app.set_pane_identity("%3".into(), "opensessions".into(), Some("@3".into()));
+    app.focus_agents_panel();
+    app.focused_agent_idx = 1;
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("learning".into()),
+        current_session: Some("learning".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 2,
+    }));
+
+    assert_eq!(app.focused_session_name(), Some("opensessions"));
+    assert_eq!(app.panel_focus, PanelFocus::Agents);
+    assert_eq!(app.focused_agent_idx, 1);
+}
+
+#[test]
+fn state_refresh_rehomes_missing_cursor_to_local_session_not_server_focus() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.set_pane_identity("%2".into(), "learning".into(), Some("@2".into()));
+    app.set_focused_session("soon-to-be-hidden");
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 2,
+    }));
+
+    assert_eq!(
+        app.focused_session_name(),
+        Some("learning"),
+        "when the local cursor disappears, recover to the local pane's session instead of shared server focus",
+    );
+    assert_eq!(app.current_session.as_deref(), Some("learning"));
 }
 
 #[test]
@@ -467,14 +544,24 @@ fn extra_typescript_key_commands_are_available() {
 }
 
 #[test]
-fn enter_switches_to_focused_session() {
+fn enter_switches_temporary_selection_then_rehomes_focus_to_active_session() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
     app.set_focused_session("plane-pdf-word-formatting");
 
     app.activate_focused_session();
 
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-pdf-word-formatting"),
+        "Enter keeps the temporary selection visible as the pending switch target, avoiding an active-session snap-back frame",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
     assert_eq!(
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
@@ -483,6 +570,53 @@ fn enter_switches_to_focused_session() {
             debounce: None,
         }]
     );
+
+    app.apply_server_message(ServerMessage::YourSession {
+        name: "plane-pdf-word-formatting".into(),
+        client_tty: Some("/dev/ttys002".into()),
+    });
+
+    assert_eq!(
+        app.current_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-pdf-word-formatting")
+    );
+    assert_eq!(app.pending_switch_session, None);
+}
+
+#[test]
+fn background_source_sidebar_clears_pending_switch_after_focus_broadcast_confirms_target() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("plane-pdf-word-formatting");
+
+    app.activate_focused_session();
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-pdf-word-formatting")
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
+    let _ = app.drain_commands();
+
+    app.apply_server_message(ServerMessage::Focus(FocusUpdate {
+        focused_session: Some("plane-pdf-word-formatting".into()),
+        current_session: Some("plane-pdf-word-formatting".into()),
+    }));
+
+    assert_eq!(
+        app.focused_session_name(),
+        Some("opensessions"),
+        "the source sidebar is now background; it must not keep stale pending focus when revisited",
+    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
+    assert_eq!(app.pending_switch_session, None);
 }
 
 #[test]
@@ -548,7 +682,7 @@ fn filter_key_cycles_filter_modes_and_queues_set_filter() {
 }
 
 #[test]
-fn applies_focus_and_your_session_messages_without_replacing_sessions() {
+fn applies_your_session_and_ignores_focus_messages_without_replacing_sessions() {
     let mut app = App::reference_fixture("pane-attached-session-list");
 
     app.apply_server_message(ServerMessage::YourSession {
@@ -561,7 +695,7 @@ fn applies_focus_and_your_session_messages_without_replacing_sessions() {
     }));
 
     assert_eq!(app.my_session.as_deref(), Some("opensessions"));
-    assert_eq!(app.focused_session_name(), Some("learning"));
+    assert_eq!(app.focused_session_name(), Some("opensessions"));
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(app.sessions.len(), 7);
 }
