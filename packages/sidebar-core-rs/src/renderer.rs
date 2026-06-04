@@ -573,7 +573,7 @@ fn build_group_row(
         palette.lavender
     };
     row.push(marker, marker_color);
-    row.push("  ", palette.surface2);
+    row.push(" ", palette.surface2);
     row.push(if collapsed { "▸" } else { "▾" }, palette.overlay0);
     row.push(" ", palette.white);
     row.push(
@@ -620,16 +620,16 @@ fn push_loader_rows(
 
     let start_len = lines.len();
     let mut primary = StyledLine::blank();
-    primary.push("   ", palette.white);
-    primary.push(agent_spinner(spinner_ts), palette.yellow);
     primary.push("  ", palette.white);
+    primary.push(agent_spinner(spinner_ts), palette.yellow);
+    primary.push(" ", palette.white);
     let available_label = width.saturating_sub(primary.width());
     primary.push(truncate_right(label, available_label), palette.subtext0);
     lines.push(primary.end(CellStyle::fg(palette.white)));
 
     if available > 1 {
         let mut secondary = StyledLine::blank();
-        secondary.push("      ", palette.white);
+        secondary.push("    ", palette.white);
         let available_detail = width.saturating_sub(secondary.width());
         secondary.push(truncate_right(detail, available_detail), palette.overlay0);
         lines.push(secondary.end(CellStyle::fg(palette.white)));
@@ -750,10 +750,10 @@ fn build_session_name_row(
         " "
     };
     if indented {
-        row.push("   │", palette.surface2);
+        row.push("  │", palette.surface2);
         row.push(marker, marker_color);
     } else {
-        row.push(format!("{marker}  "), marker_color);
+        row.push(format!("{marker} "), marker_color);
     }
     row.push(format!("{index:02}  "), index_color);
     row.push(&session.name, name_color);
@@ -795,7 +795,7 @@ fn build_session_detail_row(
     };
     let mut line = StyledLine::with_bg(bg);
     line.push(
-        if indented { "   │     " } else { "       " },
+        if indented { "  │     " } else { "      " },
         palette.surface2,
     );
     let mut suffix_width = 0;
@@ -843,7 +843,7 @@ fn rail_blank(palette: &Palette) -> StyledLine {
 
 fn inner_rail_blank(palette: &Palette) -> StyledLine {
     let mut line = StyledLine::blank();
-    line.push("   │", palette.surface2);
+    line.push("  │", palette.surface2);
     line.end(CellStyle::fg(palette.white))
 }
 
