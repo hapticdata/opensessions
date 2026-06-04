@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use crate::fixtures::{fixture_static_name, reference_sessions};
 use crate::generated::protocol::{
     AgentEvent, AgentStatus, ClientCommand, ServerMessage, ServerState, SessionData,
     SessionFilterMode,
@@ -108,7 +107,6 @@ pub struct App {
     pub pending_switch_session: Option<String>,
     group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
-    pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
     commands: Vec<ClientCommand>,
@@ -150,7 +148,6 @@ impl App {
             pending_switch_session: None,
             group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
-            fixture_name: None,
             terminal_width: None,
             pane_identity: None,
             commands: Vec::new(),
@@ -266,53 +263,6 @@ impl App {
             }
             ServerMessage::Hello(_) | ServerMessage::Resize { .. } | ServerMessage::Quit => {}
         }
-    }
-
-    pub fn reference_fixture(name: &str) -> Self {
-        let (focused_session, current_session) = match name {
-            "pane-opensessions-self" => (Some("opensessions"), Some("opensessions")),
-            "pane-multi-window" => (Some("plane-feat-background-exports"), Some("opensessions")),
-            _ => (Some("plane-pdf-word-formatting"), Some("opensessions")),
-        };
-
-        let mut app = Self {
-            sessions: reference_sessions(),
-            sidebar_focus: focused_session.map(|name| SidebarFocus::Session(name.to_string())),
-            current_session: current_session.map(str::to_string),
-            my_session: current_session.map(str::to_string),
-            initializing: false,
-            init_label: None,
-            theme: None,
-            ts: 0,
-            spinner_now: 0,
-            session_filter: SessionFilterMode::All,
-            panel_focus: PanelFocus::Sessions,
-            agent_panel_scope: AgentPanelScope::Current,
-            focused_agent_idx: 0,
-            quit_deadline: None,
-            flash_target: None,
-            flash_deadline: None,
-            hover_target: None,
-            modal: Modal::None,
-            detail_panel_height: 10,
-            session_scroll_offset: 0,
-            session_scroll_follows_focus: true,
-            resize_drag_state: None,
-            pending_switch_session: None,
-            group_focus_surrogate_for: None,
-            collapsed_worktree_groups: HashSet::new(),
-            fixture_name: fixture_static_name(name),
-            terminal_width: None,
-            pane_identity: None,
-            commands: Vec::new(),
-            pending_launches: Vec::new(),
-        };
-
-        if name == "pane-opensessions-self" {
-            app.focused_agent_idx = 0;
-        }
-
-        app
     }
 
     pub fn filtered_sessions(&self) -> impl Iterator<Item = &SessionData> {

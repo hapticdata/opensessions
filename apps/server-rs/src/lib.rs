@@ -36,11 +36,7 @@ use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::AgentTracker;
 use opensessions_sidebar_core::app::App as SidebarApp;
-use opensessions_sidebar_core::frame::render_rows;
-use opensessions_sidebar_core::generated::protocol::{
-    ClientCommand as SidebarClientCommand, ServerMessage as SidebarServerMessage,
-};
-use opensessions_sidebar_core::input::{UiKey, apply_ui_key};
+use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2813,18 +2809,6 @@ async fn handle_connection(
         return Ok(());
     }
 
-    if parsed.is_websocket_upgrade() && parsed.path == "/rendered-sidebar" {
-        return handle_rendered_sidebar_connection(
-            stream,
-            parsed,
-            shutdown,
-            state_source,
-            state_updates,
-            shutdown_announcement,
-        )
-        .await;
-    }
-
     if parsed.is_websocket_upgrade() {
         let Some(key) = parsed.header("sec-websocket-key") else {
             stream
@@ -2940,165 +2924,6 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn handle_rendered_sidebar_connection(
-    mut stream: TcpStream,
-    parsed: HttpRequest,
-    shutdown: broadcast::Sender<()>,
-    state_source: Option<Arc<dyn StateSource>>,
-    state_updates: broadcast::Sender<String>,
-    shutdown_announcement: Arc<ShutdownAnnouncement>,
-) -> Result<(), ServerError> {
-    let Some(key) = parsed.header("sec-websocket-key") else {
-        stream
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            .await?;
-        return Ok(());
-    };
-    let accept = websocket_accept(key);
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await?;
-
-    let mut websocket = ServerBuilder::new().serve(stream);
-    let mut width = parsed
-        .query_param("width")
-        .and_then(|width| width.parse::<u16>().ok())
-        .unwrap_or(35);
-    let mut height = parsed
-        .query_param("height")
-        .and_then(|height| height.parse::<u16>().ok())
-        .unwrap_or(56);
-
-    let mut app = state_source
-        .as_ref()
-        .and_then(|state_source| app_from_state_json(&state_source.snapshot_json()));
-    if let Some(app) = &mut app {
-        websocket
-            .send(Message::text(render_sidebar_frame(app, width, height)))
-            .await?;
-    }
-
-    let mut connection_shutdown = shutdown.subscribe();
-    let mut state_rx = state_updates.subscribe();
-    let mut render_tick = tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
-    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut dirty = false;
-    loop {
-        tokio::select! {
-            _ = connection_shutdown.recv() => {
-                let _ = websocket.send(Message::text(QUIT_JSON)).await;
-                return Ok(());
-            }
-            _ = render_tick.tick(), if dirty => {
-                if let Some(app) = &mut app {
-                    websocket.send(Message::text(render_sidebar_frame(app, width, height))).await?;
-                }
-                dirty = false;
-            }
-            state = state_rx.recv() => {
-                match state {
-                    Ok(state) => {
-                        if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&state) {
-                            if matches!(message, SidebarServerMessage::Quit) {
-                                let _ = websocket.send(Message::text(QUIT_JSON)).await;
-                                return Ok(());
-                            }
-                            apply_sidebar_server_message(&mut app, message);
-                            dirty = true;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                }
-            }
-            message = websocket.next() => {
-                match message {
-                    Some(Ok(message)) if message.is_close() => return Ok(()),
-                    Some(Ok(message)) => {
-                        if is_quit_command(&message) {
-                            request_shutdown(
-                                &state_source,
-                                &state_updates,
-                                &shutdown,
-                                &shutdown_announcement,
-                            );
-                            return Ok(());
-                        }
-
-                        if let Some(command) = parse_command(&message) {
-                            if command.get("type").and_then(Value::as_str) == Some("render-resize") {
-                                width = command
-                                    .get("width")
-                                    .and_then(Value::as_u64)
-                                    .map(|width| width.min(u16::MAX as u64) as u16)
-                                    .unwrap_or(width);
-                                height = command
-                                    .get("height")
-                                    .and_then(Value::as_u64)
-                                    .map(|height| height.min(u16::MAX as u64) as u16)
-                                    .unwrap_or(height);
-                                dirty = true;
-                                continue;
-                            }
-
-                            if command.get("type").and_then(Value::as_str) == Some("render-key") {
-                                if let Some(app) = &mut app {
-                                    apply_render_key(app, &command);
-                                    for command in app.drain_commands() {
-                                        if matches!(command, SidebarClientCommand::Quit) {
-                                            request_shutdown(
-                                                &state_source,
-                                                &state_updates,
-                                                &shutdown,
-                                                &shutdown_announcement,
-                                            );
-                                            return Ok(());
-                                        }
-                                        if let Ok(command) = serde_json::to_value(command)
-                                            && let Some(payload) = state_source
-                                                .as_ref()
-                                                .and_then(|state_source| state_source.handle_client_command(&command))
-                                        {
-                                            if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
-                                                app.apply_server_message(message);
-                                            }
-                                            if !is_client_view_command(&command) {
-                                                let _ = state_updates.send(payload);
-                                            }
-                                        }
-                                    }
-                                    dirty = true;
-                                }
-                                continue;
-                            }
-
-                            if let Some(payload) = state_source
-                                .as_ref()
-                                .and_then(|state_source| state_source.handle_client_command(&command))
-                            {
-                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
-                                    apply_sidebar_server_message(&mut app, message);
-                                }
-                                if !is_client_view_command(&command) {
-                                    let _ = state_updates.send(payload);
-                                }
-                            }
-                            dirty = true;
-                        }
-                    }
-                    Some(Err(err)) => return Err(err.into()),
-                    None => return Ok(()),
-                }
-            }
-        }
-    }
-}
-
 fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
     let SidebarServerMessage::State(state) =
         serde_json::from_str::<SidebarServerMessage>(state_json).ok()?
@@ -3106,72 +2931,6 @@ fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
         return None;
     };
     Some(SidebarApp::from_state(state))
-}
-
-fn apply_sidebar_server_message(app: &mut Option<SidebarApp>, message: SidebarServerMessage) {
-    match (app, message) {
-        (slot @ None, SidebarServerMessage::State(state)) => {
-            *slot = Some(SidebarApp::from_state(state))
-        }
-        (Some(app), message) => app.apply_server_message(message),
-        (None, _) => {}
-    }
-}
-
-fn render_sidebar_frame(app: &mut SidebarApp, width: u16, height: u16) -> String {
-    let rows = render_rows(app, width, height);
-    let mut frame = String::new();
-    for row in rows.rows {
-        frame.push_str(&String::from_utf8_lossy(&row));
-        frame.push('\n');
-    }
-    frame
-}
-
-fn apply_render_key(app: &mut SidebarApp, command: &Value) {
-    let key = command
-        .get("key")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let alt = command.get("alt").and_then(Value::as_bool).unwrap_or(false);
-    let ctrl = command
-        .get("ctrl")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let shift = command
-        .get("shift")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    let ui_key = if alt {
-        match key {
-            "up" => Some(UiKey::AltUp),
-            "down" => Some(UiKey::AltDown),
-            _ => None,
-        }
-    } else if ctrl {
-        match key {
-            "j" => Some(UiKey::CtrlJ),
-            "k" => Some(UiKey::CtrlK),
-            _ => None,
-        }
-    } else {
-        match key {
-            "up" => Some(UiKey::Up),
-            "down" => Some(UiKey::Down),
-            "tab" => Some(UiKey::Tab { shift }),
-            "enter" => Some(UiKey::Enter),
-            "esc" => Some(UiKey::Esc),
-            key if key.chars().count() == 1 => Some(UiKey::Char(
-                key.chars().next().expect("single char key must exist"),
-            )),
-            _ => None,
-        }
-    };
-
-    if let Some(key) = ui_key {
-        apply_ui_key(app, key);
-    }
 }
 
 async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>, ServerError> {

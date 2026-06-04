@@ -177,7 +177,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 ### Packages
 
 - `packages/runtime-rs/` — Shared Rust runtime: tmux provider, agent watchers, config, tracker, protocol
-- `packages/sidebar-core-rs/` — Core sidebar rendering logic, extractable for snapshot tests
+- `packages/sidebar-core-rs/` — Core sidebar state, input, and rendering logic
 
 ### Integrations
 

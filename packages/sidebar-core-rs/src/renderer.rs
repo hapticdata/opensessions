@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use ratatui::Frame;
-use ratatui::buffer::Cell;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -107,21 +104,13 @@ fn sidebar_layout(app: &App, width: u16, height: u16) -> SidebarLayout {
     const FOOTER_SEPARATOR_ROWS: u16 = 1;
     const FOOTER_ROWS: u16 = 2;
 
-    let detail_separator_row = match app.fixture_name {
-        Some("pane-opensessions-self") => 38,
-        Some("pane-multi-window") => 35,
-        Some(_) => 43,
-        None => height
-            .saturating_sub(FOOTER_SEPARATOR_ROWS + FOOTER_ROWS + app.detail_panel_height as u16)
-            .saturating_sub(DETAIL_SEPARATOR_ROWS)
-            .max(HEADER_ROWS),
-    };
-    let footer_separator_row = match app.fixture_name {
-        Some("pane-opensessions-self") => 51,
-        Some(_) => 52,
-        None => height.saturating_sub(FOOTER_ROWS + FOOTER_SEPARATOR_ROWS),
-    }
-    .max(detail_separator_row + DETAIL_SEPARATOR_ROWS);
+    let detail_separator_row = height
+        .saturating_sub(FOOTER_SEPARATOR_ROWS + FOOTER_ROWS + app.detail_panel_height as u16)
+        .saturating_sub(DETAIL_SEPARATOR_ROWS)
+        .max(HEADER_ROWS);
+    let footer_separator_row = height
+        .saturating_sub(FOOTER_ROWS + FOOTER_SEPARATOR_ROWS)
+        .max(detail_separator_row + DETAIL_SEPARATOR_ROWS);
 
     let session_rows = detail_separator_row.saturating_sub(HEADER_ROWS);
     let detail_rows =
@@ -288,22 +277,6 @@ struct ScrollbarSpec {
     viewport_length: usize,
     track: Rgb,
     thumb: Rgb,
-}
-
-impl RenderModel {
-    pub(crate) fn markers(&self, width: u16, height: u16) -> HashMap<(u16, u16), CellStyle> {
-        let mut markers = HashMap::new();
-        for (y, line) in self.lines.iter().take(height as usize).enumerate() {
-            let y = y as u16;
-            if let Some(style) = line.end_style {
-                let x = line.width().min(width as usize) as u16;
-                if x < width {
-                    markers.insert((x, y), style);
-                }
-            }
-        }
-        markers
-    }
 }
 
 fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
@@ -1858,13 +1831,6 @@ impl CellStyle {
             .fg(self.fg.color())
             .bg(self.bg.map_or(Color::Reset, Rgb::color))
     }
-
-    pub(crate) fn from_cell(cell: &Cell) -> Self {
-        Self {
-            fg: Rgb::from_color(cell.fg).unwrap_or(WHITE),
-            bg: Rgb::from_color(cell.bg),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1881,21 +1847,6 @@ impl Rgb {
 
     fn color(self) -> Color {
         Color::Rgb(self.r, self.g, self.b)
-    }
-
-    fn from_color(color: Color) -> Option<Self> {
-        match color {
-            Color::Rgb(r, g, b) => Some(Self { r, g, b }),
-            _ => None,
-        }
-    }
-
-    pub fn fg_sgr(self) -> String {
-        format!("\x1b[38;2;{};{};{}m", self.r, self.g, self.b)
-    }
-
-    pub fn bg_sgr(self) -> String {
-        format!("\x1b[48;2;{};{};{}m", self.r, self.g, self.b)
     }
 }
 
@@ -2400,8 +2351,5 @@ pub fn palette_for_theme(name: Option<&str>) -> Palette {
     }
 }
 
-// Default foreground used for the screen-filling Block in `render_model` and
-// as the fallback when reconstructing styles via `CellStyle::from_cell`. Both
-// built-in palettes (mocha, latte) use white = (255, 255, 255), so this is
-// theme-agnostic.
+// Default foreground used for the screen-filling Block in `render_model`.
 const WHITE: Rgb = Rgb::new(255, 255, 255);

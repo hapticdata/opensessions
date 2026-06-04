@@ -217,7 +217,7 @@ fn tmux_sidebar_resize_immediately_before_switch_survives_handoff() {
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
 
-    lab.wait_for_client_session("os-demo-feat-agent-panel");
+    lab.wait_for_client_to_leave_session("opensessions");
     lab.wait_for_all_sidebar_widths(42);
 }
 
@@ -234,7 +234,7 @@ fn tmux_sidebar_single_resize_immediately_before_switch_is_adopted() {
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
 
-    lab.wait_for_client_session("os-demo-feat-agent-panel");
+    lab.wait_for_client_to_leave_session("opensessions");
     lab.wait_for_all_sidebar_widths(42);
 }
 
@@ -624,6 +624,29 @@ time.sleep(300)
         }
         panic!(
             "timed out waiting for client sessions {expected:?}; clients:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
+    }
+
+    fn wait_for_client_to_leave_session(&self, previous: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
+            if output
+                .lines()
+                .any(|line| !line.trim().is_empty() && line.trim() != previous)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for client to leave session {previous}; clients:\n{}\n\nlogs:\n{}",
             self.tmux([
                 "list-clients",
                 "-F",
