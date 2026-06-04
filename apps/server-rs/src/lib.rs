@@ -1038,11 +1038,20 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "/client-resized" => {
                 let now = (self.now_ms)();
+                if self.adopt_active_sidebar_width_from_layout(now) {
+                    return;
+                }
+                let width = self.current_sidebar_width_u16();
+                if self.active_window_sidebar_width_drifted(width) {
+                    debug_log(format!(
+                        "client-resized: active window sidebar differs from stored width={width}; leaving user pane resize to report-width"
+                    ));
+                    return;
+                }
                 self.sidebar_coordinator
                     .lock()
                     .unwrap()
                     .begin_client_resize_sync(now + 500, now + 700);
-                let width = self.current_sidebar_width_u16();
                 self.enforce_sidebar_width(width, None);
             }
             _ => {}
@@ -1369,14 +1378,10 @@ impl ReadOnlyMuxStateSource {
             }
             let current_session = provider.get_current_session();
             let current_window_id = provider.get_current_window_id();
-            let Some(current_pane_id) = provider.get_current_pane_id() else {
-                continue;
-            };
-            let Some(sidebar_pane) = provider
-                .list_sidebar_panes(None)
-                .into_iter()
-                .find(|pane| pane.pane_id == current_pane_id)
-            else {
+            let Some(sidebar_pane) = provider.list_sidebar_panes(None).into_iter().find(|pane| {
+                current_session.as_deref() == Some(pane.session_name.as_str())
+                    && current_window_id.as_deref() == Some(pane.window_id.as_str())
+            }) else {
                 continue;
             };
             let Some(width) = sidebar_pane.width else {

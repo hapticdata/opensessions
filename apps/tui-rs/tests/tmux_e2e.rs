@@ -6,23 +6,20 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 const W: &str = "36";
+const SIDEBAR_SESSIONS: &[&str] = &[
+    "opensessions",
+    "effect-ts",
+    "lazydiff",
+    "os-demo-feat-agent-panel",
+    "os-demo-preview",
+];
 
 #[test]
 fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
-    if std::env::var("OPENSESSIONS_TMUX_E2E").ok().as_deref() != Some("1") {
-        eprintln!("skipping tmux e2e; set OPENSESSIONS_TMUX_E2E=1 to run");
+    let mut lab = started_lab("opensessions-e2e-focus");
+    if lab.skipped {
         return;
     }
-    if Command::new("tmux").arg("-V").output().is_err() {
-        eprintln!("skipping tmux e2e; tmux is unavailable");
-        return;
-    }
-
-    let mut lab = Lab::new("opensessions-e2e-focus");
-    lab.setup_repos();
-    lab.setup_tmux();
-    lab.start_server();
-    lab.spawn_sidebars();
 
     lab.wait_for_text("opensessions", "os-demo-worktrees");
     lab.wait_for_text("effect-ts", "effect-ts");
@@ -97,6 +94,62 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     );
 }
 
+#[test]
+fn tmux_sidebar_width_resize_fans_out_to_every_session_sidebar() {
+    let lab = started_lab("opensessions-e2e-width");
+    if lab.skipped {
+        return;
+    }
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_all_sidebar_widths(36);
+    sleep(Duration::from_millis(900));
+
+    // First resize initializes the TUI's last-observed terminal width. The
+    // second resize is the product behavior: the active sidebar reports the
+    // user-owned width and the server fans it out to every other session.
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "40"]);
+    sleep(Duration::from_millis(250));
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
+
+    lab.wait_for_all_sidebar_widths(42);
+}
+
+#[test]
+fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
+    let mut lab = started_lab("opensessions-e2e-quit");
+    if lab.skipped {
+        return;
+    }
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "q"]);
+
+    lab.wait_for_server_exit();
+    lab.wait_for_no_sidebar_processes();
+}
+
+fn started_lab(prefix: &str) -> Lab {
+    if std::env::var("OPENSESSIONS_TMUX_E2E").ok().as_deref() != Some("1") {
+        eprintln!("skipping tmux e2e; set OPENSESSIONS_TMUX_E2E=1 to run");
+        return Lab::skipped();
+    }
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping tmux e2e; tmux is unavailable");
+        return Lab::skipped();
+    }
+
+    let mut lab = Lab::new(prefix);
+    lab.setup_repos();
+    lab.setup_tmux();
+    lab.start_server();
+    lab.spawn_sidebars();
+    lab
+}
+
 fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
     text.lines().find(|line| line.contains(needle))
 }
@@ -110,6 +163,7 @@ fn free_port() -> u16 {
 }
 
 struct Lab {
+    skipped: bool,
     socket: String,
     root: PathBuf,
     port: u16,
@@ -118,6 +172,17 @@ struct Lab {
 }
 
 impl Lab {
+    fn skipped() -> Self {
+        Self {
+            skipped: true,
+            socket: String::new(),
+            root: std::env::temp_dir(),
+            port: 0,
+            server: None,
+            client: None,
+        }
+    }
+
     fn new(prefix: &str) -> Self {
         let unique = format!(
             "{}-{}-{}",
@@ -128,6 +193,7 @@ impl Lab {
         let root = std::env::temp_dir().join(&unique);
         fs::create_dir_all(&root).expect("create e2e root");
         Self {
+            skipped: false,
             socket: unique,
             root,
             port: free_port(),
@@ -137,6 +203,9 @@ impl Lab {
     }
 
     fn setup_repos(&self) {
+        if self.skipped {
+            return;
+        }
         for name in ["opensessions", "effect-ts", "lazydiff"] {
             let dir = self.root.join(name);
             fs::create_dir_all(&dir).expect("create fake repo dir");
@@ -188,6 +257,9 @@ impl Lab {
     }
 
     fn setup_tmux(&mut self) {
+        if self.skipped {
+            return;
+        }
         let _ = Command::new("tmux")
             .args(["-L", &self.socket, "kill-server"])
             .output();
@@ -251,12 +323,19 @@ time.sleep(300)
     }
 
     fn start_server(&mut self) {
+        if self.skipped {
+            return;
+        }
         let server = self.server_bin();
         let tmux_env = self.tmux_socket_env();
         let child = Command::new(server)
             .env("TMUX", tmux_env)
             .env("OPENSESSIONS_HOST", "127.0.0.1")
             .env("OPENSESSIONS_PORT", self.port.to_string())
+            .env(
+                "OPENSESSIONS_DEBUG_LOG",
+                self.root.join("debug.log").to_str().unwrap(),
+            )
             .env(
                 "OPENSESSIONS_PID_FILE",
                 self.root.join("server.pid").to_str().unwrap(),
@@ -282,17 +361,15 @@ time.sleep(300)
     }
 
     fn spawn_sidebars(&self) {
+        if self.skipped {
+            return;
+        }
         let sidebar = self.sidebar_bin();
-        for session in [
-            "opensessions",
-            "effect-ts",
-            "lazydiff",
-            "os-demo-feat-agent-panel",
-            "os-demo-preview",
-        ] {
+        for session in SIDEBAR_SESSIONS {
             let command = format!(
-                "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} {} 2>{}",
+                "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
                 self.port,
+                shell_quote(&self.root.join("debug.log").to_string_lossy()),
                 sidebar.display(),
                 shell_quote(
                     &self
@@ -311,7 +388,7 @@ time.sleep(300)
                 "-F",
                 "#{pane_id}",
                 "-t",
-                session,
+                *session,
                 &command,
             ]);
             self.tmux_ok([
@@ -326,6 +403,9 @@ time.sleep(300)
     }
 
     fn wait_for_text(&self, session: &str, text: &str) {
+        if self.skipped {
+            return;
+        }
         self.wait_for_capture(session, |capture| capture.contains(text));
     }
 
@@ -333,6 +413,9 @@ time.sleep(300)
     where
         F: Fn(&str) -> bool,
     {
+        if self.skipped {
+            return;
+        }
         let pane = self.sidebar_pane(session);
         self.wait_for_capture_pane(&pane, predicate);
     }
@@ -341,6 +424,9 @@ time.sleep(300)
     where
         F: Fn(&str) -> bool,
     {
+        if self.skipped {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let capture = self.capture_pane(pane);
@@ -358,6 +444,9 @@ time.sleep(300)
     }
 
     fn wait_for_client_session(&self, expected: &str) {
+        if self.skipped {
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
@@ -377,6 +466,62 @@ time.sleep(300)
         );
     }
 
+    fn wait_for_all_sidebar_widths(&self, expected: u16) {
+        if self.skipped {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            let panes = self.sidebar_panes();
+            if panes.len() == SIDEBAR_SESSIONS.len()
+                && panes.iter().all(|pane| pane.width == expected)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for all sidebar widths to be {expected}; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
+    fn wait_for_no_sidebar_processes(&self) {
+        if self.skipped {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.sidebar_panes().is_empty() {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for all sidebar panes to exit; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
+    fn wait_for_server_exit(&mut self) {
+        if self.skipped {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(server) = &mut self.server
+                && server.try_wait().expect("poll server process").is_some()
+            {
+                self.server = None;
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!("server did not exit after q; logs:\n{}", self.logs());
+    }
+
     fn sidebar_pane(&self, session: &str) -> String {
         let output = self.tmux([
             "list-panes",
@@ -394,6 +539,32 @@ time.sleep(300)
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+    }
+
+    fn sidebar_panes(&self) -> Vec<SidebarPane> {
+        self.tmux([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_id}\t#{pane_width}\t#{pane_current_command}\t#{pane_title}",
+        ])
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let session = parts.next()?;
+            let pane = parts.next()?;
+            let width = parts.next()?.parse::<u16>().ok()?;
+            let command = parts.next()?;
+            let title = parts.next()?;
+            (title == "opensessions-sidebar" || command.starts_with("opensessions")).then(|| {
+                SidebarPane {
+                    session: session.to_string(),
+                    pane: pane.to_string(),
+                    width,
+                }
+            })
+        })
+        .collect()
     }
 
     fn capture_pane(&self, pane: &str) -> String {
@@ -490,6 +661,9 @@ fn shell_quote(value: &str) -> String {
 
 impl Drop for Lab {
     fn drop(&mut self) {
+        if self.skipped {
+            return;
+        }
         if let Some(mut server) = self.server.take() {
             let _ = server.kill();
             let _ = server.wait();
@@ -503,4 +677,11 @@ impl Drop for Lab {
             .output();
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarPane {
+    session: String,
+    pane: String,
+    width: u16,
 }
