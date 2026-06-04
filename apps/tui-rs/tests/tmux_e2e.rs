@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -237,6 +238,47 @@ fn tmux_sidebar_single_resize_immediately_before_switch_is_adopted() {
     lab.wait_for_all_sidebar_widths(42);
 }
 
+#[test]
+fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-100-clients");
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_client_session("opensessions");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build e2e tokio runtime");
+
+    runtime.block_on(async {
+        let mut clients = Vec::new();
+        for index in 0..100 {
+            let ws = opensessions_sidebar::client::connect_ws("127.0.0.1", lab.port)
+                .await
+                .unwrap_or_else(|err| panic!("connect passive ws client {index}: {err}"));
+            clients.push(ws);
+        }
+
+        for _ in 0..25 {
+            post_refresh(lab.port);
+        }
+
+        let started = Instant::now();
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
+        lab.wait_for_client_session("os-demo-feat-agent-panel");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "switch took {elapsed:?} with 100 connected sidebar clients"
+        );
+
+        drop(clients);
+    });
+}
+
 fn started_lab(prefix: &str) -> Lab {
     Command::new("tmux")
         .arg("-V")
@@ -268,6 +310,15 @@ fn e2e_serial_guard() -> MutexGuard<'static, ()> {
 
 fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
     text.lines().find(|line| line.contains(needle))
+}
+
+fn post_refresh(port: u16) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect /refresh");
+    stream
+        .write_all(b"POST /refresh HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .expect("write /refresh");
+    let mut response = [0; 128];
+    let _ = stream.read(&mut response);
 }
 
 fn assert_active_row(capture: &str, session: &str) {

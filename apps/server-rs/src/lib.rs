@@ -2854,26 +2854,17 @@ async fn handle_connection(
         let mut connection_shutdown = shutdown.subscribe();
         let mut state_rx = state_updates.subscribe();
         let mut client_context = ClientConnectionContext::default();
+        let mut pending_state: Option<String> = None;
+        let mut state_flush =
+            tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
+        state_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                biased;
+
                 _ = connection_shutdown.recv() => {
                     let _ = websocket.send(Message::text(QUIT_JSON)).await;
                     return Ok(());
-                }
-                state = state_rx.recv() => {
-                    match state {
-                        Ok(state) => {
-                            debug_log(format!(
-                                "ws: forwarding broadcast state ({} bytes) to client",
-                                state.len()
-                            ));
-                            websocket.send(Message::text(state)).await?
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            debug_log(format!("ws: state_rx lagged by {n} messages"));
-                        }
-                    }
                 }
                 message = websocket.next() => {
                     match message {
@@ -2914,6 +2905,29 @@ async fn handle_connection(
                         }
                         Some(Err(err)) => return Err(err.into()),
                         None => return Ok(()),
+                    }
+                }
+                _ = state_flush.tick(), if pending_state.is_some() => {
+                    let state = pending_state.take().expect("pending state checked above");
+                    debug_log(format!(
+                        "ws: flushing latest broadcast state ({} bytes) to client",
+                        state.len()
+                    ));
+                    websocket.send(Message::text(state)).await?;
+                }
+                state = state_rx.recv() => {
+                    match state {
+                        Ok(state) => {
+                            if state == QUIT_JSON {
+                                let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                                return Ok(());
+                            }
+                            pending_state = Some(state);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug_log(format!("ws: state_rx lagged by {n} messages"));
+                        }
                     }
                 }
             }
