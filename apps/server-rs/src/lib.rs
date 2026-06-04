@@ -359,6 +359,17 @@ struct PendingWidthFanout {
     width: u16,
     except_window_id: Option<String>,
     due_at: u64,
+    pending_pane_ids: Vec<String>,
+    started: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WidthFanoutStep {
+    width: u16,
+    except_window_id: Option<String>,
+    pane_id: Option<String>,
+    started: bool,
+    finished: bool,
 }
 
 pub struct ReadOnlyMuxStateSource {
@@ -1242,13 +1253,128 @@ impl ReadOnlyMuxStateSource {
             .and_then(|event| event.pane_id)
     }
 
-    /// Resize every sidebar pane to `width`, skipping any pane already at the
-    /// target width and any pane in `except_window_id` (the window that just
-    /// reported a user drag — we must not fight the pane the user is dragging).
-    /// Mirrors `enforceSidebarWidth(skipWindowId)` in the TS server. Returns
-    /// `true` if any pane was actually resized.
-    fn enforce_sidebar_width(&self, width: u16, except_window_id: Option<&str>) -> bool {
-        let mut resized = false;
+    fn schedule_session_switch(&self, name: &str, client_tty: Option<&str>) {
+        let due_at = (self.now_ms)().saturating_add(SWITCH_DEBOUNCE_MS);
+        *self.pending_session_switch.lock().unwrap() = Some(PendingSessionSwitch {
+            name: name.to_string(),
+            client_tty: client_tty.map(ToString::to_string),
+            due_at,
+        });
+    }
+
+    fn schedule_width_fanout(&self, width: u16, except_window_id: Option<&str>) {
+        let due_at = (self.now_ms)().saturating_add(WIDTH_FANOUT_DEBOUNCE_MS);
+        debug_log(format!(
+            "width-fanout: scheduled width={width} except_window={except_window_id:?} due_at={due_at}"
+        ));
+        *self.pending_width_fanout.lock().unwrap() = Some(PendingWidthFanout {
+            width,
+            except_window_id: except_window_id.map(ToString::to_string),
+            due_at,
+            pending_pane_ids: Vec::new(),
+            started: false,
+        });
+    }
+
+    fn apply_due_coalesced_operations(&self, now: u64) -> bool {
+        let switch = {
+            let mut pending = self.pending_session_switch.lock().unwrap();
+            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        let mut changed = false;
+        if let Some(intent) = switch
+            && let Some(provider) = self.providers.first()
+        {
+            self.prepare_session_handoff(now);
+            provider.switch_session(&intent.name, intent.client_tty.as_deref());
+            self.agent_tracker
+                .lock()
+                .unwrap()
+                .handle_focus(&intent.name);
+            return true;
+        }
+
+        if self.pending_session_switch.lock().unwrap().is_some() {
+            return changed;
+        }
+
+        let width_step = self.next_due_width_fanout_step(now);
+        if let Some(step) = width_step {
+            if step.started {
+                debug_log(format!(
+                    "width-fanout: applying width={} except_window={:?} now={now}",
+                    step.width, step.except_window_id,
+                ));
+                let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+                coordinator.finish_user_drag();
+                let _ = coordinator.begin_programmatic_adjustment_until(
+                    now.saturating_add(SIDEBAR_DRIFT_CORRECTION_MS),
+                );
+            }
+            let mut resized = false;
+            if let Some(pane_id) = step.pane_id.as_deref() {
+                debug_log(format!(
+                    "width-fanout: resize pane={pane_id} to={}",
+                    step.width,
+                ));
+                for provider in &self.providers {
+                    provider.resize_sidebar_pane(pane_id, step.width);
+                }
+                resized = true;
+            }
+            if step.finished {
+                debug_log(format!(
+                    "width-fanout: applied width={} resized={resized}",
+                    step.width,
+                ));
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    fn next_due_width_fanout_step(&self, now: u64) -> Option<WidthFanoutStep> {
+        let mut pending = self.pending_width_fanout.lock().unwrap();
+        let intent = pending.as_mut()?;
+        if intent.due_at > now {
+            return None;
+        }
+
+        let started = !intent.started;
+        if started {
+            debug_log(format!(
+                "width-fanout: starting width={} except_window={:?} now={now}",
+                intent.width, intent.except_window_id,
+            ));
+            intent.started = true;
+            intent.pending_pane_ids =
+                self.sidebar_panes_to_resize(intent.width, intent.except_window_id.as_deref());
+        }
+
+        let pane_id = intent.pending_pane_ids.pop();
+        let finished = intent.pending_pane_ids.is_empty();
+        let width = intent.width;
+        let except_window_id = intent.except_window_id.clone();
+        if finished {
+            pending.take();
+        }
+
+        Some(WidthFanoutStep {
+            width,
+            except_window_id,
+            pane_id,
+            started,
+            finished,
+        })
+    }
+
+    fn sidebar_panes_to_resize(&self, width: u16, except_window_id: Option<&str>) -> Vec<String> {
+        let mut pane_ids = Vec::new();
         for provider in &self.providers {
             if !provider.is_sidebar_capable() {
                 continue;
@@ -1268,91 +1394,23 @@ impl ReadOnlyMuxStateSource {
                     ));
                     continue;
                 }
-                debug_log(format!(
-                    "width-fanout: resize pane={} window={} session={} from={:?} to={width}",
-                    pane.pane_id, pane.window_id, pane.session_name, pane.width,
-                ));
-                provider.resize_sidebar_pane(&pane.pane_id, width);
-                resized = true;
+                pane_ids.push(pane.pane_id);
+            }
+        }
+        pane_ids.reverse();
+        pane_ids
+    }
+
+    fn enforce_sidebar_width(&self, width: u16, except_window_id: Option<&str>) -> bool {
+        let panes = self.sidebar_panes_to_resize(width, except_window_id);
+        let resized = !panes.is_empty();
+        for pane_id in panes {
+            debug_log(format!("width-fanout: resize pane={pane_id} to={width}",));
+            for provider in &self.providers {
+                provider.resize_sidebar_pane(&pane_id, width);
             }
         }
         resized
-    }
-
-    fn schedule_session_switch(&self, name: &str, client_tty: Option<&str>) {
-        let due_at = (self.now_ms)().saturating_add(SWITCH_DEBOUNCE_MS);
-        *self.pending_session_switch.lock().unwrap() = Some(PendingSessionSwitch {
-            name: name.to_string(),
-            client_tty: client_tty.map(ToString::to_string),
-            due_at,
-        });
-    }
-
-    fn schedule_width_fanout(&self, width: u16, except_window_id: Option<&str>) {
-        let due_at = (self.now_ms)().saturating_add(WIDTH_FANOUT_DEBOUNCE_MS);
-        debug_log(format!(
-            "width-fanout: scheduled width={width} except_window={except_window_id:?} due_at={due_at}"
-        ));
-        *self.pending_width_fanout.lock().unwrap() = Some(PendingWidthFanout {
-            width,
-            except_window_id: except_window_id.map(ToString::to_string),
-            due_at,
-        });
-    }
-
-    fn apply_due_coalesced_operations(&self, now: u64) -> bool {
-        let switch = {
-            let mut pending = self.pending_session_switch.lock().unwrap();
-            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        let mut changed = false;
-        if let Some(intent) = switch
-            && let Some(provider) = self.providers.first()
-        {
-            self.prepare_session_handoff(now);
-            provider.switch_session(&intent.name, intent.client_tty.as_deref());
-            changed = self
-                .agent_tracker
-                .lock()
-                .unwrap()
-                .handle_focus(&intent.name)
-                || changed;
-        }
-
-        let width = {
-            let mut pending = self.pending_width_fanout.lock().unwrap();
-            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        if let Some(intent) = width {
-            debug_log(format!(
-                "width-fanout: applying width={} except_window={:?} now={now}",
-                intent.width, intent.except_window_id,
-            ));
-            {
-                let mut coordinator = self.sidebar_coordinator.lock().unwrap();
-                coordinator.finish_user_drag();
-                let _ = coordinator.begin_programmatic_adjustment_until(
-                    now.saturating_add(SIDEBAR_DRIFT_CORRECTION_MS),
-                );
-            }
-            let resized =
-                self.enforce_sidebar_width(intent.width, intent.except_window_id.as_deref());
-            debug_log(format!(
-                "width-fanout: applied width={} resized={resized}",
-                intent.width,
-            ));
-            changed = true;
-        }
-
-        changed
     }
 
     fn sidebar_width_drifted(&self, width: u16) -> bool {
