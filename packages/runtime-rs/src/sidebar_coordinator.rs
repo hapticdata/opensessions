@@ -348,7 +348,10 @@ impl SidebarCoordinator {
         if !continued_drag && !report.is_foreground_client {
             return self.reject("background-sidebar");
         }
-        if self.client_resize_report_guard_until > report.now {
+        if self.client_resize_report_guard_until > report.now
+            && !report.is_foreground_client
+            && !continued_drag
+        {
             return self.reject("client-resize-guard");
         }
         if self.authority == SidebarResizeAuthority::ClientResizeSync {

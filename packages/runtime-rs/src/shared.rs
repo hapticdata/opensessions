@@ -44,7 +44,6 @@ pub struct OpensessionsEndpoint {
     pub host: String,
     pub port: u16,
     pub pid_file: PathBuf,
-    pub shim_socket: PathBuf,
 }
 
 impl OpensessionsEndpoint {
@@ -66,29 +65,13 @@ impl OpensessionsEndpoint {
             server_key_string.as_deref(),
             env("OPENSESSIONS_PID_FILE").as_deref(),
         ));
-        let shim_socket = default_shim_socket_path(&pid_file);
-
         Self {
             server_key,
             host,
             port,
             pid_file,
-            shim_socket,
         }
     }
-}
-
-pub fn default_shim_socket_path(pid_file: &Path) -> PathBuf {
-    let candidate = pid_file.with_extension("sock");
-    if candidate.as_os_str().len() < 90 {
-        return candidate;
-    }
-
-    let mut hash = 0_u32;
-    for (idx, byte) in pid_file.to_string_lossy().bytes().enumerate() {
-        hash = (hash + u32::from(byte) * (idx as u32 + 1)) % 100_000;
-    }
-    std::env::temp_dir().join(format!("opensessions-{hash}.sock"))
 }
 
 pub fn hash_server_key(input: &str) -> u16 {

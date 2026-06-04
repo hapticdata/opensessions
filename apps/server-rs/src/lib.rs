@@ -29,7 +29,6 @@ use opensessions_runtime::protocol::{
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
-use opensessions_runtime::shared::default_shim_socket_path;
 use opensessions_runtime::sidebar_coordinator::{
     SidebarCoordinator, SidebarResizeAuthority, SidebarWidthReportInput,
 };
@@ -37,20 +36,16 @@ use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::AgentTracker;
 use opensessions_sidebar_core::app::App as SidebarApp;
-use opensessions_sidebar_core::frame::{FrameDiff, RenderedRows, diff_rows, render_rows};
+use opensessions_sidebar_core::frame::render_rows;
 use opensessions_sidebar_core::generated::protocol::{
     ClientCommand as SidebarClientCommand, ServerMessage as SidebarServerMessage,
 };
 use opensessions_sidebar_core::input::{UiKey, apply_ui_key};
-use opensessions_sidebar_protocol::{
-    KeyCode as ShimKeyCode, KeyModifiers as ShimKeyModifiers, ServerToShim, ShimToServer,
-    decode_shim_message, encode_server_message,
-};
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
@@ -636,7 +631,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     self.schedule_session_switch(name, client_tty);
                 } else {
                     self.pending_session_switch.lock().unwrap().take();
-                    self.guard_width_reports_after_session_handoff((self.now_ms)());
+                    self.prepare_session_handoff((self.now_ms)());
                     provider.switch_session(name, client_tty);
                 }
                 // Visiting a session clears its unseen agents (turns ● back
@@ -677,7 +672,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                         .session_before(name)
                         .or_else(|| self.session_after(name))
                 {
-                    self.guard_width_reports_after_session_handoff((self.now_ms)());
+                    self.prepare_session_handoff((self.now_ms)());
                     provider.switch_session(&next, None);
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
@@ -801,6 +796,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                     decision.continued_drag,
                 ));
                 if !decision.accepted {
+                    if matches!(
+                        decision.reason.as_str(),
+                        "client-resize-sync" | "client-resize-guard"
+                    ) {
+                        self.schedule_width_fanout(current_width, None);
+                    }
                     return None;
                 }
                 // The coordinator already holds the accepted width; do not keep a
@@ -877,6 +878,11 @@ impl StateSource for ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .acknowledge_sidebar_connected();
+        let startup_guard_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
+        self.sidebar_coordinator
+            .lock()
+            .unwrap()
+            .begin_client_resize_sync(startup_guard_until, startup_guard_until);
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
@@ -1306,7 +1312,7 @@ impl ReadOnlyMuxStateSource {
         if let Some(intent) = switch
             && let Some(provider) = self.providers.first()
         {
-            self.guard_width_reports_after_session_handoff(now);
+            self.prepare_session_handoff(now);
             provider.switch_session(&intent.name, intent.client_tty.as_deref());
             changed = self
                 .agent_tracker
@@ -1704,7 +1710,7 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
-        self.guard_width_reports_after_session_handoff((self.now_ms)());
+        self.prepare_session_handoff((self.now_ms)());
         provider.switch_session(&name, client_tty);
         self.agent_tracker.lock().unwrap().handle_focus(&name);
         Some(format!(
@@ -1717,6 +1723,11 @@ impl ReadOnlyMuxStateSource {
         let mut coordinator = self.sidebar_coordinator.lock().unwrap();
         coordinator.focus_context_changed();
         coordinator.note_client_resize_guard(guard_until);
+    }
+
+    fn prepare_session_handoff(&self, now: u64) {
+        let _ = self.adopt_active_sidebar_width_from_layout(now);
+        self.guard_width_reports_after_session_handoff(now);
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
@@ -2402,7 +2413,6 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub pid_file: PathBuf,
-    shim_socket_path: Option<PathBuf>,
     state_source: Option<Arc<dyn StateSource>>,
 }
 
@@ -2412,14 +2422,8 @@ impl ServerConfig {
             host: host.into(),
             port,
             pid_file: pid_file.into(),
-            shim_socket_path: None,
             state_source: None,
         }
-    }
-
-    pub fn with_shim_socket_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.shim_socket_path = Some(path.into());
-        self
     }
 
     pub fn with_state_source(mut self, source: impl StateSource) -> Self {
@@ -2431,7 +2435,6 @@ impl ServerConfig {
 #[derive(Debug)]
 pub struct ServerHandle {
     addr: SocketAddr,
-    shim_socket_path: Option<PathBuf>,
     shutdown: broadcast::Sender<()>,
     task: JoinHandle<Result<(), ServerError>>,
 }
@@ -2439,10 +2442,6 @@ pub struct ServerHandle {
 impl ServerHandle {
     pub fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    pub fn shim_socket_path(&self) -> Option<&std::path::Path> {
-        self.shim_socket_path.as_deref()
     }
 
     pub async fn shutdown(self) -> Result<(), ServerError> {
@@ -2501,15 +2500,6 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         .ok_or_else(|| ServerError::new("server bind address did not resolve"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;
-    let shim_socket_path = config
-        .shim_socket_path
-        .clone()
-        .unwrap_or_else(|| default_shim_socket_path(&config.pid_file));
-    if shim_socket_path.exists() {
-        fs::remove_file(&shim_socket_path)?;
-    }
-    let shim_listener = UnixListener::bind(&shim_socket_path)?;
-
     fs::write(&config.pid_file, process::id().to_string())?;
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
@@ -2524,7 +2514,6 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
     let cleanup_state_source = state_source.clone();
-    let cleanup_shim_socket_path = shim_socket_path.clone();
     let loop_shutdown_announcement = Arc::clone(&shutdown_announcement);
     let task = tokio::spawn(async move {
         let result = run_accept_loop(
@@ -2533,7 +2522,6 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             shutdown_rx,
             state_source,
             state_updates,
-            shim_listener,
             loop_shutdown_announcement,
         )
         .await;
@@ -2541,18 +2529,15 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             source.cleanup_mux_hooks();
         }
         let cleanup_result = fs::remove_file(&config.pid_file);
-        let socket_cleanup_result = fs::remove_file(&cleanup_shim_socket_path);
-        match (result, cleanup_result, socket_cleanup_result) {
-            (Err(err), _, _) => Err(err),
-            (Ok(()), Err(err), _) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
-            (Ok(()), _, Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        match (result, cleanup_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
             _ => Ok(()),
         }
     });
 
     Ok(ServerHandle {
         addr,
-        shim_socket_path: Some(shim_socket_path),
         shutdown,
         task,
     })
@@ -2564,7 +2549,6 @@ async fn run_accept_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
-    shim_listener: UnixListener,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     loop {
@@ -2591,23 +2575,7 @@ async fn run_accept_loop(
                     .await;
                 });
             }
-            accepted = shim_listener.accept() => {
-                let (stream, _) = accepted?;
-                let connection_shutdown = shutdown.clone();
-                let connection_state_source = state_source.clone();
-                let connection_state_updates = state_updates.clone();
-                let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
-                tokio::spawn(async move {
-                    let _ = handle_shim_connection(
-                        stream,
-                        connection_shutdown,
-                        connection_state_source,
-                        connection_state_updates,
-                        connection_shutdown_announcement,
-                    )
-                    .await;
-                });
-            }
+
         }
     }
 }
@@ -2633,297 +2601,6 @@ fn request_shutdown(
 ) {
     shutdown_announcement.announce_once(state_source, state_updates);
     let _ = shutdown.send(());
-}
-
-async fn handle_shim_connection(
-    stream: UnixStream,
-    shutdown: broadcast::Sender<()>,
-    state_source: Option<Arc<dyn StateSource>>,
-    state_updates: broadcast::Sender<String>,
-    shutdown_announcement: Arc<ShutdownAnnouncement>,
-) -> Result<(), ServerError> {
-    let (mut reader, mut writer) = stream.into_split();
-    let first = read_protocol_frame(&mut reader).await?;
-    let ShimToServer::Hello(hello) = decode_shim_message(&first)
-        .map_err(|err| ServerError::new(format!("invalid shim hello: {err}")))?
-    else {
-        return Err(ServerError::new("shim must send hello first"));
-    };
-
-    writer
-        .write_all(&encode_server_message(&ServerToShim::Hello {
-            protocol: PROTOCOL_VERSION,
-        }))
-        .await?;
-    let (frames_tx, frames_rx) = watch::channel(Arc::new(Vec::<u8>::new()));
-    let _writer_task = tokio::spawn(write_shim_frames(writer, frames_rx));
-
-    let mut context = ClientConnectionContext {
-        client_tty: hello.client_tty.clone(),
-        pane_id: Some(hello.pane_id.clone()),
-        session_name: Some(hello.session_name.clone()),
-        window_id: hello.window_id.clone(),
-    };
-    let identify = serde_json::json!({
-        "type": "identify-pane",
-        "paneId": hello.pane_id,
-        "sessionName": hello.session_name,
-        "windowId": hello.window_id,
-    });
-
-    let mut app = state_source.as_ref().and_then(|state_source| {
-        let _ = state_source.handle_sender_command_with_context(&identify, &mut context);
-        app_from_state_json(&state_source.snapshot_json())
-    });
-    if let Some(state_source) = &state_source {
-        let _ = state_updates.send(state_source.snapshot_json());
-    }
-    if let Some(app) = &mut app {
-        app.my_session = context.session_name.clone();
-    }
-
-    let mut width = hello.width;
-    let mut height = hello.height;
-    let mut previous_rows = None::<RenderedRows>;
-    let mut seq = 0_u32;
-    if let Some(app) = &mut app {
-        seq = seq.wrapping_add(1);
-        let rows = render_rows(app, width, height);
-        frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::FullFrame {
-            seq,
-            width,
-            height,
-            rows: rows.rows.clone(),
-        })));
-        previous_rows = Some(rows);
-    }
-
-    let mut connection_shutdown = shutdown.subscribe();
-    let mut state_rx = state_updates.subscribe();
-    let mut render_tick = tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
-    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut dirty = false;
-
-    loop {
-        tokio::select! {
-            _ = connection_shutdown.recv() => {
-                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
-                return Ok(());
-            }
-            _ = render_tick.tick(), if dirty => {
-                if let Some(app) = &mut app {
-                    seq = seq.wrapping_add(1);
-                    let rows = render_rows(app, width, height);
-                    let message = match previous_rows.as_ref() {
-                        Some(previous) => match diff_rows(previous, &rows) {
-                            FrameDiff::Full(rows) => ServerToShim::FullFrame {
-                                seq,
-                                width: rows.width,
-                                height: rows.height,
-                                rows: rows.rows.clone(),
-                            },
-                            FrameDiff::Patch { width, height, changed_rows, clear_from_row } => {
-                                ServerToShim::PatchFrame { seq, width, height, changed_rows, clear_from_row }
-                            }
-                        },
-                        None => ServerToShim::FullFrame {
-                            seq,
-                            width: rows.width,
-                            height: rows.height,
-                            rows: rows.rows.clone(),
-                        },
-                    };
-                    previous_rows = Some(rows);
-                    frames_tx.send_replace(Arc::new(encode_server_message(&message)));
-                }
-                dirty = false;
-            }
-            state = state_rx.recv() => {
-                match state {
-                    Ok(state) => {
-                        if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&state) {
-                            if matches!(message, SidebarServerMessage::Quit) {
-                                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
-                                return Ok(());
-                            }
-                            apply_sidebar_server_message(&mut app, message);
-                            dirty = true;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                }
-            }
-            frame = read_protocol_frame(&mut reader) => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(err) if err.message == "client closed" => return Ok(()),
-                    Err(err) => return Err(err),
-                };
-                match decode_shim_message(&frame)
-                    .map_err(|err| ServerError::new(format!("invalid shim frame: {err}")))? {
-                    ShimToServer::Hello(_) => {}
-                    ShimToServer::Close => return Ok(()),
-                    ShimToServer::Resize { width: next_width, height: next_height } => {
-                        let should_report_resize = next_width != width
-                            && state_source.as_ref().is_some_and(|state_source| {
-                                state_source.should_report_sidebar_resize(&context)
-                            });
-                        debug_log(format!(
-                            "shim-resize: pane={:?} session={:?} window={:?} old={}x{} new={}x{} should_report_width={should_report_resize}",
-                            context.pane_id,
-                            context.session_name,
-                            context.window_id,
-                            width,
-                            height,
-                            next_width,
-                            next_height,
-                        ));
-                        if should_report_resize {
-                            let command = serde_json::json!({
-                                "type": "report-width",
-                                "width": next_width,
-                            });
-                            if let Some(payload) = state_source
-                                .as_ref()
-                                .and_then(|state_source| {
-                                    state_source.handle_client_command_with_context(
-                                        &command,
-                                        Some(&context),
-                                    )
-                                })
-                            {
-                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
-                                    apply_sidebar_server_message(&mut app, message);
-                                }
-                                let _ = state_updates.send(payload);
-                            }
-                        }
-                        width = next_width;
-                        height = next_height;
-                        previous_rows = None;
-                        dirty = true;
-                    }
-                    ShimToServer::Mouse(_) => {
-                        // Mouse hit-testing is intentionally server-owned; the protocol carries
-                        // coordinates now so clickable rows and drag resizing can be layered on
-                        // the render model without adding Ratatui to the shim.
-                    }
-                    ShimToServer::Key(key) => {
-                        if let Some(app) = &mut app
-                            && let Some(ui_key) = ui_key_from_shim(key.code, key.modifiers)
-                        {
-                            apply_ui_key(app, ui_key);
-                            if drain_sidebar_commands(
-                                app,
-                                &state_source,
-                                &state_updates,
-                                &mut context,
-                                &shutdown,
-                                &shutdown_announcement,
-                            )? {
-                                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
-                                return Ok(());
-                            }
-                            dirty = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn write_shim_frames(
-    mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut frames_rx: watch::Receiver<Arc<Vec<u8>>>,
-) -> Result<(), ServerError> {
-    loop {
-        if frames_rx.changed().await.is_err() {
-            return Ok(());
-        }
-        let frame = frames_rx.borrow_and_update().clone();
-        if frame.is_empty() {
-            continue;
-        }
-        writer.write_all(&frame).await?;
-    }
-}
-
-async fn read_protocol_frame<R>(reader: &mut R) -> Result<Vec<u8>, ServerError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut len = [0_u8; 4];
-    if let Err(err) = reader.read_exact(&mut len).await {
-        if err.kind() == std::io::ErrorKind::UnexpectedEof {
-            return Err(ServerError::new("client closed"));
-        }
-        return Err(err.into());
-    }
-    let len = u32::from_le_bytes(len) as usize;
-    let mut frame = Vec::with_capacity(4 + len);
-    frame.extend_from_slice(&(len as u32).to_le_bytes());
-    frame.resize(4 + len, 0);
-    reader.read_exact(&mut frame[4..]).await?;
-    Ok(frame)
-}
-
-fn ui_key_from_shim(code: ShimKeyCode, modifiers: ShimKeyModifiers) -> Option<UiKey> {
-    if modifiers.contains(ShimKeyModifiers::ALT) {
-        return match code {
-            ShimKeyCode::Up => Some(UiKey::AltUp),
-            ShimKeyCode::Down => Some(UiKey::AltDown),
-            _ => None,
-        };
-    }
-    if modifiers.contains(ShimKeyModifiers::CONTROL) {
-        return match code {
-            ShimKeyCode::Char('j') => Some(UiKey::CtrlJ),
-            ShimKeyCode::Char('k') => Some(UiKey::CtrlK),
-            _ => None,
-        };
-    }
-
-    match code {
-        ShimKeyCode::Char('j') | ShimKeyCode::Down => Some(UiKey::Down),
-        ShimKeyCode::Char('k') | ShimKeyCode::Up => Some(UiKey::Up),
-        ShimKeyCode::Char(ch) => Some(UiKey::Char(ch)),
-        ShimKeyCode::Tab => Some(UiKey::Tab {
-            shift: modifiers.contains(ShimKeyModifiers::SHIFT),
-        }),
-        ShimKeyCode::Enter => Some(UiKey::Enter),
-        ShimKeyCode::Esc => Some(UiKey::Esc),
-    }
-}
-
-fn drain_sidebar_commands(
-    app: &mut SidebarApp,
-    state_source: &Option<Arc<dyn StateSource>>,
-    state_updates: &broadcast::Sender<String>,
-    context: &mut ClientConnectionContext,
-    shutdown: &broadcast::Sender<()>,
-    shutdown_announcement: &ShutdownAnnouncement,
-) -> Result<bool, ServerError> {
-    for command in app.drain_commands() {
-        if matches!(command, SidebarClientCommand::Quit) {
-            request_shutdown(state_source, state_updates, shutdown, shutdown_announcement);
-            return Ok(true);
-        }
-        let command = serde_json::to_value(command)
-            .map_err(|err| ServerError::new(format!("serialize sidebar command: {err}")))?;
-        if let Some(payload) = state_source.as_ref().and_then(|state_source| {
-            state_source.handle_client_command_with_context(&command, Some(context))
-        }) {
-            if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
-                app.apply_server_message(message);
-            }
-            if !is_client_view_command(&command) {
-                let _ = state_updates.send(payload);
-            }
-        }
-    }
-    Ok(false)
 }
 
 async fn handle_connection(
@@ -3452,28 +3129,33 @@ fn apply_render_key(app: &mut SidebarApp, command: &Value) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let code = match key {
-        "up" => ShimKeyCode::Up,
-        "down" => ShimKeyCode::Down,
-        "tab" => ShimKeyCode::Tab,
-        "enter" => ShimKeyCode::Enter,
-        "esc" => ShimKeyCode::Esc,
-        key if key.chars().count() == 1 => {
-            ShimKeyCode::Char(key.chars().next().expect("single char key must exist"))
+    let ui_key = if alt {
+        match key {
+            "up" => Some(UiKey::AltUp),
+            "down" => Some(UiKey::AltDown),
+            _ => None,
         }
-        _ => return,
+    } else if ctrl {
+        match key {
+            "j" => Some(UiKey::CtrlJ),
+            "k" => Some(UiKey::CtrlK),
+            _ => None,
+        }
+    } else {
+        match key {
+            "up" => Some(UiKey::Up),
+            "down" => Some(UiKey::Down),
+            "tab" => Some(UiKey::Tab { shift }),
+            "enter" => Some(UiKey::Enter),
+            "esc" => Some(UiKey::Esc),
+            key if key.chars().count() == 1 => Some(UiKey::Char(
+                key.chars().next().expect("single char key must exist"),
+            )),
+            _ => None,
+        }
     };
-    let mut modifiers = ShimKeyModifiers::empty();
-    if alt {
-        modifiers = modifiers | ShimKeyModifiers::ALT;
-    }
-    if ctrl {
-        modifiers = modifiers | ShimKeyModifiers::CONTROL;
-    }
-    if shift {
-        modifiers = modifiers | ShimKeyModifiers::SHIFT;
-    }
-    if let Some(key) = ui_key_from_shim(code, modifiers) {
+
+    if let Some(key) = ui_key {
         apply_ui_key(app, key);
     }
 }

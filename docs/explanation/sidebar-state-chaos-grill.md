@@ -33,8 +33,8 @@ Current Rust behavior:
 
 - `q` in the sidebar becomes a `quit` client command.
 - the server broadcasts a `closing…` state, then a `quit` message.
-- websocket and shim clients normally exit after receiving `quit`.
-- the accept loop sleeps briefly, then removes hooks, pid file, and shim socket.
+- websocket clients normally exit after receiving `quit`.
+- the accept loop sleeps briefly, then removes hooks and pid file.
 - this is operationally close to the desired behavior, but it is not yet encoded as a terminal lifecycle in the model.
 
 Current gap:
@@ -48,8 +48,8 @@ Desired behavior:
 - pressing `q` in a connected sidebar requests shutdown of the opensessions server for this tmux-server namespace
 - the server enters `closing…`
 - every attached sidebar client receives `quit`
-- websocket clients and shim clients exit
-- hooks, pid file, and shim socket are cleaned up
+- websocket clients exit
+- hooks and pid file are cleaned up
 - restarting creates a fresh generation
 
 The confusing part is whether a client owns quitting itself or whether the server owns quitting the whole sidebar generation.
@@ -533,7 +533,7 @@ Do not start by patching flicker locally. Start by separating shared and client-
 Smallest useful slice:
 
 1. introduce explicit `ClientId` / `ClientViewState` in the Rust server
-2. make shim/websocket identify establish a client view
+2. make websocket identify establish a client view
 3. derive `currentSession` per client, not globally
 4. keep shared state broadcast separate from client state response
 5. make switch-session update only the requesting client's view immediately

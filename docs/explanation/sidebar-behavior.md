@@ -4,6 +4,8 @@ This document captures the sidebar behaviors that were learned the hard way whil
 
 If you change sidebar spawning, width sync, tmux hook handling, focus/session switching, or the `sidebar-coordinator` state machine, read this first.
 
+For current automated coverage, see [`sidebar-behavior-test-matrix.md`](./sidebar-behavior-test-matrix.md).
+
 ## The Product Contract
 
 The sidebar should behave like a real sidebar, not like an ordinary tmux pane.
@@ -52,8 +54,8 @@ Expected shutdown behavior:
 
 - quit can be requested by a connected sidebar keypress, websocket command, `/quit`, or process shutdown
 - the server marks the sidebar lifecycle as `closing…`
-- the server broadcasts `quit` to websocket and shim clients
-- the server waits briefly for clients to receive the quit frame, then removes hooks, pid file, and shim socket
+- the server broadcasts `quit` to websocket sidebar clients
+- the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
 
 ### Session switching keeps the sidebar in control
@@ -204,7 +206,7 @@ The tmux socket is the namespace boundary.
 Derived configuration must be stable for a given tmux socket and distinct across tmux sockets:
 
 - `server_key` is derived from the tmux socket path unless explicitly overridden in tmux-scoped environment
-- server port, pid file, log file, and shim socket path derive from that key
+- server port, pid file, and log file derive from that key
 - tmux hooks for that tmux server point only to that tmux server's derived server port
 - sidebar clients derive the same endpoint as the server launcher
 - explicit overrides such as `OPENSESSIONS_PORT`, `OPENSESSIONS_HOST`, and `OPENSESSIONS_PID_FILE` should be tmux-scoped, not ambient shell leftovers
@@ -215,7 +217,7 @@ Symptoms of broken per-server wiring:
 - hooks in one tmux server point to another tmux server's port
 - sidebars inside the same tmux server have mixed widths after settle
 - pressing `q` in a connected sidebar does not stop the expected derived server
-- sidebars keep rendering after their server pid file/socket has been removed
+- sidebars keep rendering after their server pid file has been removed
 
 The recovery path is: clear stale tmux-scoped overrides, refresh hooks from the current plugin, restart the derived server for that tmux socket, and respawn visible sidebar panes.
 
@@ -349,7 +351,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - background windows land at the current width without visible proportional flash
 - `warming up…` clears once spawn/restore is complete
 - `adjusting…` appears reliably while global width correction is still happening
-- server shutdown broadcasts `quit` to websocket and shim sidebar clients before cleanup
+- server shutdown broadcasts `quit` to websocket sidebar clients before cleanup
 - control-mode clients cannot steal foreground/current-session authority
 - hooks and sidebar clients point to the derived server for the current tmux socket
 - tmux windows remain in `window-size latest`
@@ -357,11 +359,15 @@ Before shipping any sidebar behavior change, verify all of these.
 
 ## Files To Read Before Changing This Area
 
+- `apps/server-rs/src/lib.rs`
+- `apps/tui-rs/src/main.rs`
+- `apps/tui-rs/tests/tmux_e2e.rs`
+- `packages/runtime-rs/src/sidebar_coordinator.rs`
+- `packages/sidebar-core-rs/src/app.rs`
 - `packages/runtime/src/server/sidebar-coordinator.ts`
 - `packages/runtime/src/server/index.ts`
 - `packages/mux/providers/tmux/src/provider.ts`
 - `packages/mux/tmux-sdk/src/index.ts`
 - `apps/tui/src/index.tsx`
-- `packages/runtime/test/sidebar-coordinator.test.ts`
 
 If a future change violates this doc but seems necessary, update the doc in the same change and explain the new invariant explicitly.

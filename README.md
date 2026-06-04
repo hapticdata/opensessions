@@ -172,14 +172,12 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 - `apps/tui-rs/` — Rust ratatui sidebar client (connects to server over WebSocket)
 - `apps/server-rs/` — Rust server that assembles state from mux providers and agent watchers
-- `apps/sidebar-shim-rs/` — Lightweight shim for sidebar process management
 - `apps/tui/scripts/` — Shell scripts for tmux sidebar launch and session switching
 
 ### Packages
 
 - `packages/runtime-rs/` — Shared Rust runtime: tmux provider, agent watchers, config, tracker, protocol
 - `packages/sidebar-core-rs/` — Core sidebar rendering logic, extractable for snapshot tests
-- `packages/sidebar-protocol-rs/` — Shared protocol types between server and sidebar
 
 ### Integrations
 
