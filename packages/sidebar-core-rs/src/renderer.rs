@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AgentPanelScope, App, DisplaySessionEntry, Modal};
 use crate::generated::protocol::{AgentEvent, AgentStatus, MetadataTone, SessionData};
+use crate::session_display::worktree_group_key;
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -574,11 +575,32 @@ fn build_group_row(
     let hit = HitTarget::Group(key.to_string());
     let focused =
         app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
+    let active_surrogate = collapsed
+        && app
+            .current_session
+            .as_deref()
+            .and_then(|name| app.sessions.iter().find(|session| session.name == name))
+            .and_then(worktree_group_key)
+            .as_deref()
+            == Some(key);
     let flashed = app.active_flash_target() == Some(&hit);
     let bg = (focused || flashed).then_some(palette.surface1);
 
     let mut row = StyledLine::with_bg(bg);
-    row.push("   ", palette.surface2);
+    let marker = if active_surrogate {
+        "▌"
+    } else if focused {
+        "›"
+    } else {
+        " "
+    };
+    let marker_color = if active_surrogate {
+        palette.green
+    } else {
+        palette.lavender
+    };
+    row.push(marker, marker_color);
+    row.push("  ", palette.surface2);
     row.push(if collapsed { "▸" } else { "▾" }, palette.overlay0);
     row.push(" ", palette.white);
     row.push(

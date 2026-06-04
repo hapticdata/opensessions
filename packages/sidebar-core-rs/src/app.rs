@@ -106,6 +106,7 @@ pub struct App {
     session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
     pub pending_switch_session: Option<String>,
+    group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
     pub fixture_name: Option<&'static str>,
     terminal_width: Option<u16>,
@@ -147,6 +148,7 @@ impl App {
             session_scroll_follows_focus: true,
             resize_drag_state: None,
             pending_switch_session: None,
+            group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             fixture_name: None,
             terminal_width: None,
@@ -214,10 +216,10 @@ impl App {
             self.pending_switch_session = None;
         }
         if update_focus {
-            self.set_focus_if_changed(
-                self.visible_focus_for_session(&session_name)
-                    .unwrap_or_else(|| SidebarFocus::Session(session_name)),
-            );
+            let focus = self
+                .visible_focus_for_session(&session_name)
+                .unwrap_or_else(|| SidebarFocus::Session(session_name.clone()));
+            self.set_focus_for_session_if_changed(&session_name, focus);
         }
     }
 
@@ -230,7 +232,6 @@ impl App {
             ServerMessage::State(state) => {
                 let previous_focus = self.sidebar_focus.clone();
                 let server_current = state.current_session.clone();
-                let server_focused = state.focused_session.clone();
                 self.sessions = state.sessions;
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
@@ -239,20 +240,18 @@ impl App {
                 self.session_filter = state.session_filter.unwrap_or_default();
                 self.collapsed_worktree_groups =
                     state.collapsed_worktree_groups.into_iter().collect();
+                self.clear_missing_pending_switch();
+                self.rehome_expanded_group_surrogate();
                 let focus_still_exists = previous_focus
                     .as_ref()
                     .is_some_and(|focus| self.focus_exists(focus));
                 if !focus_still_exists {
-                    self.rehome_focus_to_local_session();
+                    self.rehome_missing_focus();
                 }
                 self.clear_background_pending_switch(server_current.as_deref());
-                self.clear_background_pending_switch(server_focused.as_deref());
                 self.clamp_session_scroll_offset(0);
             }
-            ServerMessage::Focus(update) => {
-                self.clear_background_pending_switch(update.current_session.as_deref());
-                self.clear_background_pending_switch(update.focused_session.as_deref());
-            }
+            ServerMessage::Focus(_) => {}
             ServerMessage::YourSession { name, .. } => {
                 self.confirm_local_session(name, true);
             }
@@ -300,6 +299,7 @@ impl App {
             session_scroll_follows_focus: true,
             resize_drag_state: None,
             pending_switch_session: None,
+            group_focus_surrogate_for: None,
             collapsed_worktree_groups: HashSet::new(),
             fixture_name: fixture_static_name(name),
             terminal_width: None,
@@ -361,15 +361,27 @@ impl App {
     }
 
     pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
+        self.group_focus_surrogate_for = None;
         self.sidebar_focus = Some(focus);
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
         self.session_scroll_follows_focus = true;
     }
 
-    fn set_focus_if_changed(&mut self, focus: SidebarFocus) {
-        if self.sidebar_focus.as_ref() != Some(&focus) {
-            self.set_sidebar_focus(focus);
+    fn set_sidebar_focus_for_session(&mut self, session_name: &str, focus: SidebarFocus) {
+        self.group_focus_surrogate_for =
+            matches!(focus, SidebarFocus::WorktreeGroup(_)).then(|| session_name.to_string());
+        self.sidebar_focus = Some(focus);
+        self.panel_focus = PanelFocus::Sessions;
+        self.focused_agent_idx = 0;
+        self.session_scroll_follows_focus = true;
+    }
+
+    fn set_focus_for_session_if_changed(&mut self, session_name: &str, focus: SidebarFocus) {
+        if self.sidebar_focus.as_ref() != Some(&focus)
+            || self.group_focus_surrogate_for.as_deref() != Some(session_name)
+        {
+            self.set_sidebar_focus_for_session(session_name, focus);
         }
     }
 
@@ -769,7 +781,13 @@ impl App {
 
     fn request_session_switch(&mut self, name: String, debounce: bool, preserve_focus: bool) {
         self.pending_switch_session = Some(name.clone());
-        if !preserve_focus {
+        if preserve_focus {
+            if let Some(focus) = self.visible_focus_for_session(&name) {
+                self.set_focus_for_session_if_changed(&name, focus);
+            }
+        } else if let Some(focus) = self.visible_focus_for_session(&name) {
+            self.set_focus_for_session_if_changed(&name, focus);
+        } else {
             self.rehome_focus_to_local_session();
         }
         self.commands.push(ClientCommand::SwitchSession {
@@ -780,8 +798,12 @@ impl App {
     }
 
     fn rehome_focus_to_local_session(&mut self) {
-        if let Some(focus) = self.local_session_focus() {
-            self.set_focus_if_changed(focus);
+        if let Some(name) = self.confirmed_local_session_name().map(str::to_string)
+            && let Some(focus) = self
+                .visible_focus_for_session(&name)
+                .or_else(|| Some(SidebarFocus::Session(name.clone())))
+        {
+            self.set_focus_for_session_if_changed(&name, focus);
         } else if self
             .sidebar_focus
             .as_ref()
@@ -790,6 +812,29 @@ impl App {
             self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
             self.session_scroll_follows_focus = true;
         }
+    }
+
+    fn rehome_missing_focus(&mut self) {
+        if let Some(pending) = self.pending_switch_session.clone()
+            && let Some(focus) = self.visible_focus_for_session(&pending)
+        {
+            self.set_focus_for_session_if_changed(&pending, focus);
+            return;
+        }
+        self.rehome_focus_to_local_session();
+    }
+
+    fn rehome_expanded_group_surrogate(&mut self) {
+        let Some(session_name) = self.group_focus_surrogate_for.clone() else {
+            return;
+        };
+        let Some(SidebarFocus::Session(_)) = self.visible_focus_for_session(&session_name) else {
+            return;
+        };
+        self.set_sidebar_focus_for_session(
+            &session_name,
+            SidebarFocus::Session(session_name.clone()),
+        );
     }
 
     fn clear_background_pending_switch(&mut self, broadcast_session: Option<&str>) {
@@ -804,6 +849,16 @@ impl App {
         }
         self.pending_switch_session = None;
         self.rehome_focus_to_local_session();
+    }
+
+    fn clear_missing_pending_switch(&mut self) {
+        let Some(pending) = self.pending_switch_session.as_deref() else {
+            return;
+        };
+        if self.sessions.iter().any(|session| session.name == pending) {
+            return;
+        }
+        self.pending_switch_session = None;
     }
 
     fn confirmed_local_session_name(&self) -> Option<&str> {
@@ -843,12 +898,7 @@ impl App {
     fn session_focus_targets(&self) -> Vec<SidebarFocus> {
         self.display_session_entries()
             .into_iter()
-            .filter_map(|entry| match entry {
-                DisplaySessionEntry::Session { session, .. } => {
-                    Some(SidebarFocus::Session(session.name.clone()))
-                }
-                DisplaySessionEntry::Group { .. } => None,
-            })
+            .map(|entry| entry_focus(&entry))
             .collect()
     }
 

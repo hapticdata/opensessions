@@ -69,8 +69,12 @@ fn tab_switch_queues_next_visible_session_without_changing_confirmed_current_ses
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(
         app.focused_session_name(),
-        Some("opensessions"),
-        "tab sends a switch request but snaps the local cursor back to the confirmed active session",
+        Some("plane-pdf-word-formatting"),
+        "tab sends immediate switch intent and shows the concrete pending target while the active row stays on the confirmed session",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-pdf-word-formatting")
     );
     assert_eq!(app.panel_focus, PanelFocus::Sessions);
     assert_eq!(
@@ -98,9 +102,10 @@ fn session_switch_request_does_not_make_target_the_confirmed_active_session() {
     );
     assert_eq!(
         app.focused_session_name(),
-        Some("opensessions"),
-        "the click target may flash, but the keyboard cursor snaps back to the confirmed active session",
+        Some("learning"),
+        "a concrete session switch request should make the target row the pending focus while the active row stays on the confirmed session",
     );
+    assert_eq!(app.pending_switch_session.as_deref(), Some("learning"));
     assert_eq!(
         app.drain_commands(),
         vec![ClientCommand::SwitchSession {
@@ -195,7 +200,7 @@ fn navigation_keys_move_temporary_session_selection_without_switching() {
 }
 
 #[test]
-fn keyboard_navigation_skips_worktree_group_headers() {
+fn keyboard_navigation_can_focus_worktree_group_headers_and_enter_toggles_them() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     let first = app
         .sessions
@@ -218,12 +223,22 @@ fn keyboard_navigation_skips_worktree_group_headers() {
     app.set_focused_session("plane-feat-edit-pages-from-pi");
     app.move_focus(-1);
 
-    assert_eq!(app.focused_group_key(), None);
     assert_eq!(
-        app.focused_session_name(),
-        Some("plane-feat-edit-pages-from-pi")
+        app.focused_group_key(),
+        Some(group_key),
+        "keyboard navigation should be able to land on a worktree group header so Enter can collapse it",
     );
+    assert_eq!(app.focused_session_name(), None);
     assert_eq!(app.drain_commands(), Vec::<ClientCommand>::new());
+
+    app.activate_focused_item();
+
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::ToggleWorktreeGroup {
+            key: group_key.into(),
+        }]
+    );
 
     app.apply_server_message(ServerMessage::State(ServerState {
         sessions: app.sessions.clone(),
@@ -588,7 +603,7 @@ fn enter_switches_temporary_selection_then_rehomes_focus_to_active_session() {
 }
 
 #[test]
-fn background_source_sidebar_clears_pending_switch_after_focus_broadcast_confirms_target() {
+fn background_source_sidebar_keeps_pending_on_focus_echo_then_clears_on_state_settle() {
     let mut app = App::reference_fixture("pane-attached-session-list");
     app.current_session = Some("opensessions".into());
     app.my_session = Some("opensessions".into());
@@ -612,11 +627,287 @@ fn background_source_sidebar_clears_pending_switch_after_focus_broadcast_confirm
 
     assert_eq!(
         app.focused_session_name(),
+        Some("plane-pdf-word-formatting"),
+        "Focus is a fast intent echo and may arrive before tmux visibly switches; it must not clear pending or cause a snap-back frame",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-pdf-word-formatting".into()),
+        current_session: Some("plane-pdf-word-formatting".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 6,
+    }));
+
+    assert_eq!(
+        app.focused_session_name(),
         Some("opensessions"),
-        "the source sidebar is now background; it must not keep stale pending focus when revisited",
+        "the settled state snapshot can clean up the old source sidebar after the switch has moved the client away",
     );
     assert_eq!(app.current_session.as_deref(), Some("opensessions"));
     assert_eq!(app.pending_switch_session, None);
+}
+
+#[test]
+fn state_focused_echo_without_current_settle_does_not_clear_pending_switch() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("plane-pdf-word-formatting");
+
+    app.activate_focused_session();
+    let _ = app.drain_commands();
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-pdf-word-formatting".into()),
+        current_session: Some("opensessions".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 7,
+    }));
+
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-pdf-word-formatting"),
+        "focused_session inside State is still a shared focus echo; only current_session settling may clear local pending switch state",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-pdf-word-formatting")
+    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
+}
+
+#[test]
+fn missing_pending_session_is_cleared_before_focus_rehome() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("plane-pdf-word-formatting");
+    app.activate_focused_session();
+    let _ = app.drain_commands();
+
+    let sessions = app
+        .sessions
+        .iter()
+        .filter(|session| session.name != "plane-pdf-word-formatting")
+        .cloned()
+        .collect();
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions,
+        focused_session: Some("plane-pdf-word-formatting".into()),
+        current_session: Some("opensessions".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 8,
+    }));
+
+    assert_eq!(app.pending_switch_session, None);
+    assert_eq!(app.focused_session_name(), Some("opensessions"));
+}
+
+#[test]
+fn pending_worktree_child_uses_visible_group_surrogate_when_state_collapses_group() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    for (name, dir) in [
+        (
+            "plane-feat-edit-pages-from-pi",
+            "/Users/me/work/plane-ee-wt/feat-databases",
+        ),
+        (
+            "plane-feat-background-exports",
+            "/Users/me/work/plane-ee-wt/preview",
+        ),
+    ] {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.name == name)
+            .unwrap();
+        session.dir = dir.into();
+        session.is_worktree = true;
+    }
+    let group_key = "/Users/me/work/plane-ee-wt";
+    app.current_session = Some("opensessions".into());
+    app.my_session = Some("opensessions".into());
+    app.set_focused_session("plane-feat-edit-pages-from-pi");
+
+    app.activate_focused_session();
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-feat-edit-pages-from-pi")
+    );
+    let _ = app.drain_commands();
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("opensessions".into()),
+        current_session: Some("opensessions".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: vec![group_key.into()],
+        ts: 3,
+    }));
+
+    assert_eq!(
+        app.focused_group_key(),
+        Some(group_key),
+        "when a pending worktree child is hidden by collapse, focus should move to its visible group surrogate instead of snapping to the old active session",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-feat-edit-pages-from-pi")
+    );
+    assert_eq!(app.current_session.as_deref(), Some("opensessions"));
+}
+
+#[test]
+fn clicking_expanded_worktree_child_replaces_group_focus_with_concrete_session_focus() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    for (name, dir) in [
+        (
+            "plane-feat-edit-pages-from-pi",
+            "/Users/me/work/plane-ee-wt/feat-databases",
+        ),
+        (
+            "plane-feat-background-exports",
+            "/Users/me/work/plane-ee-wt/preview",
+        ),
+    ] {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.name == name)
+            .unwrap();
+        session.dir = dir.into();
+        session.is_worktree = true;
+    }
+    let group_key = "/Users/me/work/plane-ee-wt";
+    app.current_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.my_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.set_sidebar_focus(opensessions_sidebar::app::SidebarFocus::WorktreeGroup(
+        group_key.into(),
+    ));
+
+    app.click_session("plane-feat-background-exports".into());
+
+    assert_eq!(app.focused_group_key(), None);
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-feat-background-exports"),
+        "once the user chooses a concrete session inside an expanded worktree group, the group header is no longer the pending focus",
+    );
+    assert_eq!(
+        app.pending_switch_session.as_deref(),
+        Some("plane-feat-background-exports")
+    );
+    assert_eq!(
+        app.drain_commands(),
+        vec![ClientCommand::SwitchSession {
+            name: "plane-feat-background-exports".into(),
+            client_tty: None,
+            debounce: None,
+        }]
+    );
+
+    app.apply_server_message(ServerMessage::YourSession {
+        name: "plane-feat-background-exports".into(),
+        client_tty: Some("/dev/ttys003".into()),
+    });
+
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-feat-background-exports")
+    );
+    assert_eq!(app.focused_group_key(), None);
+    assert_eq!(app.pending_switch_session, None);
+}
+
+#[test]
+fn expanded_worktree_group_surrogate_rehomes_to_concrete_active_child() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    for (name, dir) in [
+        (
+            "plane-feat-edit-pages-from-pi",
+            "/Users/me/work/plane-ee-wt/feat-databases",
+        ),
+        (
+            "plane-feat-background-exports",
+            "/Users/me/work/plane-ee-wt/preview",
+        ),
+    ] {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.name == name)
+            .unwrap();
+        session.dir = dir.into();
+        session.is_worktree = true;
+    }
+    let group_key = "/Users/me/work/plane-ee-wt";
+    app.current_session = Some("plane-feat-background-exports".into());
+    app.my_session = Some("plane-feat-background-exports".into());
+    app.set_focused_session("plane-feat-background-exports");
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-feat-background-exports".into()),
+        current_session: Some("plane-feat-background-exports".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: vec![group_key.into()],
+        ts: 4,
+    }));
+
+    assert_eq!(
+        app.focused_group_key(),
+        Some(group_key),
+        "collapsed group is a surrogate for the active hidden child",
+    );
+
+    app.apply_server_message(ServerMessage::State(ServerState {
+        sessions: app.sessions.clone(),
+        focused_session: Some("plane-feat-background-exports".into()),
+        current_session: Some("plane-feat-background-exports".into()),
+        theme: app.theme.clone(),
+        session_filter: Some(app.session_filter),
+        sidebar_width: 26,
+        initializing: false,
+        init_label: None,
+        collapsed_worktree_groups: Vec::new(),
+        ts: 5,
+    }));
+
+    assert_eq!(app.focused_group_key(), None);
+    assert_eq!(
+        app.focused_session_name(),
+        Some("plane-feat-background-exports"),
+        "when the group expands, surrogate group focus must resolve to the concrete active child row",
+    );
 }
 
 #[test]

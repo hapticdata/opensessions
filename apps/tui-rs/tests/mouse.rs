@@ -124,9 +124,10 @@ fn click_on_session_row_queues_switch_without_changing_confirmed_active_session(
 
     assert_eq!(
         app.focused_session_name(),
-        Some("opensessions"),
-        "mouse clicks request a switch and flash the target, but the keyboard cursor stays on the confirmed active session",
+        Some("learning"),
+        "mouse clicks request a switch and make the clicked session the pending concrete focus target",
     );
+    assert_eq!(app.pending_switch_session.as_deref(), Some("learning"));
     assert_eq!(
         app.current_session.as_deref(),
         Some("opensessions"),

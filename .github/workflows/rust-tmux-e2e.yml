@@ -1,0 +1,29 @@
+name: Rust tmux E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tmux-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 tmux
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries used by tmux E2E
+        run: cargo build --bins
+
+      - name: Run tmux sidebar E2E
+        run: OPENSESSIONS_TMUX_E2E=1 cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture

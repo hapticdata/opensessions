@@ -47,6 +47,53 @@ fn temporary_session_focus_uses_weaker_marker_than_active_session() {
 }
 
 #[test]
+fn collapsed_worktree_group_uses_active_marker_when_it_represents_current_session() {
+    let mut app = App::reference_fixture("pane-attached-session-list");
+    for (name, dir) in [
+        (
+            "plane-feat-edit-pages-from-pi",
+            "/Users/me/work/plane-ee-wt/feat-databases",
+        ),
+        (
+            "plane-feat-background-exports",
+            "/Users/me/work/plane-ee-wt/preview",
+        ),
+    ] {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.name == name)
+            .expect("fixture worktree session should exist");
+        session.dir = dir.into();
+        session.is_worktree = true;
+    }
+    app.current_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.my_session = Some("plane-feat-edit-pages-from-pi".into());
+    app.apply_server_message(
+        opensessions_sidebar::generated::protocol::ServerMessage::State(
+            opensessions_sidebar::generated::protocol::ServerState {
+                sessions: app.sessions.clone(),
+                focused_session: Some("plane-feat-edit-pages-from-pi".into()),
+                current_session: Some("plane-feat-edit-pages-from-pi".into()),
+                theme: app.theme.clone(),
+                session_filter: Some(app.session_filter),
+                sidebar_width: 26,
+                initializing: false,
+                init_label: None,
+                collapsed_worktree_groups: vec!["/Users/me/work/plane-ee-wt".into()],
+                ts: 1,
+            },
+        ),
+    );
+
+    let buffer = render_to_buffer(&mut app, 35, 56);
+    let group_row = row_containing(&buffer, 35, 56, "plane-ee-wt")
+        .expect("collapsed worktree group row should be visible");
+
+    assert_eq!(buffer_symbol_at(&buffer, 0, group_row), "▌");
+}
+
+#[test]
 fn focused_agent_row_uses_highlight_background() {
     let mut app = App::reference_fixture("pane-opensessions-self");
     app.focus_agents_panel();
