@@ -749,6 +749,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let is_current_sidebar_pane = context.pane_id.as_deref().is_some_and(|pane_id| {
                     provider.list_sidebar_panes(None).into_iter().any(|pane| {
                         pane.pane_id == pane_id
+                            && context.session_name.as_deref() == Some(pane.session_name.as_str())
                             && context.window_id.as_deref() == Some(pane.window_id.as_str())
                     })
                 });
@@ -769,12 +770,16 @@ impl StateSource for ReadOnlyMuxStateSource {
                         session: context.session_name.clone(),
                         window_id: context.window_id.clone(),
                         is_active_session,
-                        is_foreground_client: is_active_session
-                            && is_current_window
-                            && is_current_sidebar_pane,
+                        // A resize event belongs to the identified sidebar pane
+                        // that emitted it. Do not require that pane's window to
+                        // still be tmux's current window by the time the server
+                        // handles the message: users can resize, then switch
+                        // windows before this branch runs. The coordinator's
+                        // UserDrag lock rejects later stale layout sampling.
+                        is_foreground_client: is_active_session && is_current_sidebar_pane,
                         is_current_window,
                         now: (self.now_ms)(),
-                        suppress_ms: 500,
+                        suppress_ms: WIDTH_FANOUT_DEBOUNCE_MS + COALESCED_OP_TICK_MS,
                     },
                 );
                 debug_log(format!(
@@ -1402,7 +1407,7 @@ impl ReadOnlyMuxStateSource {
                     is_foreground_client: is_active_session && is_current_window,
                     is_current_window,
                     now,
-                    suppress_ms: 500,
+                    suppress_ms: WIDTH_FANOUT_DEBOUNCE_MS + COALESCED_OP_TICK_MS,
                 },
             );
             debug_log(format!(

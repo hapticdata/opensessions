@@ -224,6 +224,38 @@ fn tmux_sidebar_resize_immediately_before_switch_survives_handoff() {
 }
 
 #[test]
+fn tmux_sidebar_resize_then_immediate_window_switch_keeps_new_width_authority() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-resize-window-switch");
+    let source_window = lab.current_window_index("opensessions");
+    let alt_window = lab.spawn_window_with_sidebar("opensessions", "alt");
+    let source = lab.sidebar_pane_in_window("opensessions", &source_window);
+    let stale = lab.sidebar_pane_in_window("opensessions", &alt_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{source_window}").as_str(),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_all_sidebar_widths(36);
+    sleep(Duration::from_millis(1500));
+
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
+    lab.tmux_ok([
+        "select-window",
+        "-t",
+        format!("opensessions:{alt_window}").as_str(),
+    ]);
+    lab.tmux_ok(["select-pane", "-t", stale.as_str()]);
+
+    lab.wait_for_capture_pane(&stale, |text| text.contains("adjusting…"));
+    lab.wait_for_all_sidebar_widths(42);
+    sleep(Duration::from_millis(900));
+    lab.wait_for_all_sidebar_widths(42);
+}
+
+#[test]
 fn tmux_sidebar_single_resize_immediately_before_switch_is_adopted() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-single-resize-switch");
@@ -560,6 +592,60 @@ time.sleep(300)
         sleep(Duration::from_millis(1200));
     }
 
+    fn spawn_window_with_sidebar(&self, session: &str, window_name: &str) -> String {
+        self.tmux_ok([
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:90"),
+            "-n",
+            window_name,
+            "sh",
+        ]);
+        let window_index = self.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{session}:{window_name}"),
+            "#{window_index}",
+        ]);
+        let sidebar = self.sidebar_bin();
+        let command = format!(
+            "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
+            self.port,
+            shell_quote(&self.root.join("debug.log").to_string_lossy()),
+            sidebar.display(),
+            shell_quote(
+                &self
+                    .root
+                    .join(format!("sidebar-{session}-{window_name}.stderr.log"))
+                    .to_string_lossy()
+            ),
+        );
+        let pane = self.tmux([
+            "split-window",
+            "-h",
+            "-b",
+            "-l",
+            W,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &format!("{session}:{window_index}"),
+            &command,
+        ]);
+        self.tmux_ok([
+            "select-pane",
+            "-t",
+            pane.as_str(),
+            "-T",
+            "opensessions-sidebar",
+        ]);
+        self.wait_for_capture_pane(&pane, |text| text.contains("opensessions"));
+        window_index
+    }
+
     fn wait_for_text(&self, session: &str, text: &str) {
         self.wait_for_capture(session, |capture| capture.contains(text));
     }
@@ -682,7 +768,7 @@ time.sleep(300)
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             let panes = self.sidebar_panes();
-            if panes.len() == SIDEBAR_SESSIONS.len()
+            if panes.len() >= SIDEBAR_SESSIONS.len()
                 && panes.iter().all(|pane| pane.width == expected)
             {
                 return;
@@ -764,6 +850,31 @@ time.sleep(300)
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+    }
+
+    fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
+        let output = self.tmux([
+            "list-panes",
+            "-t",
+            &format!("{session}:{window}"),
+            "-F",
+            "#{pane_id} #{pane_current_command}",
+        ]);
+        output
+            .lines()
+            .find_map(|line| {
+                let (pane, command) = line.split_once(' ')?;
+                command
+                    .starts_with("opensessions")
+                    .then(|| pane.to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!("no sidebar pane found for {session}:{window}; panes:\n{output}")
+            })
+    }
+
+    fn current_window_index(&self, session: &str) -> String {
+        self.tmux(["display-message", "-p", "-t", session, "#{window_index}"])
     }
 
     fn main_pane(&self, session: &str) -> String {
