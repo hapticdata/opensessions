@@ -95,7 +95,7 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 }
 
 #[test]
-fn tmux_sidebar_width_resize_fans_out_to_every_session_sidebar() {
+fn tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-width");
     let source = lab.sidebar_pane("opensessions");
@@ -104,14 +104,13 @@ fn tmux_sidebar_width_resize_fans_out_to_every_session_sidebar() {
     lab.wait_for_all_sidebar_widths(36);
     sleep(Duration::from_millis(1500));
 
-    // First resize initializes the TUI's last-observed terminal width. The
-    // second resize is the product behavior: the active sidebar reports the
-    // user-owned width and the server fans it out to every other session.
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "40"]);
     sleep(Duration::from_millis(250));
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
+    sleep(Duration::from_millis(250));
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "1"]);
 
-    lab.wait_for_all_sidebar_widths(42);
+    lab.wait_for_all_sidebar_widths(36);
 }
 
 #[test]
@@ -159,7 +158,7 @@ fn tmux_sidebar_state_is_isolated_per_tmux_socket() {
     sleep(Duration::from_millis(250));
     lab_a.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
 
-    lab_a.wait_for_all_sidebar_widths(42);
+    lab_a.wait_for_all_sidebar_widths(36);
     lab_b.wait_for_all_sidebar_widths(36);
     assert_ne!(
         lab_a.port, lab_b.port,
@@ -203,125 +202,81 @@ fn tmux_sidebar_pane_exit_does_not_steal_sidebar_width() {
 }
 
 #[test]
-fn tmux_sidebar_resize_immediately_before_switch_survives_handoff() {
+fn tmux_sidebar_width_survives_flat_three_pane_layout_churn() {
     let _guard = e2e_serial_guard();
-    let lab = started_lab("opensessions-e2e-resize-switch");
-    let source = lab.sidebar_pane("opensessions");
+    let lab = started_lab("opensessions-e2e-flat-pane-churn");
+    let sidebar = lab.sidebar_pane("opensessions");
+    let main = lab.main_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
     lab.wait_for_all_sidebar_widths(36);
-    sleep(Duration::from_millis(1500));
 
-    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "40"]);
-    sleep(Duration::from_millis(120));
-    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
+    lab.tmux_ok(["split-window", "-h", "-t", main.as_str(), "sh"]);
+    lab.wait_for_non_sidebar_pane_count("opensessions", 2);
+    lab.tmux_ok(["select-layout", "-t", "opensessions", "even-horizontal"]);
+    lab.wait_for_sidebar_width("opensessions", 36);
 
-    lab.wait_for_client_to_leave_session("opensessions");
-    let destination = lab.current_client_session();
-    lab.wait_for_capture(&destination, |text| text.contains("adjusting…"));
-    lab.wait_for_all_sidebar_widths(42);
+    let content_panes = lab.non_sidebar_panes("opensessions");
+    assert_eq!(
+        content_panes.len(),
+        2,
+        "expected sidebar | pane1 | pane2 before churn; got {content_panes:?}"
+    );
+    lab.tmux_ok(["kill-pane", "-t", content_panes[0].as_str()]);
+    let immediate_width = lab.sidebar_width("opensessions");
+    assert_eq!(
+        immediate_width,
+        Some(36),
+        "sidebar width changed immediately after killing pane1 in `sidebar | pane1 | pane2`; panes={:?}\nwidth_option={}\nhooks:\n{}\nlogs:\n{}",
+        lab.sidebar_panes(),
+        lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
+        lab.tmux(["show-hooks", "-g"]),
+        lab.logs(),
+    );
+
+    lab.wait_for_non_sidebar_pane_count("opensessions", 1);
+    lab.wait_for_sidebar_width("opensessions", 36);
+    lab.wait_for_all_sidebar_widths(36);
 }
 
 #[test]
-fn tmux_sidebar_resize_then_immediate_window_switch_keeps_new_width_authority() {
+fn tmux_sidebar_client_resize_never_persists_a_smaller_sidebar_width() {
     let _guard = e2e_serial_guard();
-    let lab = started_lab("opensessions-e2e-resize-window-switch");
-    let source_window = lab.current_window_index("opensessions");
-    let alt_window = lab.spawn_window_with_sidebar("opensessions", "alt");
-    let source = lab.sidebar_pane_in_window("opensessions", &source_window);
-    let stale = lab.sidebar_pane_in_window("opensessions", &alt_window);
+    let lab = started_lab("opensessions-e2e-client-resize-fixed-width");
+    let sidebar = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok([
-        "select-window",
-        "-t",
-        format!("opensessions:{source_window}").as_str(),
-    ]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
     lab.wait_for_all_sidebar_widths(36);
-    sleep(Duration::from_millis(1500));
 
-    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
     lab.tmux_ok([
-        "select-window",
+        "resize-window",
         "-t",
-        format!("opensessions:{alt_window}").as_str(),
+        "opensessions",
+        "-x",
+        "80",
+        "-y",
+        "40",
     ]);
-    lab.tmux_ok(["select-pane", "-t", stale.as_str()]);
+    sleep(Duration::from_millis(600));
     lab.tmux_ok([
-        "select-window",
+        "resize-window",
         "-t",
-        format!("opensessions:{source_window}").as_str(),
+        "opensessions",
+        "-x",
+        "160",
+        "-y",
+        "40",
     ]);
     lab.tmux_ok([
-        "select-window",
+        "set-window-option",
         "-t",
-        format!("opensessions:{alt_window}").as_str(),
+        "opensessions",
+        "window-size",
+        "latest",
     ]);
-    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
-    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok([
-        "select-window",
-        "-t",
-        format!("opensessions:{alt_window}").as_str(),
-    ]);
-    lab.tmux_ok(["select-pane", "-t", stale.as_str()]);
 
-    lab.wait_for_capture_pane(&stale, |text| text.contains("adjusting…"));
-    lab.wait_for_all_sidebar_widths(42);
-    sleep(Duration::from_millis(900));
-    lab.wait_for_all_sidebar_widths(42);
-}
-
-#[test]
-fn tmux_sidebar_competing_resize_during_adjustment_does_not_steal_authority() {
-    let _guard = e2e_serial_guard();
-    let lab = started_lab("opensessions-e2e-competing-resize");
-    let source_window = lab.current_window_index("opensessions");
-    let alt_window = lab.spawn_window_with_sidebar("opensessions", "alt");
-    let source = lab.sidebar_pane_in_window("opensessions", &source_window);
-    let competing = lab.sidebar_pane_in_window("opensessions", &alt_window);
-    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok([
-        "select-window",
-        "-t",
-        format!("opensessions:{source_window}").as_str(),
-    ]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_sidebar_width("opensessions", 36);
     lab.wait_for_all_sidebar_widths(36);
-    sleep(Duration::from_millis(1500));
-
-    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
-    lab.tmux_ok([
-        "select-window",
-        "-t",
-        format!("opensessions:{alt_window}").as_str(),
-    ]);
-    lab.tmux_ok(["select-pane", "-t", competing.as_str()]);
-    lab.wait_for_capture_pane(&competing, |text| text.contains("adjusting…"));
-
-    lab.tmux_ok(["resize-pane", "-t", competing.as_str(), "-x", "44"]);
-
-    lab.wait_for_all_sidebar_widths(42);
-    sleep(Duration::from_millis(900));
-    lab.wait_for_all_sidebar_widths(42);
-}
-
-#[test]
-fn tmux_sidebar_single_resize_immediately_before_switch_is_adopted() {
-    let _guard = e2e_serial_guard();
-    let lab = started_lab("opensessions-e2e-single-resize-switch");
-    let source = lab.sidebar_pane("opensessions");
-    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
-    lab.wait_for_all_sidebar_widths(36);
-    sleep(Duration::from_millis(1500));
-
-    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "42"]);
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
-
-    lab.wait_for_client_to_leave_session("opensessions");
-    lab.wait_for_all_sidebar_widths(42);
 }
 
 #[test]
@@ -366,7 +321,7 @@ fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
 }
 
 #[test]
-fn tmux_sidebar_switch_latency_during_resize_fanout_probe() {
+fn tmux_sidebar_switch_latency_during_width_repair_probe() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("os-e2e-latency");
     for session in SIDEBAR_SESSIONS {
@@ -389,8 +344,7 @@ fn tmux_sidebar_switch_latency_during_resize_fanout_probe() {
     lab.tmux_ok(["select-pane", "-t", resize_source.as_str()]);
     sleep(Duration::from_millis(300));
     lab.tmux_ok(["resize-pane", "-t", resize_source.as_str(), "-x", "42"]);
-    lab.wait_for_capture_pane(&resize_source, |text| text.contains("adjusting…"));
-    sleep(Duration::from_millis(575));
+    lab.wait_for_all_sidebar_widths(36);
     let during_resize = lab.measure_tab_switch("opensessions", &resize_source);
 
     eprintln!(
@@ -402,7 +356,7 @@ fn tmux_sidebar_switch_latency_during_resize_fanout_probe() {
 
     assert!(
         during_resize <= baseline + Duration::from_millis(250),
-        "switch during resize fanout should stay close to baseline; baseline={baseline:?} during_resize={during_resize:?} panes={:?}\nlogs:\n{}",
+        "switch during width repair should stay close to baseline; baseline={baseline:?} during_resize={during_resize:?} panes={:?}\nlogs:\n{}",
         lab.sidebar_panes(),
         lab.logs(),
     );
@@ -878,6 +832,43 @@ time.sleep(300)
         );
     }
 
+    fn wait_for_sidebar_width(&self, session: &str, expected: u16) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if self.sidebar_width(session) == Some(expected) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for {session} sidebar width to be {expected}; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
+    fn wait_for_sidebar_widths_except_pane(&self, expected: u16, excluded_pane: &str) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            let panes = self.sidebar_panes();
+            let checked = panes
+                .iter()
+                .filter(|pane| pane.pane != excluded_pane)
+                .collect::<Vec<_>>();
+            if checked.len() >= SIDEBAR_SESSIONS.len().saturating_sub(1)
+                && checked.iter().all(|pane| pane.width == expected)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for sidebar widths except {excluded_pane} to be {expected}; panes={:?}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
     fn wait_for_sidebar_pane_count(&self, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -896,8 +887,26 @@ time.sleep(300)
     fn measure_tab_switch(&self, from_session: &str, source_pane: &str) -> Duration {
         let started = Instant::now();
         self.tmux_ok(["send-keys", "-t", source_pane, "Tab"]);
-        self.wait_for_client_to_leave_session(from_session);
-        started.elapsed()
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
+            if output
+                .lines()
+                .any(|line| !line.trim().is_empty() && line.trim() != from_session)
+            {
+                return started.elapsed();
+            }
+            sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for client to leave session {from_session}; clients:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
     }
 
     fn wait_for_no_sidebar_processes(&self) {
@@ -995,6 +1004,20 @@ time.sleep(300)
         self.tmux(["display-message", "-p", "-t", session, "#{window_index}"])
     }
 
+    fn pane_window_id(&self, pane: &str) -> String {
+        self.tmux(["display-message", "-p", "-t", pane, "#{window_id}"])
+    }
+
+    fn client_tty(&self) -> String {
+        self.tmux(["list-clients", "-F", "#{client_tty}"])
+            .lines()
+            .find_map(|line| {
+                let tty = line.trim();
+                (!tty.is_empty()).then(|| tty.to_string())
+            })
+            .expect("attached tmux client tty")
+    }
+
     fn next_window_index(&self, session: &str) -> u32 {
         self.tmux(["list-windows", "-t", session, "-F", "#{window_index}"])
             .lines()
@@ -1009,6 +1032,13 @@ time.sleep(300)
             .into_iter()
             .next()
             .unwrap_or_else(|| panic!("no main pane found for {session}"))
+    }
+
+    fn sidebar_width(&self, session: &str) -> Option<u16> {
+        self.sidebar_panes()
+            .into_iter()
+            .find(|pane| pane.session == session)
+            .map(|pane| pane.width)
     }
 
     fn non_sidebar_panes(&self, session: &str) -> Vec<String> {
@@ -1073,7 +1103,8 @@ time.sleep(300)
             .expect("run tmux");
         assert!(
             output.status.success(),
-            "tmux failed: {}",
+            "tmux failed: args={args:?}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }

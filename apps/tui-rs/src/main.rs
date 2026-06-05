@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let mut last_lazydiff_launch: Option<std::time::Instant> = None;
     let mut startup_refocused = false;
     // Render-tick interval: advance the spinner clock and redraw at ~120ms so
-    // the "warming up…" / "adjusting…" / agent-running spinners animate even
+    // the "warming up…" / agent-running spinners animate even
     // when no server state arrives. Mirrors the React render loop in the TS
     // sidebar driven by Date.now() inside Yoga's frame timer.
     let render_epoch = std::time::Instant::now();

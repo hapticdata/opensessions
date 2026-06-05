@@ -23,7 +23,6 @@ pub enum ServerPhase {
 pub struct RunningGeneration {
     pub lifecycle: SidebarLifecycle,
     pub presence: Option<SidebarPresenceReconciliation>,
-    pub resize: Option<ResizeAdjustment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,14 +41,6 @@ pub enum SidebarLifecycle {
     Hidden,
     Warming,
     Ready,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResizeAdjustment {
-    pub owner: ResizeOwner,
-    pub target_width: SidebarWidth,
-    pub pending_targets: BTreeSet<ResizeTarget>,
-    pub acknowledged_targets: BTreeSet<ResizeTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,22 +72,6 @@ pub enum PresenceFailureReason {
     WindowVanished,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SidebarWidth(pub u16);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResizeOwner {
-    pub client_id: ClientId,
-    pub target: ResizeTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ResizeTarget {
-    pub session: String,
-    pub window_id: String,
-    pub pane_id: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClientId(String);
 
@@ -126,15 +101,6 @@ pub enum LifecycleOperation {
     PresenceTargetFailed {
         window_id: String,
         reason: PresenceFailureReason,
-    },
-    BeginResize {
-        owner: ResizeOwner,
-        target_width: SidebarWidth,
-        targets: Vec<ResizeTarget>,
-    },
-    AckResize {
-        target: ResizeTarget,
-        observed_width: SidebarWidth,
     },
     SwitchSession {
         client_id: ClientId,
@@ -179,7 +145,6 @@ pub struct LifecycleSnapshot {
 pub enum SnapshotPhase {
     Hidden,
     Warming,
-    Adjusting,
     Ready,
     Closing,
     Closed,
@@ -197,7 +162,6 @@ impl LifecycleServer {
             phase: ServerPhase::Running(RunningGeneration {
                 lifecycle: SidebarLifecycle::Hidden,
                 presence: None,
-                resize: None,
             }),
             connected_clients: BTreeMap::new(),
         }
@@ -213,12 +177,6 @@ impl LifecycleServer {
 
     pub fn snapshot(&self) -> LifecycleSnapshot {
         match &self.phase {
-            ServerPhase::Running(generation) if generation.resize.is_some() => LifecycleSnapshot {
-                phase: SnapshotPhase::Adjusting,
-                visible: true,
-                initializing: true,
-                init_label: Some("adjusting…"),
-            },
             ServerPhase::Running(generation) if generation.presence.is_some() => {
                 LifecycleSnapshot {
                     phase: SnapshotPhase::Warming,
@@ -368,49 +326,6 @@ impl LifecycleServer {
                 if presence.pending_windows.is_empty() {
                     generation.presence = None;
                     generation.lifecycle = SidebarLifecycle::Ready;
-                    vec![LifecycleEffect::BroadcastState(self.snapshot())]
-                } else {
-                    Vec::new()
-                }
-            }
-            (
-                ServerPhase::Running(generation),
-                LifecycleOperation::BeginResize {
-                    owner,
-                    target_width,
-                    targets,
-                },
-            ) => {
-                if generation.resize.is_some() {
-                    return Vec::new();
-                }
-                generation.lifecycle = SidebarLifecycle::Ready;
-                let pending_targets = targets.into_iter().collect::<BTreeSet<_>>();
-                generation.resize = Some(ResizeAdjustment {
-                    owner,
-                    target_width,
-                    pending_targets,
-                    acknowledged_targets: BTreeSet::new(),
-                });
-                vec![LifecycleEffect::BroadcastState(self.snapshot())]
-            }
-            (
-                ServerPhase::Running(generation),
-                LifecycleOperation::AckResize {
-                    target,
-                    observed_width,
-                },
-            ) => {
-                let Some(resize) = generation.resize.as_mut() else {
-                    return Vec::new();
-                };
-                if observed_width != resize.target_width || !resize.pending_targets.remove(&target)
-                {
-                    return Vec::new();
-                }
-                resize.acknowledged_targets.insert(target);
-                if resize.pending_targets.is_empty() {
-                    generation.resize = None;
                     vec![LifecycleEffect::BroadcastState(self.snapshot())]
                 } else {
                     Vec::new()

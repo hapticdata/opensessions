@@ -407,7 +407,7 @@ impl App {
     }
 
     pub fn handle_tab(&mut self, shift: bool) {
-        self.switch_to_relative_session(if shift { -1 } else { 1 }, true);
+        self.switch_to_relative_session(if shift { -1 } else { 1 }, false);
     }
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {

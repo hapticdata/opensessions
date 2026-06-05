@@ -20,9 +20,9 @@ _Avoid_: direct coordinator mutation, ad hoc lifecycle flag, local lifecycle pat
 The serialized path through which Lifecycle Operations enter the server-owned state machine. A Lifecycle Channel rejects re-entrant lifecycle submissions while it is delivering effects from the current operation.
 _Avoid_: callback-driven lifecycle mutation, nested lifecycle send
 
-**Resize Adjustment**:
-A Lifecycle Operation transaction that moves sidebar panes in a Server Generation toward one target width. While a Resize Adjustment is active, only its owner can continue authoring width; competing width reports are ignored.
-_Avoid_: resize event, width sync when referring to the transaction, resize race
+**Fixed Sidebar Width**:
+The configured sidebar width for one Server Generation. Observed tmux pane widths are drift signals only; they never author a new width. Every opensessions sidebar pane should be repaired back to the Fixed Sidebar Width.
+_Avoid_: resize transaction, user-authored width, global width adoption
 
 **Sidebar Presence Reconciliation**:
 A Lifecycle Operation transaction that ensures every eligible tmux window in a Server Generation has exactly one opensessions sidebar. Eligible windows are unique non-stash tmux windows, deduplicated by tmux `window_id` so linked sessions do not create duplicate sidebars; targets are spawned one at a time in a staggered order that starts with the origin session.

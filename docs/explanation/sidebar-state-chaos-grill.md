@@ -8,7 +8,7 @@ Read this alongside [`sidebar-behavior.md`](./sidebar-behavior.md). That file ca
 
 The core problem is not one bad resize handler or one bad focus event. The core problem is that several different actors can currently appear to own the same facts:
 
-- sidebar lifecycle: hidden, warming, ready, adjusting, closing
+- sidebar lifecycle: hidden, warming, ready, closing
 - sidebar width
 - whether the sidebar is globally open or closed
 - which session is selected in the sidebar list
@@ -131,7 +131,7 @@ Isolated proof-of-shape:
 - `packages/runtime-rs/tests/lifecycle_operation.rs` simulates connected clients, quit, late sidebar identify, warmup completion, and drain completion.
 - The test proves the key invariant: once `RequestQuit` moves the Server Generation to `Closing`, later lifecycle messages cannot move it back to `Warming` or `Ready`.
 - The test also covers 100 connected clients: `Quit` sends `quit` to every other client, does not send `quit` back to the requesting client, and rejects a re-entrant `Quit` submission through the Lifecycle Channel while effects are being delivered.
-- The same isolated reducer now models Resize Adjustment as a transaction: an active target width cannot be overwritten by a competing resize, stale width acknowledgements are ignored, and `adjusting…` stays active until every target acknowledges the target width.
+- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is config-owned, so the reducer models lifecycle/presence/switch/quit only.
 
 Live red contract:
 
@@ -176,57 +176,42 @@ Spawn pressure rule:
 
 The origin session is the tmux session where the initiating sidebar/client lives. This keeps the user's current area responsive first, then catches up the rest of the Server Generation.
 
-### 2. `adjusting…` is not causally tied to convergence
+### 2. Width adjustment should not be a lifecycle state
 
-Current desired behavior:
+Earlier we thought `adjusting…` should model width convergence: after one sidebar changed width, every other sidebar would acknowledge the target, and stale panes would be rejected until convergence finished.
 
-- after a user resize, `adjusting…` should appear immediately
-- it should stay visible across all sidebars while normalization is still in flight
-- it should disappear only when every managed sidebar pane has reached the target width or the adjustment is explicitly abandoned
-- if window 1/session 2 sets width 36, then window 2/session 3 at stale width 24 must not start a competing adjustment back to 24
+Final decision:
 
-The confusing part is that `adjusting…` is currently timer-ish/authority-ish, but the product meaning is convergence-ish.
+> Delete the width-adjustment concept. Sidebar width is Fixed Sidebar Width: configured per Server Generation and never authored by observed tmux pane width. Width drift is repaired, not modeled as a user-visible lifecycle.
+
+Why this is simpler:
+
+- there is no competing owner, so stale panes cannot steal width authority
+- manual divider drags, full terminal resizes, pane exits, and tmux layout churn all collapse to the same case: repair back to configured width
+- `adjusting…` disappears from product state; only `warming up…` and `closing…` remain user-visible lifecycle labels
 
 Recommended ownership rule:
 
-> Width is owned by a single active resize transaction. Other resize observations are either acknowledgements, stale echoes, or rejected competing proposals.
+> Configuration owns width. Clients and tmux hooks can report drift, but they cannot mutate Fixed Sidebar Width.
 
-Live red contract:
+Live contract:
 
-- `report_width_keeps_adjusting_until_every_sidebar_pane_reaches_target_width` in `apps/server-rs/tests/protocol_shell.rs` pins the convergence rule: `adjusting…` must remain visible while a known sidebar pane is still reporting the old width.
+- `tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize` proves manual/sidebar resize does not persist.
+- `tmux_sidebar_width_survives_flat_three_pane_layout_churn` proves `sidebar | pane1 | pane2`, then killing/exiting `pane1`, leaves sidebar width fixed.
+- `tmux_sidebar_client_resize_never_persists_a_smaller_sidebar_width` proves whole-terminal/client resize does not redefine width.
 
 Rust model shape:
 
 ```rust
-enum WidthAuthority {
-    Idle { width: SidebarWidth },
-    Adjusting(WidthAdjustment),
-}
+struct FixedSidebarWidth(u16);
 
-struct WidthAdjustment {
-    id: AdjustmentId,
-    target_width: SidebarWidth,
-    cause: AdjustmentCause,
-    owner: AdjustmentOwner,
-    pending: PendingTargets,
-    started_at: Instant,
-}
-
-enum AdjustmentCause {
-    UserDrag,
-    ClientResizeSync,
-    ProgrammaticEnsure,
-}
-
-struct AdjustmentOwner {
-    client_id: ClientId,
-    session: SessionName,
-    window_id: WindowId,
-    pane_id: PaneId,
+enum WidthObservation {
+    Matches,
+    Drift { pane_id: PaneId, observed: u16 },
 }
 ```
 
-The key is not just an enum. The key is that `Adjusting` contains the target width and pending target set. If an old pane reports width 24 while adjustment `A` targets 36, that report cannot become a new target. It can only be interpreted relative to `A`.
+The key is not a richer transaction enum. The key is that runtime observations do not own the configured width. If an old pane reports width 24 while the configured width is 36, that report cannot become a new target; it can only trigger repair back to 36.
 
 ### 3. Server-derived vs client-derived state is blurred
 
@@ -235,7 +220,7 @@ Some sidebar state should be global within one tmux server:
 - sidebar open/closed
 - sidebar width
 - session order/filter/theme/collapsed groups
-- lifecycle labels like `warming up…`, `adjusting…`, `closing…`
+- lifecycle labels like `warming up…` and `closing…`
 - agent/session data
 
 Some state is local to one terminal client or one sidebar pane:
@@ -490,13 +475,13 @@ Protocol direction:
 
 Switching session from a sidebar is therefore targeted: the requesting client receives a new Client View State immediately, while other clients keep their own current session and selected row. This prevents flicker caused by a fake global `currentSession` broadcast.
 
-### Decision 5: What ends `adjusting…`?
+### Decision 5: What ends width repair?
 
-Decision: accepted direction.
+Decision: superseded by Fixed Sidebar Width.
 
 Recommended answer:
 
-> A width adjustment ends when every target pane has acknowledged the target width, disappeared from the target set, or timed out into a repairable error state.
+> Width repair ends immediately for a given event when every observed sidebar pane already matches the configured width or has been issued an idempotent resize back to that width. There is no user-visible `adjusting…` state.
 
 Not enough:
 
@@ -506,25 +491,24 @@ Not enough:
 
 Needed data:
 
-- adjustment id
-- target width
-- target pane/window set
-- observed width per target
-- deadline and retry policy
+- configured width
+- sidebar pane identity/title
+- observed pane width
+- hook/backstop evidence if repair fails
 
-### Decision 6: Can a stale pane start a new adjustment?
+### Decision 6: Can a stale pane start a new width target?
 
 Decision: accepted.
 
 Recommended answer:
 
-> No. During an active adjustment, only the adjustment owner can continue a user drag. Other reports are acknowledgements or stale echoes.
+> No. No pane can start a new width target. Stale panes, foreground panes, and background panes all produce drift observations only.
 
 Refinement:
 
-> Competing reports are ignored. They must not queue a future target width and must not overwrite the active Resize Adjustment.
+> Competing reports are repaired to configured width. They must not queue a future target width and must not overwrite Fixed Sidebar Width.
 
-This is the “use Rust ownership” rule: a stale window does not own `WidthAuthority`, so it cannot mutate the target width.
+This is the “use Rust ownership” rule: runtime observations do not own `FixedSidebarWidth`, so they cannot mutate the target width.
 
 ## First implementation direction
 

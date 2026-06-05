@@ -345,11 +345,25 @@ impl TmuxClient {
     }
 
     pub fn set_global_hook(&self, name: &str, command: &str) {
-        self.run(&["set-hook", "-g", name, command]);
+        let output = self.run(&["set-hook", "-g", name, command]);
+        if !output.ok() {
+            eprintln!(
+                "opensessions: failed to install tmux hook {name}: status={} stderr={} command={command}",
+                output.exit_code, output.stderr,
+            );
+        }
     }
 
     pub fn unset_global_hook(&self, name: &str) {
         self.run(&["set-hook", "-gu", name]);
+    }
+
+    pub fn set_global_option(&self, name: &str, value: &str) {
+        self.run(&["set-option", "-gq", name, value]);
+    }
+
+    pub fn unset_global_option(&self, name: &str) {
+        self.run(&["set-option", "-gu", name]);
     }
 }
 
@@ -399,7 +413,6 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
-        self.client.select_sidebar_pane_for_session(name);
     }
 
     fn get_current_session(&self) -> Option<String> {
@@ -441,27 +454,37 @@ impl MuxProvider for TmuxProvider {
 
     fn setup_hooks(&self, server_host: &str, server_port: u16) {
         let base = format!("http://{server_host}:{server_port}");
-        let hook = |path: &str, data: Option<&str>| {
+        let hook = |path: &str, data: Option<&str>, background: bool| {
             let body = data.map(|data| format!(" -d '{data}'")).unwrap_or_default();
+            let background = if background { " -b" } else { "" };
             format!(
-                "run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true\""
+                "run-shell{background} \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true\""
             )
         };
-        let delayed_hook = |path: &str| {
-            format!(
-                "run-shell -b \"sleep 0.2; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path} >/dev/null 2>&1 || true\""
-            )
-        };
+        let repair_sidebar_width = r#"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"#;
 
-        let focus_cmd = hook("/focus", Some("#{client_tty}|#{session_name}|#{window_id}"));
-        let refresh_cmd = hook("/refresh", None);
+        let focus_cmd = hook(
+            "/focus",
+            Some("#{client_tty}|#{session_name}|#{window_id}"),
+            true,
+        );
+        let refresh_cmd = hook("/refresh", None, true);
         let ensure_cmd = hook(
             "/ensure-sidebar",
             Some("#{client_tty}|#{session_name}|#{window_id}"),
+            true,
         );
-        let client_resized_cmd = hook("/client-resized", None);
-        let pane_exited_cmd = hook("/pane-exited", None);
-        let pane_resized_cmd = delayed_hook("/pane-layout-changed");
+        let client_resized_cmd = hook("/client-resized", None, true);
+        // Pane death is the one tmux layout mutation where the sidebar can
+        // visibly inherit a sibling pane's width before the user does anything.
+        // Run this repair hook in the foreground so `kill-pane`/process exit
+        // does not return with a non-sidebar width persisted on the sidebar pane.
+        let pane_exited_cmd = format!(
+            "run-shell \"{repair_sidebar_width}\" ; run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}/pane-exited >/dev/null 2>&1 || true\""
+        );
+        let pane_resized_cmd = format!(
+            "run-shell \"{repair_sidebar_width}\" ; run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}/pane-layout-changed >/dev/null 2>&1 || true\""
+        );
 
         self.client.set_global_hook(
             "client-session-changed",
@@ -495,6 +518,12 @@ impl MuxProvider for TmuxProvider {
         ] {
             self.client.unset_global_hook(hook);
         }
+        self.client.unset_global_option("@opensessions_width");
+    }
+
+    fn set_sidebar_width_hint(&self, width: u16) {
+        self.client
+            .set_global_option("@opensessions_width", &width.to_string());
     }
 
     fn is_window_capable(&self) -> bool {
