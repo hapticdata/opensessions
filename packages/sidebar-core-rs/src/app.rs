@@ -258,7 +258,6 @@ impl App {
                 self.clear_background_pending_switch(server_current.as_deref());
                 self.clamp_session_scroll_offset(0);
             }
-            ServerMessage::Focus(_) => {}
             ServerMessage::YourSession { name, .. } => {
                 self.confirm_local_session(name, true);
             }

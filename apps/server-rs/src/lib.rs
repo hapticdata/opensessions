@@ -59,6 +59,7 @@ const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
+const TMUX_STATE_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
@@ -154,7 +155,9 @@ pub trait StateSource: Send + Sync + 'static {
         None
     }
 
-    fn handle_http_hook(&self, _path: &str, _body: &str) {}
+    fn handle_http_hook(&self, _path: &str, _body: &str) -> Option<String> {
+        None
+    }
 
     fn handle_switch_index(&self, _index: u32, _body: &str) -> Option<String> {
         None
@@ -597,9 +600,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 // into ✓). Mirrors `tracker.handleFocus` in
                 // `packages/runtime/src/server/index.ts:1964`.
                 self.agent_tracker.lock().unwrap().handle_focus(name);
-                Some(format!(
-                    r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
-                ))
+                None
             }
             "switch-index" => {
                 let index = command.get("index")?.as_u64()?.min(u32::MAX as u64) as u32;
@@ -865,13 +866,16 @@ impl StateSource for ReadOnlyMuxStateSource {
         if had_unseen {
             return Some(self.snapshot_json());
         }
-        Some(format_focus_json(Some(&name), Some(&name)))
+        None
     }
 
-    fn handle_http_hook(&self, path: &str, body: &str) {
+    fn handle_http_hook(&self, path: &str, body: &str) -> Option<String> {
         match path {
-            "/toggle" => self.toggle_sidebar(),
-            "/ensure-sidebar" => self.ensure_sidebar(body),
+            "/toggle" => {
+                self.toggle_sidebar();
+                Some(self.snapshot_json())
+            }
+            "/ensure-sidebar" => self.ensure_sidebar(body).then(|| self.snapshot_json()),
             "/pane-exited" => {
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
@@ -879,13 +883,15 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if self.is_sidebar_visible() {
                     self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
+                None
             }
             "/pane-layout-changed" | "/client-resized" => {
                 if self.is_sidebar_visible() {
                     self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -1275,17 +1281,18 @@ impl ReadOnlyMuxStateSource {
         }
     }
 
-    fn ensure_sidebar(&self, body: &str) {
+    fn ensure_sidebar(&self, body: &str) -> bool {
         let context = parse_context(body);
         let width = self.current_sidebar_width_u16();
         if !self.is_sidebar_visible() {
             debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
-            return;
+            return false;
         }
         // A window switch / new window can make tmux proportionally redistribute
         // panes in that window, so repair existing sidebars before spawning any
         // missing ones. This is event-driven, not a per-tick width scan.
         self.enforce_sidebar_width(width);
+        let mut spawned = false;
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
                 continue;
@@ -1320,7 +1327,9 @@ impl ReadOnlyMuxStateSource {
                 SidebarPosition::Left,
                 SIDEBAR_SCRIPTS_DIR,
             );
+            spawned = true;
         }
+        spawned
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
@@ -1331,9 +1340,7 @@ impl ReadOnlyMuxStateSource {
             .and_then(|names| names.get(target_index).cloned())?;
         provider.switch_session(&name, client_tty);
         self.agent_tracker.lock().unwrap().handle_focus(&name);
-        Some(format!(
-            r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
-        ))
+        None
     }
 
     fn session_before(&self, name: &str) -> Option<String> {
@@ -1432,7 +1439,7 @@ async fn run_tmux_state_poll_loop(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut interval = tokio::time::interval(Duration::from_millis(TMUX_STATE_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Seed `last_hash` from the current state so the first tick does not
     // broadcast an unprovoked snapshot. Subsequent broadcasts only happen
@@ -1456,8 +1463,8 @@ async fn run_tmux_state_poll_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
-                // Width is fixed/config-owned. Hooks correct most tmux layout churn
-                // immediately; this slower poll is just a backstop for missed hooks.
+                // Hooks correct tmux layout churn immediately; this slower poll
+                // is only a backstop for missed external tmux changes.
 
                 // Visiting (= becoming the current tmux session) clears the
                 // unseen-agents notification dot for that session, so `●`
@@ -1850,14 +1857,6 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn format_focus_json(focused_session: Option<&str>, current_session: Option<&str>) -> String {
-    format!(
-        r#"{{"type":"focus","focusedSession":{},"currentSession":{}}}"#,
-        json_string_or_null(focused_session),
-        json_string_or_null(current_session),
-    )
-}
-
 fn json_string_or_null(value: Option<&str>) -> String {
     value
         .map(|value| serde_json::to_string(value).expect("string must serialize"))
@@ -2199,8 +2198,9 @@ async fn handle_connection(
     if parsed.method == "POST" && is_ok_hook_path(&parsed.path) {
         let body = String::from_utf8_lossy(http_body(&request));
         if let Some(state_source) = &state_source {
-            state_source.handle_http_hook(&parsed.path, &body);
-            let _ = state_updates.send(state_source.snapshot_json());
+            if let Some(payload) = state_source.handle_http_hook(&parsed.path, &body) {
+                let _ = state_updates.send(payload);
+            }
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")

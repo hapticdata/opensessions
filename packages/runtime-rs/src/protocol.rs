@@ -18,7 +18,6 @@ pub struct ProtocolHello {
 pub enum ServerMessage {
     Hello(ProtocolHello),
     State(ServerState),
-    Focus(FocusUpdate),
     Quit,
     YourSession {
         name: String,
@@ -46,13 +45,6 @@ pub struct ServerState {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub collapsed_worktree_groups: Vec<String>,
     pub ts: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FocusUpdate {
-    pub focused_session: Option<String>,
-    pub current_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

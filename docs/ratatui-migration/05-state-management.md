@@ -174,10 +174,6 @@ impl App {
                 self.init_label = s.init_label.unwrap_or_default();
                 self.connected = true;
             }
-            ServerMessage::Focus(f) => {
-                self.focused_session = f.focused_session;
-                self.current_session = f.current_session;
-            }
             ServerMessage::Quit => self.should_quit = true,
             ServerMessage::YourSession { name, client_tty } => {
                 self.my_session = Some(name);

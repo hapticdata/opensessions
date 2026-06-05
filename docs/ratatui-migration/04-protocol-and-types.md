@@ -53,25 +53,6 @@ pub struct ServerState {
 }
 ```
 
-### `focus`
-
-```ts
-{ type: "focus"; focusedSession: string | null; currentSession: string | null }
-```
-
-```rust
-pub struct FocusUpdate {
-    pub focused_session: Option<String>,
-    pub current_session: Option<String>,
-}
-```
-
-### `resize`
-
-```ts
-{ type: "resize"; width: number }
-```
-
 ### `quit`
 
 ```ts
@@ -102,7 +83,6 @@ Client should re-send an `identify-pane` command.
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
     State(ServerState),
-    Focus(FocusUpdate),
     Quit,
     YourSession { name: String, client_tty: Option<String> },
     ReIdentify,
