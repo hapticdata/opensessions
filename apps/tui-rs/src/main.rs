@@ -276,10 +276,12 @@ async fn main() -> Result<()> {
                             app.my_session,
                             app.current_session,
                         ));
-                        ws.send(Message::text(encode_client_command(
-                            &ClientCommand::RepairWidth,
-                        )?))
-                        .await?;
+                        if width != app.sidebar_width {
+                            ws.send(Message::text(encode_client_command(
+                                &ClientCommand::RepairWidth,
+                            )?))
+                            .await?;
+                        }
                         terminal.draw(app)?;
                     }
                 } else if let Event::Mouse(mouse) = event

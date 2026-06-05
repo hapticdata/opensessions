@@ -659,7 +659,10 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "repair-width" => {
                 if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
+                    let width = self.current_sidebar_width_u16();
+                    if !self.repair_context_sidebar_width(context, width) {
+                        self.enforce_sidebar_width(width);
+                    }
                 }
                 None
             }
@@ -746,7 +749,10 @@ impl StateSource for ReadOnlyMuxStateSource {
             .unwrap()
             .acknowledge_sidebar_connected();
         if self.is_sidebar_visible() {
-            self.enforce_sidebar_width(self.current_sidebar_width_u16());
+            let width = self.current_sidebar_width_u16();
+            if !self.repair_context_sidebar_width(Some(context), width) {
+                self.enforce_sidebar_width(width);
+            }
         }
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
@@ -863,7 +869,6 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn handle_http_hook(&self, path: &str, body: &str) {
-        debug_log(format!("http-hook: path={path}"));
         match path {
             "/toggle" => self.toggle_sidebar(),
             "/ensure-sidebar" => self.ensure_sidebar(body),
@@ -1049,10 +1054,6 @@ impl ReadOnlyMuxStateSource {
             }
             for pane in provider.list_sidebar_panes(None) {
                 if pane.width == Some(width) {
-                    debug_log(format!(
-                        "width-repair: skip pane={} window={} session={} width={:?} reason=already-target target_width={width}",
-                        pane.pane_id, pane.window_id, pane.session_name, pane.width,
-                    ));
                     continue;
                 }
                 pane_ids.push(pane.pane_id);
@@ -1060,6 +1061,23 @@ impl ReadOnlyMuxStateSource {
         }
         pane_ids.reverse();
         pane_ids
+    }
+
+    fn repair_context_sidebar_width(
+        &self,
+        context: Option<&ClientConnectionContext>,
+        width: u16,
+    ) -> bool {
+        let Some(pane_id) = context.and_then(|context| context.pane_id.as_deref()) else {
+            return false;
+        };
+        debug_log(format!(
+            "width-repair: resize context pane={pane_id} to={width}"
+        ));
+        for provider in &self.providers {
+            provider.resize_sidebar_pane(pane_id, width);
+        }
+        true
     }
 
     fn enforce_sidebar_width(&self, width: u16) {

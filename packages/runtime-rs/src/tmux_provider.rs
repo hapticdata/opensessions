@@ -512,7 +512,7 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-kill-pane", &pane_exited_cmd);
         self.client.set_global_hook("pane-exited", &pane_exited_cmd);
         self.client
-            .set_global_hook("after-resize-pane", &pane_layout_changed_cmd);
+            .set_global_hook("after-resize-pane", &repair_sidebar_width_cmd);
         self.client
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
     }
