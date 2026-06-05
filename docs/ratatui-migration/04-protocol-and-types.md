@@ -103,7 +103,6 @@ Client should re-send an `identify-pane` command.
 pub enum ServerMessage {
     State(ServerState),
     Focus(FocusUpdate),
-    Resize { width: u32 },
     Quit,
     YourSession { name: String, client_tty: Option<String> },
     ReIdentify,
@@ -112,7 +111,7 @@ pub enum ServerMessage {
 
 > ⚠ Note: TS uses `"your-session"` and `"re-identify"` (kebab-case). Confirm
 > that `#[serde(rename_all = "kebab-case")]` on the **enum tag** matches.
-> `State` → `state`, `Focus` → `focus`, `Resize` → `resize`, `Quit` → `quit`,
+> `State` → `state`, `Focus` → `focus`, `Quit` → `quit`,
 > `YourSession` → `your-session`, `ReIdentify` → `re-identify`. ✅
 
 ## Nested types
@@ -302,30 +301,27 @@ pub enum SessionFilterMode { All, Active, Running }
 
 ## Client → Server (`ClientCommand`)
 
-All 18 variants:
+All 17 variants:
 
 ```ts
 type ClientCommand =
   | { type: "switch-session"; name: string; clientTty?: string }
-  | { type: "switch-index"; index: number }
   | { type: "new-session" }
   | { type: "hide-session"; name: string }
   | { type: "show-all-sessions" }
   | { type: "kill-session"; name: string }
   | { type: "reorder-session"; name: string; delta: -1 | 1 }
   | { type: "refresh" }
-  | { type: "move-focus"; delta: -1 | 1 }
-  | { type: "focus-session"; name: string }
   | { type: "mark-seen"; name: string }
   | { type: "dismiss-agent"; session: string; agent: string; threadId?: string }
   | { type: "set-theme"; theme: string }
+  | { type: "set-sidebar-width"; width: number }
   | { type: "set-filter"; filter: SessionFilterMode }
-  | { type: "identify"; clientTty: string }
+  | { type: "toggle-worktree-group"; key: string }
   | { type: "quit" }
   | { type: "identify-pane"; paneId: string; sessionName: string; windowId?: string }
-  | { type: "focus-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string }
-  | { type: "kill-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string }
-  | { type: "report-width"; width: number };
+  | { type: "focus-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string; paneId?: string }
+  | { type: "kill-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string; paneId?: string };
 ```
 
 ```rust
@@ -337,15 +333,12 @@ pub enum ClientCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
     },
-    SwitchIndex { index: u32 },
     NewSession,
     HideSession { name: String },
     ShowAllSessions,
     KillSession { name: String },
     ReorderSession { name: String, delta: i8 }, // -1 | 1
     Refresh,
-    MoveFocus { delta: i8 },
-    FocusSession { name: String },
     MarkSeen { name: String },
     DismissAgent {
         session: String,
@@ -354,8 +347,9 @@ pub enum ClientCommand {
         thread_id: Option<String>,
     },
     SetTheme { theme: String },
+    SetSidebarWidth { width: u32 },
     SetFilter { filter: SessionFilterMode },
-    Identify { client_tty: String },
+    ToggleWorktreeGroup { key: String },
     Quit,
     IdentifyPane {
         pane_id: String,
@@ -370,6 +364,8 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
     KillAgentPane {
         session: String,
@@ -378,8 +374,9 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
     },
-    ReportWidth { width: u32 },
 }
 ```
 

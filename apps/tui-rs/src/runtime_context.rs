@@ -1,5 +1,3 @@
-use crate::generated::protocol::ClientCommand;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneIdentity {
     pub pane_id: String,
@@ -55,19 +53,6 @@ where
     })
 }
 
-pub fn should_report_width(local_session: Option<&str>, current_session: Option<&str>) -> bool {
-    let Some(local) = local_session else {
-        return false;
-    };
-    if local == "_os_stash" {
-        return false;
-    }
-    match current_session {
-        Some(current) => current == local,
-        None => true,
-    }
-}
-
 /// Plan describing which tmux pane should receive focus after the sidebar
 /// finishes capability detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,15 +97,4 @@ where
     Some(RefocusPlan {
         select_pane: main_pane.to_string(),
     })
-}
-
-pub fn report_width_command(
-    width: u32,
-    local_session: Option<&str>,
-    current_session: Option<&str>,
-) -> Option<ClientCommand> {
-    if !should_report_width(local_session, current_session) {
-        return None;
-    }
-    Some(ClientCommand::ReportWidth { width })
 }

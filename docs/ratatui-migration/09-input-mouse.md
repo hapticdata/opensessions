@@ -68,7 +68,6 @@ fn on_left_down(&mut self, col: u16, row: u16) {
     match zone {
         ClickZone::SessionRow { name, .. } => {
             self.focused_session = Some(name.clone());
-            self.send(ClientCommand::FocusSession { name });
         }
         ClickZone::OpenDir { dir, only_when_focused, .. } => {
             // Match TS behavior: only open dir when row is focused

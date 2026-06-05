@@ -178,7 +178,6 @@ impl App {
                 self.focused_session = f.focused_session;
                 self.current_session = f.current_session;
             }
-            ServerMessage::Resize { width } => self.sidebar_width = width,
             ServerMessage::Quit => self.should_quit = true,
             ServerMessage::YourSession { name, client_tty } => {
                 self.my_session = Some(name);

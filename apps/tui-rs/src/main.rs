@@ -17,7 +17,7 @@ use opensessions_sidebar::generated::protocol::{ClientCommand, ServerMessage};
 use opensessions_sidebar::input::{UiKey, UiMouse, apply_ui_key, apply_ui_mouse};
 use opensessions_sidebar::renderer::render_app;
 use opensessions_sidebar::runtime_context::{
-    PaneIdentity as RuntimePaneIdentity, pane_identity_resolve, refocus_plan, report_width_command,
+    PaneIdentity as RuntimePaneIdentity, pane_identity_resolve, refocus_plan,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -37,15 +37,16 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
-/// Append a single debug line to the path in `OPENSESSIONS_DEBUG_LOG`
-/// (defaults to `/tmp/opensessions-debug.log`). Mirrors the helper in
-/// `apps/server-rs/src/lib.rs` so we can correlate client and server events
-/// in the live tmux A/B harness.
+/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` points at a log
+/// file. Mirrors the helper in `apps/server-rs/src/lib.rs` so live tmux A/B
+/// harness tracing can be enabled without making production resize/input paths
+/// append to disk.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .unwrap_or_else(|_| "/tmp/opensessions-debug-rs.log".to_string());
+    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
+        return;
+    };
     if path.is_empty() {
         return;
     }
@@ -117,7 +118,6 @@ async fn main() -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut events = EventStream::new();
     let mut app: Option<App> = None;
-    let mut last_reported_width: Option<u32> = None;
     let mut last_lazydiff_launch: Option<std::time::Instant> = None;
     let mut pending_sidebar_width: Option<PendingSidebarWidthCommand> = None;
     let mut startup_refocused = false;
@@ -271,35 +271,11 @@ async fn main() -> Result<()> {
                 } else if let Event::Resize(width, _) = event {
                     if let Some(app) = &mut app {
                         app.set_terminal_width(width);
-                        let width = u32::from(width);
                         debug_log(format!(
-                            "resize-event: pane_identity={identity:?} local_session={:?} current_session={:?} previous_width={last_reported_width:?} new_width={width}",
+                            "resize-event: pane_identity={identity:?} local_session={:?} current_session={:?} width={width}",
                             app.my_session,
                             app.current_session,
                         ));
-                        if last_reported_width.is_some() && last_reported_width != Some(width) {
-                            let local_session = identity
-                                .as_ref()
-                                .map(|identity| identity.session_name.as_str())
-                                .or(app.my_session.as_deref());
-                            if let Some(command) = report_width_command(
-                                width,
-                                local_session,
-                                app.current_session.as_deref(),
-                            ) {
-                                debug_log(format!(
-                                    "resize-event: sending report-width width={width} local_session={local_session:?} current_session={:?}",
-                                    app.current_session,
-                                ));
-                                ws.send(Message::text(encode_client_command(&command)?)).await?;
-                            } else {
-                                debug_log(format!(
-                                    "resize-event: not reporting width={width} local_session={local_session:?} current_session={:?}",
-                                    app.current_session,
-                                ));
-                            }
-                        }
-                        last_reported_width = Some(width);
                         terminal.draw(app)?;
                     }
                 } else if let Event::Mouse(mouse) = event
@@ -389,11 +365,8 @@ async fn main() -> Result<()> {
                             send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                         }
                         terminal.draw(app)?;
-                        if last_reported_width.is_none()
-                            && let Ok((width, _)) = terminal::size()
-                        {
+                        if let Ok((width, _)) = terminal::size() {
                             app.set_terminal_width(width);
-                            last_reported_width = Some(u32::from(width));
                         }
                         if !startup_refocused {
                             startup_refocused = true;

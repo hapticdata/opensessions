@@ -866,49 +866,6 @@ time.sleep(300)
         );
     }
 
-    fn wait_for_client_to_leave_session(&self, previous: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
-            if output
-                .lines()
-                .any(|line| !line.trim().is_empty() && line.trim() != previous)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(100));
-        }
-        panic!(
-            "timed out waiting for client to leave session {previous}; clients:\n{}\n\nlogs:\n{}",
-            self.tmux([
-                "list-clients",
-                "-F",
-                "#{client_name} #{client_tty} #{client_session}"
-            ]),
-            self.logs(),
-        );
-    }
-
-    fn current_client_session(&self) -> String {
-        self.tmux(["list-clients", "-F", "#{client_session}"])
-            .lines()
-            .find_map(|line| {
-                let session = line.trim();
-                (!session.is_empty()).then(|| session.to_string())
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no attached client session found; clients:\n{}\n\nlogs:\n{}",
-                    self.tmux([
-                        "list-clients",
-                        "-F",
-                        "#{client_name} #{client_tty} #{client_session}"
-                    ]),
-                    self.logs(),
-                )
-            })
-    }
-
     fn wait_for_all_sidebar_widths(&self, expected: u16) {
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
@@ -952,28 +909,6 @@ time.sleep(300)
         }
         panic!(
             "timed out waiting for {session} sidebar width to be {expected}; panes={:?}\nlogs:\n{}",
-            self.sidebar_panes(),
-            self.logs(),
-        );
-    }
-
-    fn wait_for_sidebar_widths_except_pane(&self, expected: u16, excluded_pane: &str) {
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            let panes = self.sidebar_panes();
-            let checked = panes
-                .iter()
-                .filter(|pane| pane.pane != excluded_pane)
-                .collect::<Vec<_>>();
-            if checked.len() >= SIDEBAR_SESSIONS.len().saturating_sub(1)
-                && checked.iter().all(|pane| pane.width == expected)
-            {
-                return;
-            }
-            sleep(Duration::from_millis(100));
-        }
-        panic!(
-            "timed out waiting for sidebar widths except {excluded_pane} to be {expected}; panes={:?}\nlogs:\n{}",
             self.sidebar_panes(),
             self.logs(),
         );
@@ -1096,45 +1031,6 @@ time.sleep(300)
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
-    }
-
-    fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
-        let output = self.tmux([
-            "list-panes",
-            "-t",
-            &format!("{session}:{window}"),
-            "-F",
-            "#{pane_id} #{pane_current_command}",
-        ]);
-        output
-            .lines()
-            .find_map(|line| {
-                let (pane, command) = line.split_once(' ')?;
-                command
-                    .starts_with("opensessions")
-                    .then(|| pane.to_string())
-            })
-            .unwrap_or_else(|| {
-                panic!("no sidebar pane found for {session}:{window}; panes:\n{output}")
-            })
-    }
-
-    fn current_window_index(&self, session: &str) -> String {
-        self.tmux(["display-message", "-p", "-t", session, "#{window_index}"])
-    }
-
-    fn pane_window_id(&self, pane: &str) -> String {
-        self.tmux(["display-message", "-p", "-t", pane, "#{window_id}"])
-    }
-
-    fn client_tty(&self) -> String {
-        self.tmux(["list-clients", "-F", "#{client_tty}"])
-            .lines()
-            .find_map(|line| {
-                let tty = line.trim();
-                (!tty.is_empty()).then(|| tty.to_string())
-            })
-            .expect("attached tmux client tty")
     }
 
     fn next_window_index(&self, session: &str) -> u32 {

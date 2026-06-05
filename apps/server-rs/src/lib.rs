@@ -61,8 +61,6 @@ const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
-const COALESCED_OP_TICK_MS: u64 = 25;
-const SWITCH_DEBOUNCE_MS: u64 = 80;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
@@ -85,15 +83,13 @@ impl ShutdownAnnouncement {
     }
 }
 
-/// Append a single debug line to the path in `OPENSESSIONS_DEBUG_LOG` (defaults
-/// to `/tmp/opensessions-debug.log`). Use sparingly to trace state-machine
-/// transitions in the live tmux A/B harness; the log is rotated by the user
-/// (`: > /tmp/opensessions-debug.log`). Set `OPENSESSIONS_DEBUG_LOG=` (empty)
-/// to silence.
+/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` points at a log
+/// file. Logging is opt-in because many call sites sit on tmux hot paths.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .unwrap_or_else(|_| "/tmp/opensessions-debug-rs.log".to_string());
+    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
+        return;
+    };
     if path.is_empty() {
         return;
     }
@@ -336,13 +332,6 @@ struct CachedPortSnapshot {
     ts: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingSessionSwitch {
-    name: String,
-    client_tty: Option<String>,
-    due_at: u64,
-}
-
 pub struct ReadOnlyMuxStateSource {
     providers: Vec<Arc<dyn MuxProvider>>,
     port_command_runner: Arc<dyn PortCommandRunner>,
@@ -354,7 +343,6 @@ pub struct ReadOnlyMuxStateSource {
     // `getSidebarWidth()` always reads from the XState coordinator — there is no
     // separate mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
-    sidebar_drift_detected_at: Mutex<Option<u64>>,
     focused_session: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
@@ -363,7 +351,6 @@ pub struct ReadOnlyMuxStateSource {
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
-    pending_session_switch: Mutex<Option<PendingSessionSwitch>>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -376,9 +363,7 @@ pub fn default_state_source_from_env(
         let config_width = env("HOME")
             .map(PathBuf::from)
             .and_then(|home| load_config_from_home(&home).sidebar_width);
-        let width = config_width
-            .or_else(|| env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()));
-        if let Some(width) = width {
+        if let Some(width) = config_width {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
         return Some(source);
@@ -396,7 +381,6 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
-            sidebar_drift_detected_at: Mutex::new(None),
             focused_session: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
@@ -405,7 +389,6 @@ impl ReadOnlyMuxStateSource {
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
-            pending_session_switch: Mutex::new(None),
             now_ms: Arc::new(current_time_ms),
         }
     }
@@ -491,11 +474,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                 shutdown.clone(),
             )),
             tokio::spawn(run_sidebar_lifecycle_loop(
-                self.clone(),
-                state_updates.clone(),
-                shutdown.clone(),
-            )),
-            tokio::spawn(run_coalesced_operation_loop(
                 self.clone(),
                 state_updates.clone(),
                 shutdown.clone(),
@@ -614,16 +592,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                let debounce = command
-                    .get("debounce")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if debounce {
-                    self.schedule_session_switch(name, client_tty);
-                } else {
-                    self.pending_session_switch.lock().unwrap().take();
-                    provider.switch_session(name, client_tty);
-                }
+                provider.switch_session(name, client_tty);
                 // Visiting a session clears its unseen agents (turns ● back
                 // into ✓). Mirrors `tracker.handleFocus` in
                 // `packages/runtime/src/server/index.ts:1964`.
@@ -635,25 +604,6 @@ impl StateSource for ReadOnlyMuxStateSource {
             "switch-index" => {
                 let index = command.get("index")?.as_u64()?.min(u32::MAX as u64) as u32;
                 self.switch_visible_index(index, None)
-            }
-            "focus-session" => {
-                let name = command.get("name")?.as_str()?;
-                *self.focused_session.lock().unwrap() = Some(name.to_string());
-                let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(name);
-                if had_unseen {
-                    return Some(self.snapshot_json());
-                }
-                let current_session = provider.get_current_session();
-                Some(format_focus_json(Some(name), current_session.as_deref()))
-            }
-            "move-focus" => {
-                let delta = command.get("delta")?.as_i64()?;
-                let current_session = provider.get_current_session();
-                let focused = self.move_focus(delta, current_session.as_deref())?;
-                Some(format_focus_json(
-                    Some(&focused),
-                    current_session.as_deref(),
-                ))
             }
             "kill-session" => {
                 let name = command.get("name")?.as_str()?;
@@ -725,20 +675,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 drop(collapsed);
                 Some(self.snapshot_json())
-            }
-            "report-width" => {
-                let reported_width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
-                let context = context?;
-                let target_width = self.current_sidebar_width_u16();
-                debug_log(format!(
-                    "width-report: fixed-width mode reported_width={reported_width} target_width={target_width} session={:?} window={:?} pane={:?}",
-                    context.session_name, context.window_id, context.pane_id,
-                ));
-                if reported_width != target_width {
-                    self.snap_sidebar_pane_to_width(provider.as_ref(), context, target_width);
-                    self.enforce_sidebar_width(target_width);
-                }
-                None
             }
             "focus-agent-pane" => {
                 let session = command.get("session")?.as_str()?;
@@ -905,7 +841,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         if path != "/focus" {
             return None;
         }
-        let name = parse_context_session(body).or_else(|| parse_legacy_focus_session(body))?;
+        let name = parse_context_session(body)?;
         *self.focused_session.lock().unwrap() = Some(name.clone());
         // Visiting (focusing) a session clears its unseen agents — `●`
         // (notification) becomes `✓` (done). Mirrors `handleFocus` in
@@ -922,23 +858,9 @@ impl StateSource for ReadOnlyMuxStateSource {
             "/toggle" => self.toggle_sidebar(),
             "/ensure-sidebar" => self.ensure_sidebar(body),
             "/pane-exited" => {
-                let width = self.current_sidebar_width_u16();
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
                 }
-                if self.sidebar_width_drifted(width) {
-                    self.enforce_sidebar_width(width);
-                }
-            }
-            "/pane-layout-changed" => {
-                let width = self.current_sidebar_width_u16();
-                if self.sidebar_width_drifted(width) {
-                    self.enforce_sidebar_width(width);
-                }
-            }
-            "/client-resized" => {
-                let width = self.current_sidebar_width_u16();
-                self.enforce_sidebar_width(width);
             }
             _ => {}
         }
@@ -1101,49 +1023,6 @@ impl ReadOnlyMuxStateSource {
             .and_then(|event| event.pane_id)
     }
 
-    fn schedule_session_switch(&self, name: &str, client_tty: Option<&str>) {
-        let due_at = (self.now_ms)().saturating_add(SWITCH_DEBOUNCE_MS);
-        *self.pending_session_switch.lock().unwrap() = Some(PendingSessionSwitch {
-            name: name.to_string(),
-            client_tty: client_tty.map(ToString::to_string),
-            due_at,
-        });
-    }
-
-    fn snap_sidebar_pane_to_width(
-        &self,
-        provider: &dyn MuxProvider,
-        context: &ClientConnectionContext,
-        width: u16,
-    ) {
-        let Some(pane_id) = context.pane_id.as_deref() else {
-            return;
-        };
-        provider.resize_sidebar_pane(pane_id, width);
-    }
-
-    fn apply_due_coalesced_operations(&self, now: u64) -> bool {
-        let switch = {
-            let mut pending = self.pending_session_switch.lock().unwrap();
-            if pending.as_ref().is_some_and(|intent| intent.due_at <= now) {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        if let Some(intent) = switch
-            && let Some(provider) = self.providers.first()
-        {
-            provider.switch_session(&intent.name, intent.client_tty.as_deref());
-            self.agent_tracker
-                .lock()
-                .unwrap()
-                .handle_focus(&intent.name);
-            return true;
-        }
-        false
-    }
-
     fn sidebar_panes_to_resize(&self, width: u16) -> Vec<String> {
         let mut pane_ids = Vec::new();
         for provider in &self.providers {
@@ -1165,42 +1044,14 @@ impl ReadOnlyMuxStateSource {
         pane_ids
     }
 
-    fn enforce_sidebar_width(&self, width: u16) -> bool {
+    fn enforce_sidebar_width(&self, width: u16) {
         let panes = self.sidebar_panes_to_resize(width);
-        let resized = !panes.is_empty();
         for pane_id in panes {
             debug_log(format!("width-repair: resize pane={pane_id} to={width}",));
             for provider in &self.providers {
                 provider.resize_sidebar_pane(&pane_id, width);
             }
         }
-        resized
-    }
-
-    fn sidebar_width_drifted(&self, width: u16) -> bool {
-        self.providers
-            .iter()
-            .filter(|provider| provider.is_sidebar_capable())
-            .flat_map(|provider| provider.list_sidebar_panes(None))
-            .any(|pane| pane.width.is_some_and(|pane_width| pane_width != width))
-    }
-
-    pub fn correct_sidebar_width_drift_after_settle(&self, now: u64) -> bool {
-        let width = self.current_sidebar_width_u16();
-        if !self.sidebar_width_drifted(width) {
-            *self.sidebar_drift_detected_at.lock().unwrap() = None;
-            return false;
-        }
-
-        let mut drift_detected_at = self.sidebar_drift_detected_at.lock().unwrap();
-        let first_seen = *drift_detected_at.get_or_insert(now);
-        if now < first_seen.saturating_add(300) {
-            return false;
-        }
-        *drift_detected_at = None;
-        drop(drift_detected_at);
-
-        self.enforce_sidebar_width(width)
     }
 
     fn provider_for_session(&self, session: &str) -> Option<Arc<dyn MuxProvider>> {
@@ -1390,19 +1241,15 @@ impl ReadOnlyMuxStateSource {
 
     fn ensure_sidebar(&self, body: &str) {
         let context = parse_context(body);
-        // A window switch / new window makes tmux proportionally redistribute the
-        // panes in that window, so the already-spawned sidebar panes can drift off
-        // the stored width. Correct every existing pane up front (a no-op when the
-        // sidebar does not exist yet) using the coordinator's single source of
-        // truth. This replaces the old per-tick enforcement loop and mirrors the
-        // `if (isSidebarVisible()) enforceSidebarWidth()` call in the TS
-        // `/ensure-sidebar` handler.
         let width = self.current_sidebar_width_u16();
-        self.enforce_sidebar_width(width);
         if !self.is_sidebar_visible() {
             debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
             return;
         }
+        // A window switch / new window can make tmux proportionally redistribute
+        // panes in that window, so repair existing sidebars before spawning any
+        // missing ones. This is event-driven, not a per-tick width scan.
+        self.enforce_sidebar_width(width);
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
                 continue;
@@ -1419,7 +1266,7 @@ impl ReadOnlyMuxStateSource {
                 continue;
             };
             if provider
-                .list_sidebar_panes(None)
+                .list_sidebar_panes(Some(&session_name))
                 .iter()
                 .any(|pane| pane.window_id == window_id)
             {
@@ -1446,35 +1293,11 @@ impl ReadOnlyMuxStateSource {
         let name = self
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
-        self.pending_session_switch.lock().unwrap().take();
         provider.switch_session(&name, client_tty);
         self.agent_tracker.lock().unwrap().handle_focus(&name);
         Some(format!(
             r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
         ))
-    }
-
-    fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
-        let mut names = self.sidebar_display_session_names()?;
-        if names.is_empty() {
-            *self.focused_session.lock().unwrap() = None;
-            return None;
-        }
-
-        let focused = self
-            .focused_session
-            .lock()
-            .unwrap()
-            .clone()
-            .or_else(|| current_session.map(ToString::to_string));
-        let current_idx = focused
-            .and_then(|focused| names.iter().position(|name| name == &focused))
-            .unwrap_or(0);
-        let max_idx = names.len() - 1;
-        let next_idx = (current_idx as i64 + delta).clamp(0, max_idx as i64) as usize;
-        let next = names.swap_remove(next_idx);
-        *self.focused_session.lock().unwrap() = Some(next.clone());
-        Some(next)
     }
 
     fn session_before(&self, name: &str) -> Option<String> {
@@ -1560,39 +1383,11 @@ async fn run_sidebar_lifecycle_loop(
     }
 }
 
-/// Latest-wins lane for expensive tmux effects whose intermediate states are
-/// not product commitments. The UI/state can move immediately, but tmux only
-/// receives the settled final intent. Immediate commands clear their matching
-/// pending intent before applying, so clicks/Enter/destructive actions keep
-/// their previous synchronous behavior.
-async fn run_coalesced_operation_loop(
-    source: Arc<ReadOnlyMuxStateSource>,
-    state_updates: broadcast::Sender<String>,
-    shutdown: broadcast::Sender<()>,
-) {
-    let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(COALESCED_OP_TICK_MS));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => return,
-            _ = interval.tick() => {
-                let now = (source.now_ms)();
-                if source.apply_due_coalesced_operations(now) {
-                    debug_log("coalesced_operation_loop: applied pending tmux effects");
-                    let _ = state_updates.send(source.snapshot_json());
-                }
-            }
-        }
-    }
-}
-
 /// Poll tmux state on a fixed cadence and broadcast a fresh snapshot whenever
 /// the JSON differs from the last broadcast. Mirrors the periodic
 /// session/window/pane refresh in `packages/runtime/src/server/index.ts`'s
 /// `setInterval` so the sidebar picks up new sessions, agent panes, focus
-/// changes, and width updates without requiring an explicit hook.
+/// changes, and other mux state without requiring an explicit hook.
 async fn run_tmux_state_poll_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
@@ -1614,7 +1409,7 @@ async fn run_tmux_state_poll_loop(
     // Track the last observed current session so we can clear unseen-agent
     // flags whenever the user moves into a different tmux session externally
     // (e.g. via `tmux switch-client`). This complements the inline
-    // `handle_focus` calls in switch-session / focus-session / `/focus`
+    // `handle_focus` calls in switch-session / `/focus`
     // command handlers.
     let mut last_current_session: Option<String> = source
         .providers
@@ -1643,8 +1438,6 @@ async fn run_tmux_state_poll_loop(
                     last_current_session = current_session;
                 }
 
-                let corrected_sidebar_drift = source.correct_sidebar_width_drift_after_settle((source.now_ms)());
-
                 let snapshot = source.snapshot_json();
                 // Hash the snapshot ignoring the per-tick `ts` field so that
                 // identical state on consecutive ticks does not trigger a
@@ -1655,7 +1448,7 @@ async fn run_tmux_state_poll_loop(
                 let mut hasher = DefaultHasher::new();
                 stripped.hash(&mut hasher);
                 let hash = hasher.finish();
-                if corrected_sidebar_drift || hash != last_hash {
+                if hash != last_hash {
                     last_hash = hash;
                     debug_log("tmux_state_poll_loop: state changed, broadcasting");
                     let _ = state_updates.send(snapshot);
@@ -2099,11 +1892,6 @@ fn parse_context(body: &str) -> Option<HttpContext> {
 
 fn parse_context_session(body: &str) -> Option<String> {
     parse_context(body).map(|context| context.session)
-}
-
-fn parse_legacy_focus_session(body: &str) -> Option<String> {
-    let name = trim_double_quotes(body.trim());
-    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn trim_context_quotes(value: &str) -> &str {
@@ -2755,10 +2543,7 @@ fn is_metadata_path(path: &str) -> bool {
 }
 
 fn is_ok_hook_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/client-resized" | "/pane-exited" | "/pane-layout-changed" | "/ensure-sidebar" | "/toggle"
-    )
+    matches!(path, "/pane-exited" | "/ensure-sidebar" | "/toggle")
 }
 
 async fn read_remaining_http_body(

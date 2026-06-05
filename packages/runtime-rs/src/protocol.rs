@@ -19,9 +19,6 @@ pub enum ServerMessage {
     Hello(ProtocolHello),
     State(ServerState),
     Focus(FocusUpdate),
-    Resize {
-        width: u32,
-    },
     Quit,
     YourSession {
         name: String,
@@ -240,11 +237,6 @@ pub enum ClientCommand {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        debounce: Option<bool>,
-    },
-    SwitchIndex {
-        index: u32,
     },
     NewSession,
     HideSession {
@@ -259,12 +251,6 @@ pub enum ClientCommand {
         delta: i8,
     },
     Refresh,
-    MoveFocus {
-        delta: i8,
-    },
-    FocusSession {
-        name: String,
-    },
     MarkSeen {
         name: String,
     },
@@ -285,9 +271,6 @@ pub enum ClientCommand {
     },
     ToggleWorktreeGroup {
         key: String,
-    },
-    Identify {
-        client_tty: String,
     },
     Quit,
     IdentifyPane {
@@ -315,8 +298,5 @@ pub enum ClientCommand {
         thread_name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pane_id: Option<String>,
-    },
-    ReportWidth {
-        width: u32,
     },
 }

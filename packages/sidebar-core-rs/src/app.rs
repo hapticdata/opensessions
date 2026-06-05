@@ -271,7 +271,7 @@ impl App {
                     });
                 }
             }
-            ServerMessage::Hello(_) | ServerMessage::Resize { .. } | ServerMessage::Quit => {}
+            ServerMessage::Hello(_) | ServerMessage::Quit => {}
         }
     }
 
@@ -418,7 +418,7 @@ impl App {
     }
 
     pub fn handle_tab(&mut self, shift: bool) {
-        self.switch_to_relative_session(if shift { -1 } else { 1 }, false);
+        self.switch_to_relative_session(if shift { -1 } else { 1 });
     }
 
     pub fn drain_commands(&mut self) -> Vec<ClientCommand> {
@@ -556,7 +556,7 @@ impl App {
 
     pub fn activate_focused_session(&mut self) {
         if let Some(name) = self.focused_session_name().map(str::to_string) {
-            self.request_session_switch(name, false, true);
+            self.request_session_switch(name, true);
         }
     }
 
@@ -742,7 +742,6 @@ impl App {
         self.commands.push(ClientCommand::SwitchSession {
             name: session.clone(),
             client_tty: None,
-            debounce: None,
         });
         self.commands.push(ClientCommand::FocusAgentPane {
             session,
@@ -798,10 +797,10 @@ impl App {
     }
 
     fn switch_to_session(&mut self, name: String) {
-        self.request_session_switch(name, false, false);
+        self.request_session_switch(name, false);
     }
 
-    fn request_session_switch(&mut self, name: String, debounce: bool, preserve_focus: bool) {
+    fn request_session_switch(&mut self, name: String, preserve_focus: bool) {
         self.pending_switch_session = Some(name.clone());
         if preserve_focus {
             if let Some(focus) = self.visible_focus_for_session(&name) {
@@ -815,7 +814,6 @@ impl App {
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
-            debounce: debounce.then_some(true),
         });
     }
 
@@ -894,7 +892,7 @@ impl App {
             .or_else(|| self.focused_session_name())
     }
 
-    fn switch_to_relative_session(&mut self, delta: i8, debounce: bool) {
+    fn switch_to_relative_session(&mut self, delta: i8) {
         let names: Vec<String> = self
             .display_sessions()
             .into_iter()
@@ -914,7 +912,7 @@ impl App {
             self.rehome_focus_to_local_session();
             return;
         }
-        self.request_session_switch(names[next_idx].clone(), debounce, false);
+        self.request_session_switch(names[next_idx].clone(), false);
     }
 
     fn session_focus_targets(&self) -> Vec<SidebarFocus> {

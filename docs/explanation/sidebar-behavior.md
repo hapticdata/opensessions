@@ -90,16 +90,16 @@ This applies to both explicit `kill-pane` and normal shell/process exit from ins
 
 Only the server-owned Fixed Sidebar Width can author sidebar width. It starts from configuration and may be changed by an explicit width command from the live TUI slider. Slider keypresses update the local slider immediately, then the TUI debounces/coalesces them into `set-sidebar-width` commands so the server remains the owner without receiving a resize storm. The server persists accepted width changes back to configuration for restart.
 
-There is no resize transaction state machine anymore. A sidebar pane can report its observed width, tmux hooks can observe a resized pane, and the server can discover drift during polling, but those observations are evidence of drift only. They do not mutate Fixed Sidebar Width.
+There is no resize transaction state machine anymore. Tmux hooks observe layout changes and repair sidebar panes back to the configured width. Those observations are evidence of drift only. They do not mutate Fixed Sidebar Width.
 
 The accepted rule set is:
 
 - persisted `sidebarWidth` seeds Fixed Sidebar Width for the tmux server
-- deprecated `OPENSESSIONS_WIDTH` only seeds Fixed Sidebar Width when persisted config has no `sidebarWidth`; it must not override slider-persisted width on restart
+- deprecated `OPENSESSIONS_WIDTH` is ignored by runtime width ownership; persisted `sidebarWidth` is the restart source of truth
 - debounced `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
-- `report-width` from a TUI client is a drift signal, not a command to change width
-- `after-resize-pane`, `pane-exited`, `after-kill-pane`, and `client-resized` are topology/drift signals only
+- `after-resize-pane`, `after-kill-pane`, and `client-resized` repair sidebar width directly in tmux without server round-trips
+- `pane-exited` repairs width directly in tmux, then notifies the server only for orphan-sidebar cleanup
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
@@ -232,13 +232,13 @@ What fixed it:
 
 What happened:
 
-- full terminal resizes and other layout churn produced `report-width` values that looked like drags
+- full terminal resizes and other layout churn produced observed pane widths that looked like drags in the old model
 - the saved width changed even though the user never dragged the divider
 
 What fixed it:
 
 - no sidebar pane can author width
-- `report-width` and tmux hooks are drift signals only
+- tmux hooks are drift signals only
 - Fixed Sidebar Width is the only source of truth
 
 ### 3. Switching quickly exposed stale widths
