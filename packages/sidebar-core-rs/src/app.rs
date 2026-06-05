@@ -115,6 +115,7 @@ pub struct App {
     collapsed_worktree_groups: HashSet<String>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
+    pending_sidebar_width_intent: Option<u16>,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -157,6 +158,7 @@ impl App {
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
             terminal_width: None,
             pane_identity: None,
+            pending_sidebar_width_intent: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -239,7 +241,7 @@ impl App {
                 self.sessions = state.sessions;
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
-                self.sidebar_width = state.sidebar_width.min(u16::MAX as u32) as u16;
+                self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
@@ -680,6 +682,7 @@ impl App {
             }
             *draft_width = next;
             self.sidebar_width = next;
+            self.pending_sidebar_width_intent = Some(next);
             self.commands.push(ClientCommand::SetSidebarWidth {
                 width: u32::from(next),
             });
@@ -687,16 +690,46 @@ impl App {
     }
 
     pub fn close_width_slider(&mut self) {
+        if let Modal::WidthSlider { draft_width } = self.modal {
+            self.pending_sidebar_width_intent = Some(draft_width);
+            self.commands.push(ClientCommand::SetSidebarWidth {
+                width: u32::from(draft_width),
+            });
+        }
         self.modal = Modal::None;
     }
 
     pub fn confirm_width_slider(&mut self) {
+        if let Modal::WidthSlider { draft_width } = self.modal {
+            self.pending_sidebar_width_intent = Some(draft_width);
+            self.commands.push(ClientCommand::SetSidebarWidth {
+                width: u32::from(draft_width),
+            });
+        }
         self.modal = Modal::None;
     }
 
     pub fn resize_detail_panel(&mut self, delta: i8) {
         let new_height = (self.detail_panel_height as i16 + delta as i16).max(4) as usize;
         self.detail_panel_height = new_height;
+    }
+
+    fn apply_server_sidebar_width(&mut self, server_width: u16) {
+        if let Some(intent) = self.pending_sidebar_width_intent {
+            if server_width == intent {
+                self.pending_sidebar_width_intent = None;
+                self.sidebar_width = server_width;
+                if let Modal::WidthSlider { draft_width } = &mut self.modal {
+                    *draft_width = server_width;
+                }
+            }
+            return;
+        }
+
+        self.sidebar_width = server_width;
+        if let Modal::WidthSlider { draft_width } = &mut self.modal {
+            *draft_width = server_width;
+        }
     }
 
     pub fn activate_focused_agent(&mut self) {

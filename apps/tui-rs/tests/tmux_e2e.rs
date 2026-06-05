@@ -157,11 +157,7 @@ fn tmux_sidebar_width_slider_is_the_only_width_author() {
     lab.wait_for_all_sidebar_widths(21);
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "Esc"]);
 
-    let config = fs::read_to_string(lab.config_path()).expect("read persisted e2e config");
-    assert!(
-        config.contains("\"sidebarWidth\": 21") || config.contains("\"sidebarWidth\":21"),
-        "slider should persist sidebarWidth=21; config={config}"
-    );
+    lab.wait_for_config_sidebar_width(21);
 
     lab.restart_server();
     lab.wait_for_all_sidebar_widths(21);
@@ -929,6 +925,21 @@ time.sleep(300)
             self.sidebar_panes(),
             self.logs(),
         );
+    }
+
+    fn wait_for_config_sidebar_width(&self, expected: u16) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let config = fs::read_to_string(self.config_path()).unwrap_or_default();
+            if config.contains(&format!("\"sidebarWidth\": {expected}"))
+                || config.contains(&format!("\"sidebarWidth\":{expected}"))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        let config = fs::read_to_string(self.config_path()).unwrap_or_default();
+        panic!("timed out waiting for sidebarWidth={expected}; config={config}");
     }
 
     fn wait_for_sidebar_width(&self, session: &str, expected: u16) {

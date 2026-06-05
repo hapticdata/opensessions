@@ -37,7 +37,7 @@ The practical product behavior is:
 
 ### Sidebar width is owned by the server, not pane resizing
 
-The sidebar width should feel like a fixed application sidebar, not an ordinary tmux pane. It starts from opensessions configuration for that tmux server, can be changed intentionally from the live TUI width slider, is persisted back to configuration, and observed pane width is never promoted to source-of-truth.
+The sidebar width should feel like a fixed application sidebar, not an ordinary tmux pane. It starts from opensessions configuration for that tmux server, can be changed intentionally from the debounced live TUI width slider, is persisted back to configuration, and observed pane width is never promoted to source-of-truth.
 
 Important details from the user's point of view:
 
@@ -88,7 +88,7 @@ This applies to both explicit `kill-pane` and normal shell/process exit from ins
 
 ## Width Authority
 
-Only the server-owned Fixed Sidebar Width can author sidebar width. It starts from configuration and may be changed by an explicit width command from the live TUI slider. Each slider movement sends `set-sidebar-width`, so the server remains the owner while the UI previews immediately. The server persists accepted width changes back to configuration for restart.
+Only the server-owned Fixed Sidebar Width can author sidebar width. It starts from configuration and may be changed by an explicit width command from the live TUI slider. Slider keypresses update the local slider immediately, then the TUI debounces/coalesces them into `set-sidebar-width` commands so the server remains the owner without receiving a resize storm. The server persists accepted width changes back to configuration for restart.
 
 There is no resize transaction state machine anymore. A sidebar pane can report its observed width, tmux hooks can observe a resized pane, and the server can discover drift during polling, but those observations are evidence of drift only. They do not mutate Fixed Sidebar Width.
 
@@ -96,7 +96,7 @@ The accepted rule set is:
 
 - persisted `sidebarWidth` seeds Fixed Sidebar Width for the tmux server
 - `OPENSESSIONS_WIDTH` can override the persisted seed for explicit scripts/tests
-- `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
+- debounced `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `report-width` from a TUI client is a drift signal, not a command to change width
 - `after-resize-pane`, `pane-exited`, `after-kill-pane`, and `client-resized` are topology/drift signals only
@@ -107,7 +107,7 @@ The accepted rule set is:
 
 When width drift is observed:
 
-- Fixed Sidebar Width stays unchanged unless the TUI width slider sends a new live value
+- Fixed Sidebar Width stays unchanged unless the TUI width slider sends a new debounced live value
 - the drifting pane is snapped back when possible
 - all other sidebar panes are checked and repaired to Fixed Sidebar Width
 - rapid switching must not be delayed by width repair

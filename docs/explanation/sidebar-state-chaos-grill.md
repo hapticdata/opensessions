@@ -131,7 +131,7 @@ Isolated proof-of-shape:
 - `packages/runtime-rs/tests/lifecycle_operation.rs` simulates connected clients, quit, late sidebar identify, warmup completion, and drain completion.
 - The test proves the key invariant: once `RequestQuit` moves the Server Generation to `Closing`, later lifecycle messages cannot move it back to `Warming` or `Ready`.
 - The test also covers 100 connected clients: `Quit` sends `quit` to every other client, does not send `quit` back to the requesting client, and rejects a re-entrant `Quit` submission through the Lifecycle Channel while effects are being delivered.
-- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is server-owned and changed only by explicit live width commands from the TUI slider, so the reducer models lifecycle/presence/switch/quit only.
+- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is server-owned and changed only by explicit debounced live width commands from the TUI slider, so the reducer models lifecycle/presence/switch/quit only.
 
 Live red contract:
 
@@ -182,7 +182,7 @@ Earlier we thought `adjusting…` should model width convergence: after one side
 
 Final decision:
 
-> Delete the width-adjustment concept. Sidebar width is Fixed Sidebar Width: server-owned per Server Generation, seeded by persisted configuration, changed only by explicit live width commands, saved back to configuration, and never authored by observed tmux pane width. Width drift is repaired, not modeled as a user-visible lifecycle.
+> Delete the width-adjustment concept. Sidebar width is Fixed Sidebar Width: server-owned per Server Generation, seeded by persisted configuration, changed only by explicit debounced live width commands, saved back to configuration, and never authored by observed tmux pane width. Width drift is repaired, not modeled as a user-visible lifecycle.
 
 Why this is simpler:
 
@@ -192,7 +192,7 @@ Why this is simpler:
 
 Recommended ownership rule:
 
-> The server owns width. The live TUI width slider can send an explicit width command for each movement; the server persists accepted values. Clients and tmux hooks can report drift, but they cannot mutate Fixed Sidebar Width through observations.
+> The server owns width. The live TUI width slider updates local UI immediately and sends debounced explicit width commands; the server persists accepted values. Clients and tmux hooks can report drift, but they cannot mutate Fixed Sidebar Width through observations.
 
 Live contract:
 
@@ -211,7 +211,7 @@ enum WidthObservation {
 }
 ```
 
-The key is not a richer transaction enum. The key is that runtime observations do not own Fixed Sidebar Width. If an old pane reports width 24 while Fixed Sidebar Width is 36, that report cannot become a new target; it can only trigger repair back to 36. If the user wants 38, the live TUI slider sends an explicit `set-sidebar-width` command and the server persists it.
+The key is not a richer transaction enum. The key is that runtime observations do not own Fixed Sidebar Width. If an old pane reports width 24 while Fixed Sidebar Width is 36, that report cannot become a new target; it can only trigger repair back to 36. If the user wants 38, the live TUI slider sends a debounced explicit `set-sidebar-width` command and the server persists it.
 
 ### 3. Server-derived vs client-derived state is blurred
 

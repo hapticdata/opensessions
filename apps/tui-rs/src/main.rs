@@ -23,10 +23,19 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::path::PathBuf;
-use tokio_websockets::Message;
+use tokio::net::TcpStream;
+use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
 const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 const DEFAULT_SERVER_PORT: u16 = 7_391;
+const SIDEBAR_WIDTH_DEBOUNCE_MS: u64 = 80;
+
+type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct PendingSidebarWidthCommand {
+    width: u32,
+    due_at: std::time::Instant,
+}
 
 /// Append a single debug line to the path in `OPENSESSIONS_DEBUG_LOG`
 /// (defaults to `/tmp/opensessions-debug.log`). Mirrors the helper in
@@ -110,6 +119,7 @@ async fn main() -> Result<()> {
     let mut app: Option<App> = None;
     let mut last_reported_width: Option<u32> = None;
     let mut last_lazydiff_launch: Option<std::time::Instant> = None;
+    let mut pending_sidebar_width: Option<PendingSidebarWidthCommand> = None;
     let mut startup_refocused = false;
     // Render-tick interval: advance the spinner clock and redraw at ~120ms so
     // the "warming up…" / agent-running spinners animate even
@@ -130,6 +140,7 @@ async fn main() -> Result<()> {
         // a re-render at the deadline so the highlight clears even without
         // any other event. Mirrors `setTimeout` in TS `triggerFlash`.
         let flash_deadline = app.as_ref().and_then(|app| app.flash_deadline);
+        let sidebar_width_due = pending_sidebar_width.as_ref().map(|pending| pending.due_at);
 
         tokio::select! {
             biased;
@@ -193,6 +204,16 @@ async fn main() -> Result<()> {
                 continue;
             }
 
+            _ = async {
+                match sidebar_width_due {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                flush_pending_sidebar_width(&mut ws, &mut pending_sidebar_width).await?;
+                continue;
+            }
+
             event = events.next() => {
                 let Some(event) = event else {
                     return Ok(());
@@ -218,8 +239,11 @@ async fn main() -> Result<()> {
                     }
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
-                        let is_quit = matches!(command, ClientCommand::Quit);
-                        ws.send(Message::text(encode_client_command(&command)?)).await?;
+                        let is_quit = send_or_queue_client_command(
+                            command,
+                            &mut ws,
+                            &mut pending_sidebar_width,
+                        ).await?;
                         if is_quit {
                             // HTTP fallback on a separate TCP connection.
                             // Whichever path reaches the server first triggers
@@ -292,7 +316,7 @@ async fn main() -> Result<()> {
                     }
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
-                        ws.send(Message::text(encode_client_command(&command)?)).await?;
+                        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                     }
                     for launch in app.drain_launches() {
                         let target_session = launch
@@ -362,7 +386,7 @@ async fn main() -> Result<()> {
                     }
                     if let Some(app) = &mut app {
                         for command in app.drain_commands() {
-                            ws.send(Message::text(encode_client_command(&command)?)).await?;
+                            send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                         }
                         terminal.draw(app)?;
                         if last_reported_width.is_none()
@@ -382,6 +406,45 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+async fn send_or_queue_client_command(
+    command: ClientCommand,
+    ws: &mut ClientWebSocket,
+    pending_sidebar_width: &mut Option<PendingSidebarWidthCommand>,
+) -> Result<bool> {
+    match command {
+        ClientCommand::SetSidebarWidth { width } => {
+            *pending_sidebar_width = Some(PendingSidebarWidthCommand {
+                width,
+                due_at: std::time::Instant::now()
+                    + std::time::Duration::from_millis(SIDEBAR_WIDTH_DEBOUNCE_MS),
+            });
+            Ok(false)
+        }
+        command => {
+            flush_pending_sidebar_width(ws, pending_sidebar_width).await?;
+            let is_quit = matches!(command, ClientCommand::Quit);
+            ws.send(Message::text(encode_client_command(&command)?))
+                .await?;
+            Ok(is_quit)
+        }
+    }
+}
+
+async fn flush_pending_sidebar_width(
+    ws: &mut ClientWebSocket,
+    pending_sidebar_width: &mut Option<PendingSidebarWidthCommand>,
+) -> Result<()> {
+    let Some(pending) = pending_sidebar_width.take() else {
+        return Ok(());
+    };
+    let command = ClientCommand::SetSidebarWidth {
+        width: pending.width,
+    };
+    ws.send(Message::text(encode_client_command(&command)?))
+        .await?;
+    Ok(())
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
