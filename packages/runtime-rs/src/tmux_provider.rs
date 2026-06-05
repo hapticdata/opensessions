@@ -461,7 +461,12 @@ impl MuxProvider for TmuxProvider {
                 "run-shell{background} \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true\""
             )
         };
-        let repair_sidebar_width = r#"w=$(tmux -S #{socket_path} show-option -gqv @opensessions_width); case "$w" in ''|*[!0-9]*) exit 0;; esac; tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}' -F '##{pane_id}' | while IFS= read -r pane; do [ -n "$pane" ] && tmux -S #{socket_path} resize-pane -t "$pane" -x "$w"; done"#;
+        let delayed_hook = |path: &str| {
+            format!(
+                "run-shell -b \"sleep 0.05; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path} >/dev/null 2>&1 || true\""
+            )
+        };
+        let repair_sidebar_width = r#"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"#;
 
         let focus_cmd = hook(
             "/focus",
@@ -479,9 +484,18 @@ impl MuxProvider for TmuxProvider {
         // Run this repair hook in the foreground so `kill-pane`/process exit
         // does not return with a non-sidebar width persisted on the sidebar pane.
         let pane_exited_cmd = format!(
-            "run-shell \"{repair_sidebar_width}\" ; run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}/pane-exited >/dev/null 2>&1 || true\""
+            "run-shell \"{repair_sidebar_width}\" ; {}",
+            delayed_hook("/pane-exited"),
         );
         let repair_sidebar_width_cmd = format!("run-shell -b \"{repair_sidebar_width}\"");
+        let client_resized_cmd = format!(
+            "{repair_sidebar_width_cmd} ; {}",
+            delayed_hook("/client-resized"),
+        );
+        let pane_layout_changed_cmd = format!(
+            "{repair_sidebar_width_cmd} ; {}",
+            delayed_hook("/pane-layout-changed"),
+        );
 
         self.client.set_global_hook(
             "client-session-changed",
@@ -493,12 +507,14 @@ impl MuxProvider for TmuxProvider {
             .set_global_hook("after-select-window", &ensure_cmd);
         self.client.set_global_hook("after-new-window", &ensure_cmd);
         self.client
-            .set_global_hook("client-resized", &repair_sidebar_width_cmd);
+            .set_global_hook("client-resized", &client_resized_cmd);
         self.client
             .set_global_hook("after-kill-pane", &pane_exited_cmd);
         self.client.set_global_hook("pane-exited", &pane_exited_cmd);
         self.client
-            .set_global_hook("after-resize-pane", &repair_sidebar_width_cmd);
+            .set_global_hook("after-resize-pane", &pane_layout_changed_cmd);
+        self.client
+            .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
     }
 
     fn cleanup_hooks(&self) {
@@ -512,6 +528,7 @@ impl MuxProvider for TmuxProvider {
             "after-kill-pane",
             "pane-exited",
             "after-resize-pane",
+            "after-resize-window",
         ] {
             self.client.unset_global_hook(hook);
         }

@@ -98,8 +98,9 @@ The accepted rule set is:
 - deprecated `OPENSESSIONS_WIDTH` is ignored by runtime width ownership; persisted `sidebarWidth` is the restart source of truth
 - debounced `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
-- `after-resize-pane`, `after-kill-pane`, and `client-resized` repair sidebar width directly in tmux without server round-trips
-- `pane-exited` repairs width directly in tmux, then notifies the server only for orphan-sidebar cleanup
+- `repair-width` from a TUI client carries no width; it only asks the server to re-apply Fixed Sidebar Width after tmux resized the pane
+- `after-resize-pane`, `after-resize-window`, `after-kill-pane`, `pane-exited`, and `client-resized` first try direct tmux repair, then schedule a delayed server `repair configured width` fallback for layout churn that settles after the hook starts
+- `pane-exited` also notifies the server for orphan-sidebar cleanup
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
@@ -238,7 +239,7 @@ What happened:
 What fixed it:
 
 - no sidebar pane can author width
-- tmux hooks are drift signals only
+- tmux hooks and `repair-width` are drift signals only
 - Fixed Sidebar Width is the only source of truth
 
 ### 3. Switching quickly exposed stale widths

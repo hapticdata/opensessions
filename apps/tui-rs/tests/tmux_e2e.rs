@@ -99,6 +99,7 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 fn tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-width");
+    lab.assert_width_hooks_are_well_quoted();
     let source = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
@@ -1107,6 +1108,22 @@ time.sleep(300)
             "{},0,0",
             self.tmux(["display-message", "-p", "#{socket_path}"])
         )
+    }
+
+    fn assert_width_hooks_are_well_quoted(&self) {
+        let hooks = self.tmux(["show-hooks", "-g"]);
+        assert!(
+            hooks.contains("@opensessions_width"),
+            "width hooks were not installed; hooks:\n{hooks}"
+        );
+        assert!(
+            hooks.contains("$(tmux") && hooks.contains("show-option -gqv @opensessions_width"),
+            "width repair hook must read the target width at execution time; hooks:\n{hooks}"
+        );
+        assert!(
+            !hooks.contains("case  in") && !hooks.contains("[ -n  ]") && !hooks.contains("-t  -x"),
+            "width repair hook lost shell variables during tmux parsing; hooks:\n{hooks}"
+        );
     }
 
     fn tmux_ok<const N: usize>(&self, args: [&str; N]) {

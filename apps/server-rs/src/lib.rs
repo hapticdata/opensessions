@@ -657,6 +657,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                 self.enforce_sidebar_width(width);
                 Some(self.snapshot_json())
             }
+            "repair-width" => {
+                if self.is_sidebar_visible() {
+                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
+                }
+                None
+            }
             "set-filter" => {
                 let filter = match command.get("filter")?.as_str()? {
                     "all" => SessionFilterMode::All,
@@ -739,6 +745,9 @@ impl StateSource for ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .acknowledge_sidebar_connected();
+        if self.is_sidebar_visible() {
+            self.enforce_sidebar_width(self.current_sidebar_width_u16());
+        }
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
@@ -854,12 +863,21 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn handle_http_hook(&self, path: &str, body: &str) {
+        debug_log(format!("http-hook: path={path}"));
         match path {
             "/toggle" => self.toggle_sidebar(),
             "/ensure-sidebar" => self.ensure_sidebar(body),
             "/pane-exited" => {
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
+                }
+                if self.is_sidebar_visible() {
+                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
+                }
+            }
+            "/pane-layout-changed" | "/client-resized" => {
+                if self.is_sidebar_visible() {
+                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
             }
             _ => {}
@@ -2543,7 +2561,10 @@ fn is_metadata_path(path: &str) -> bool {
 }
 
 fn is_ok_hook_path(path: &str) -> bool {
-    matches!(path, "/pane-exited" | "/ensure-sidebar" | "/toggle")
+    matches!(
+        path,
+        "/pane-exited" | "/pane-layout-changed" | "/client-resized" | "/ensure-sidebar" | "/toggle"
+    )
 }
 
 async fn read_remaining_http_body(

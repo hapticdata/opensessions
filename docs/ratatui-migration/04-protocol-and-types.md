@@ -301,7 +301,7 @@ pub enum SessionFilterMode { All, Active, Running }
 
 ## Client → Server (`ClientCommand`)
 
-All 17 variants:
+All 18 variants:
 
 ```ts
 type ClientCommand =
@@ -316,6 +316,7 @@ type ClientCommand =
   | { type: "dismiss-agent"; session: string; agent: string; threadId?: string }
   | { type: "set-theme"; theme: string }
   | { type: "set-sidebar-width"; width: number }
+  | { type: "repair-width" }
   | { type: "set-filter"; filter: SessionFilterMode }
   | { type: "toggle-worktree-group"; key: string }
   | { type: "quit" }
@@ -348,6 +349,7 @@ pub enum ClientCommand {
     },
     SetTheme { theme: String },
     SetSidebarWidth { width: u32 },
+    RepairWidth,
     SetFilter { filter: SessionFilterMode },
     ToggleWorktreeGroup { key: String },
     Quit,

@@ -266,6 +266,7 @@ pub enum ClientCommand {
     SetSidebarWidth {
         width: u32,
     },
+    RepairWidth,
     SetFilter {
         filter: SessionFilterMode,
     },
