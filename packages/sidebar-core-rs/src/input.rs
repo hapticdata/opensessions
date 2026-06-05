@@ -108,6 +108,7 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
 fn apply_modal_key(app: &mut App, key: UiKey) {
     match &app.modal {
         Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
+        Modal::WidthSlider { .. } => apply_width_slider_key(app, key),
         Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
         Modal::None => {}
     }
@@ -195,6 +196,20 @@ fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
         _ => {
             app.modal = Modal::None;
         }
+    }
+}
+
+fn apply_width_slider_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Left | UiKey::Down => app.adjust_width_slider(-1),
+        UiKey::Right | UiKey::Up => app.adjust_width_slider(1),
+        UiKey::Char('h') => app.adjust_width_slider(-1),
+        UiKey::Char('l') => app.adjust_width_slider(1),
+        UiKey::Char('H') => app.adjust_width_slider(-5),
+        UiKey::Char('L') => app.adjust_width_slider(5),
+        UiKey::Enter => app.confirm_width_slider(),
+        UiKey::Esc => app.close_width_slider(),
+        _ => {}
     }
 }
 

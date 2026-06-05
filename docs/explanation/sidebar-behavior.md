@@ -12,8 +12,8 @@ The sidebar should behave like a real sidebar, not like an ordinary tmux pane.
 
 That means:
 
-- the sidebar width is config-owned and fixed for the tmux server
-- every sidebar pane in every managed session/window is continuously repaired back to that configured width
+- the sidebar width is server-owned, persisted, and fixed for the tmux server until the live TUI width slider changes it
+- every sidebar pane in every managed session/window is continuously repaired back to Fixed Sidebar Width
 - full terminal resizes do not redefine the saved width
 - session switching does not cause the sidebar to jump, breathe, or re-proportion itself
 - background windows should already be correct before the user lands in them
@@ -29,21 +29,21 @@ Each tmux server/socket gets its own opensessions server and its own sidebar sta
 
 The practical product behavior is:
 
-- every sidebar pane inside the same tmux server shows the same session list, filters, lifecycle state, collapsed groups, and configured width
+- every sidebar pane inside the same tmux server shows the same session list, filters, lifecycle state, collapsed groups, and Fixed Sidebar Width
 - each attached tmux client owns its own confirmed active row and temporary keyboard focus
-- manual or tmux-driven width changes are rejected and repaired back to the configured width
+- manual tmux-driven width changes are rejected and repaired back to the server-owned width
 - a different tmux server may have a different opensessions width/state/server without conflict
 - stale hooks or sidebars talking to another port are considered broken configuration, not valid mixed-server behavior
 
-### Sidebar width is owned by configuration, not pane resizing
+### Sidebar width is owned by the server, not pane resizing
 
-The sidebar width should feel like a fixed application sidebar, not an ordinary tmux pane. It comes from opensessions configuration for that tmux server, and observed pane width is never promoted to source-of-truth.
+The sidebar width should feel like a fixed application sidebar, not an ordinary tmux pane. It starts from opensessions configuration for that tmux server, can be changed intentionally from the live TUI width slider, is persisted back to configuration, and observed pane width is never promoted to source-of-truth.
 
 Important details from the user's point of view:
 
 - dragging the divider may move the pane momentarily because tmux has no native per-pane width lock, but opensessions snaps it back
 - a normal tmux pane, background sidebar, manual sidebar drag, pane exit, or whole-terminal resize must not redefine the sidebar width
-- background sidebars should already be at the configured width before the user lands in them
+- background sidebars should already be at Fixed Sidebar Width before the user lands in them
 - pressing `q` quits opensessions only when the key is delivered to a connected sidebar client; pressing `q` in a normal tmux pane is just a normal shell/app keypress
 
 ### Server shutdown must not leave stale sidebar clients
@@ -88,26 +88,28 @@ This applies to both explicit `kill-pane` and normal shell/process exit from ins
 
 ## Width Authority
 
-Only configuration can author sidebar width.
+Only the server-owned Fixed Sidebar Width can author sidebar width. It starts from configuration and may be changed by an explicit width command from the live TUI slider. Each slider movement sends `set-sidebar-width`, so the server remains the owner while the UI previews immediately. The server persists accepted width changes back to configuration for restart.
 
-There is no resize transaction state machine anymore. A sidebar pane can report its observed width, tmux hooks can observe a resized pane, and the server can discover drift during polling, but those observations are evidence of drift only. They do not mutate the configured width.
+There is no resize transaction state machine anymore. A sidebar pane can report its observed width, tmux hooks can observe a resized pane, and the server can discover drift during polling, but those observations are evidence of drift only. They do not mutate Fixed Sidebar Width.
 
 The accepted rule set is:
 
-- `OPENSESSIONS_WIDTH` / configured width is the source of truth for the tmux server
+- persisted `sidebarWidth` seeds Fixed Sidebar Width for the tmux server
+- `OPENSESSIONS_WIDTH` can override the persisted seed for explicit scripts/tests
+- `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `report-width` from a TUI client is a drift signal, not a command to change width
 - `after-resize-pane`, `pane-exited`, `after-kill-pane`, and `client-resized` are topology/drift signals only
-- hook repair must be idempotent: only panes whose current width differs from the configured width are resized
+- hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
 ## Global Width Repair Rules
 
 When width drift is observed:
 
-- the configured width stays unchanged
+- Fixed Sidebar Width stays unchanged unless the TUI width slider sends a new live value
 - the drifting pane is snapped back when possible
-- all other sidebar panes are checked and repaired to the same configured width
+- all other sidebar panes are checked and repaired to Fixed Sidebar Width
 - rapid switching must not be delayed by width repair
 - another window reporting its old width must be corrected back to the configured target, not promoted to the new target
 
@@ -124,7 +126,7 @@ Expected behavior:
 - background windows can catch up with a staggered sync pass after a short settle delay
 - transient half-window widths reported during client resizes must never become the persisted width
 
-The server therefore treats client resize as a repair trigger only. Transient widths during full terminal resize are drift signals and must never become the configured width.
+The server therefore treats client resize as a repair trigger only. Transient widths during full terminal resize are drift signals and must never become Fixed Sidebar Width.
 
 ## Session Switching Rules
 
@@ -136,7 +138,7 @@ That means:
 - switching must not trigger visible layout jumps
 - switching must not reset the width to an older value
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
-- switching immediately after any manual/sidebar/tmux resize still converges to the configured fixed width; no observed pane width is adopted as the new width
+- switching immediately after any manual/sidebar/tmux resize still converges to Fixed Sidebar Width; no observed pane width is adopted as the new width
 - switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
 
 The sidebar session list has one durable local active row: this tmux client's confirmed active session. The keyboard-focused row may temporarily diverge while the user browses with `j`/`k`/arrow keys, but that temporary selection is local-only and must not be server-synced. `Enter` switches to the temporary selection and keeps that row visible as the pending switch target until `YourSession`/pane identity confirms the new context; it must not snap back to the old active row for an intermediate frame. `Tab`/`Shift-Tab` are the only keys that immediately switch to the next/previous visible session without first moving temporary focus. Mouse clicks on sessions also make the clicked concrete session the pending focus target. In all cases, the durable active row stays on the confirmed active session until confirmation.
@@ -151,7 +153,7 @@ This keeps per-window state simple: every attached tmux client can show a differ
 
 One specific regression we already paid for: forcing `resize-window` during the session-switch path caused visible layout jumps. The fix was to stop doing that in the switch path and instead use targeted width enforcement plus background pre-layout where appropriate.
 
-Another regression: switching into a session can briefly resize the destination sidebar through impossible widths such as `1 → 20 → 58 → 20` while tmux restores layout. Those reports are layout-settle echoes, not user drags, even when they come from the active session/window/sidebar pane. The fixed-width rule makes this boring: every such report repairs back to the configured width.
+Another regression: switching into a session can briefly resize the destination sidebar through impossible widths such as `1 → 20 → 58 → 20` while tmux restores layout. Those reports are layout-settle echoes, not user drags, even when they come from the active session/window/sidebar pane. The fixed-width rule makes this boring: every such report repairs back to Fixed Sidebar Width.
 
 ## Warmup And Closing Semantics
 
@@ -183,7 +185,7 @@ These are non-negotiable:
 - keep tmux windows in `window-size latest`; do not leave them in manual mode after `resize-window`
 - install both `pane-exited` and `after-kill-pane`; normal shell/process exit is not covered by `after-kill-pane` alone
 - treat `pane-exited` and `after-kill-pane` as topology-change signals only; they must never adopt tmux's redistributed sidebar width as user intent
-- use `after-resize-pane` only as an idempotent fixed-width repair trigger for panes titled `opensessions-sidebar`; it must no-op when every sidebar pane is already at the configured width
+- use `after-resize-pane` only as an idempotent fixed-width repair trigger for panes titled `opensessions-sidebar`; it must no-op when every sidebar pane is already at Fixed Sidebar Width
 - do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
 
@@ -222,7 +224,7 @@ What happened:
 
 What fixed it:
 
-- idempotent tmux hook repair: only sidebar panes whose current width differs from the configured width are resized
+- idempotent tmux hook repair: only sidebar panes whose current width differs from Fixed Sidebar Width are resized
 - no width-authoring path from observed pane width
 - no unconditional resize hook that can recursively trigger itself
 
@@ -237,7 +239,7 @@ What fixed it:
 
 - no sidebar pane can author width
 - `report-width` and tmux hooks are drift signals only
-- the configured width is the only source of truth
+- Fixed Sidebar Width is the only source of truth
 
 ### 3. Switching quickly exposed stale widths
 
@@ -250,7 +252,7 @@ What happened:
 What fixed it:
 
 - switch paths no longer carry resize handoff state
-- destination width is repaired to the configured width by hooks/ensure/backstop polling
+- destination width is repaired to Fixed Sidebar Width by hooks/ensure/backstop polling
 - width repair is not allowed to become a higher-priority operation than tmux switching
 
 ### 4. Background windows were stale
@@ -311,7 +313,7 @@ These are not theoretical. They were tried and caused problems.
 - setting drag suppression in a way that made the server fight the user's live drag
 - requiring tmux's active pane to be the sidebar pane before accepting a sidebar width report
 - treating every TUI as authoritative instead of only the current foreground one
-- treating any TUI as width-authoritative instead of keeping width config-owned
+- treating any observed TUI pane width as authoritative instead of requiring the explicit width slider command
 
 ## Performance Constraints
 
@@ -323,15 +325,15 @@ Keep these constraints in mind:
 - avoid repeated full `list-panes -a` scans inside the same resize cycle
 - batch where possible, cache briefly, and invalidate on real topology changes
 - prioritize the active window first, then let the rest catch up quickly in the background
-- polling may correct a detected sidebar-width drift after a short settle window, but it must not redefine configured width
+- polling may correct a detected sidebar-width drift after a short settle window, but it must not redefine Fixed Sidebar Width
 
 ## Change Checklist
 
 Before shipping any sidebar behavior change, verify all of these.
 
-- manually resizing the active sidebar snaps back to configured width
-- manually resizing the sidebar divider while focus remains in the main pane snaps back to configured width
-- switching sessions immediately after manual/sidebar/tmux resize preserves the configured width
+- manually resizing the active sidebar snaps back to Fixed Sidebar Width
+- manually resizing the sidebar divider while focus remains in the main pane snaps back to Fixed Sidebar Width
+- switching sessions immediately after manual/sidebar/tmux resize preserves Fixed Sidebar Width
 - clicking a session row leaves focus in the destination sidebar pane
 - resizing the whole terminal does not redefine the persisted width
 - in `sidebar | pane1 | pane2`, killing or exiting `pane1` leaves `sidebar` fixed-width and lets `pane2` absorb the freed width

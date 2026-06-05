@@ -1,3 +1,4 @@
+use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -1153,6 +1154,9 @@ fn render_modal_overlay(
         Modal::ThemePicker {
             query, selected, ..
         } => render_theme_picker_overlay(palette, lines, width, height, query, *selected),
+        Modal::WidthSlider { draft_width, .. } => {
+            render_width_slider_overlay(palette, lines, width, height, *draft_width)
+        }
         Modal::KillConfirm { session_name } => {
             render_kill_confirm_overlay(palette, lines, width, height, session_name)
         }
@@ -1379,6 +1383,104 @@ fn render_kill_confirm_overlay(
     }
 }
 
+fn render_width_slider_overlay(
+    palette: &Palette,
+    lines: &mut [StyledLine],
+    width: usize,
+    height: usize,
+    draft_width: u16,
+) {
+    let box_width: usize = width.min(36);
+    let box_height: usize = 7;
+    if height < box_height + 2 || box_width < MIN_SIDEBAR_WIDTH as usize {
+        return;
+    }
+
+    let start_y = (height.saturating_sub(box_height)) / 2;
+    let start_x = (width.saturating_sub(box_width)) / 2;
+    let border_color = palette.blue;
+    let inner_width = box_width - 2;
+
+    let make_inner = |content: StyledLine| -> StyledLine {
+        let pad = inner_width.saturating_sub(content.width());
+        let left = pad / 2;
+        let right = pad - left;
+        let mut line = StyledLine::blank();
+        line.push(" ".repeat(start_x), palette.white);
+        line.push("│", border_color);
+        line.push(" ".repeat(left), palette.white);
+        line.parts.extend(content.parts);
+        line.push(" ".repeat(right), palette.white);
+        line.push("│", border_color);
+        line
+    };
+
+    let mut top = StyledLine::blank();
+    top.push(" ".repeat(start_x), palette.white);
+    top.push("╭", border_color);
+    top.push("─".repeat(inner_width), border_color);
+    top.push("╮", border_color);
+
+    let mut title = StyledLine::blank();
+    title.push("Sidebar width", palette.blue);
+
+    let mut value = StyledLine::blank();
+    value.push(format!("{draft_width} columns"), palette.text);
+
+    let mut slider = StyledLine::blank();
+    let track_width = inner_width.saturating_sub(6).clamp(4, 18);
+    let range = u32::from(MAX_SIDEBAR_WIDTH - MIN_SIDEBAR_WIDTH);
+    let offset = u32::from(draft_width.saturating_sub(MIN_SIDEBAR_WIDTH));
+    let thumb = if range == 0 {
+        0
+    } else {
+        ((offset * (track_width.saturating_sub(1) as u32)) / range) as usize
+    };
+    slider.push(format!("{MIN_SIDEBAR_WIDTH} "), palette.overlay0);
+    for index in 0..track_width {
+        if index == thumb {
+            slider.push("●", palette.blue);
+        } else if index < thumb {
+            slider.push("━", palette.blue);
+        } else {
+            slider.push("─", palette.surface2);
+        }
+    }
+    slider.push(format!(" {MAX_SIDEBAR_WIDTH}"), palette.overlay0);
+
+    let mut blank = StyledLine::blank();
+    blank.push("", palette.white);
+
+    let mut hint = StyledLine::blank();
+    if inner_width >= 32 {
+        hint.push("←/→ live Enter/Esc close", palette.overlay0);
+    } else {
+        hint.push("←/→ live Esc", palette.overlay0);
+    }
+
+    let mut bottom = StyledLine::blank();
+    bottom.push(" ".repeat(start_x), palette.white);
+    bottom.push("╰", border_color);
+    bottom.push("─".repeat(inner_width), border_color);
+    bottom.push("╯", border_color);
+
+    let rows = [
+        top,
+        make_inner(title),
+        make_inner(value),
+        make_inner(slider),
+        make_inner(blank),
+        make_inner(hint),
+        bottom,
+    ];
+    for (i, row) in rows.into_iter().enumerate() {
+        let y = start_y + i;
+        if y < lines.len() {
+            lines[y] = row;
+        }
+    }
+}
+
 fn compute_agent_window(
     blocks: &[Vec<StyledLine>],
     focused_idx: usize,
@@ -1579,6 +1681,8 @@ fn footer(palette: &Palette, width: usize) -> [StyledLine; 2] {
         (" agents  ", palette.overlay1),
         ("f", palette.overlay0),
         (" filter  ", palette.overlay1),
+        ("w", palette.overlay0),
+        (" width  ", palette.overlay1),
         ("d", palette.overlay0),
         (" hide  ", palette.overlay1),
         ("x", palette.overlay0),

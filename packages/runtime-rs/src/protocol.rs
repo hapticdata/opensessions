@@ -277,6 +277,9 @@ pub enum ClientCommand {
     SetTheme {
         theme: String,
     },
+    SetSidebarWidth {
+        width: u32,
+    },
     SetFilter {
         filter: SessionFilterMode,
     },

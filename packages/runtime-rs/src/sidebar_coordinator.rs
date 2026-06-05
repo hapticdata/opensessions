@@ -57,6 +57,10 @@ impl SidebarCoordinator {
         }
     }
 
+    pub fn set_width(&mut self, width: u32) {
+        self.width = width;
+    }
+
     pub fn begin_warmup(&mut self) {
         if self.is_closing() {
             return;

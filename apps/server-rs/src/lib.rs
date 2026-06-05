@@ -16,6 +16,9 @@ use opensessions_runtime::agent_watchers::{
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
     opencode_snapshot_from_row, parse_codex_session_index,
 };
+use opensessions_runtime::config::{
+    OpensessionsConfig, load_config_from_home, save_config_to_home,
+};
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -370,7 +373,13 @@ pub fn default_state_source_from_env(
     if env("TMUX").is_some() {
         let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
         let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
-        if let Some(width) = env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()) {
+        let config_width = env("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| load_config_from_home(&home).sidebar_width);
+        let width = env("OPENSESSIONS_WIDTH")
+            .and_then(|width| width.parse::<u16>().ok())
+            .or(config_width);
+        if let Some(width) = width {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
         return Some(source);
@@ -420,6 +429,24 @@ impl ReadOnlyMuxStateSource {
 
     fn is_sidebar_visible(&self) -> bool {
         self.sidebar_coordinator.lock().unwrap().state().visible
+    }
+
+    fn persist_sidebar_width(&self, width: u16) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            debug_log("set-sidebar-width: skipped config save because HOME is unset");
+            return;
+        };
+        if let Err(err) = save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                sidebar_width: Some(width),
+                ..OpensessionsConfig::default()
+            },
+        ) {
+            debug_log(format!(
+                "set-sidebar-width: failed to save sidebarWidth={width}: {err}"
+            ));
+        }
     }
 
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
@@ -665,6 +692,20 @@ impl StateSource for ReadOnlyMuxStateSource {
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
                 *self.theme.lock().unwrap() = Some(theme);
+                Some(self.snapshot_json())
+            }
+            "set-sidebar-width" => {
+                let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
+                let width = clamp_sidebar_width(width);
+                self.persist_sidebar_width(width);
+                self.sidebar_coordinator
+                    .lock()
+                    .unwrap()
+                    .set_width(u32::from(width));
+                for provider in &self.providers {
+                    provider.set_sidebar_width_hint(width);
+                }
+                self.enforce_sidebar_width(width);
                 Some(self.snapshot_json())
             }
             "set-filter" => {
@@ -2717,11 +2758,7 @@ fn is_metadata_path(path: &str) -> bool {
 fn is_ok_hook_path(path: &str) -> bool {
     matches!(
         path,
-        "/client-resized"
-            | "/pane-exited"
-            | "/pane-layout-changed"
-            | "/ensure-sidebar"
-            | "/toggle"
+        "/client-resized" | "/pane-exited" | "/pane-layout-changed" | "/ensure-sidebar" | "/toggle"
     )
 }
 

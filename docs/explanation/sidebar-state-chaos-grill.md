@@ -131,7 +131,7 @@ Isolated proof-of-shape:
 - `packages/runtime-rs/tests/lifecycle_operation.rs` simulates connected clients, quit, late sidebar identify, warmup completion, and drain completion.
 - The test proves the key invariant: once `RequestQuit` moves the Server Generation to `Closing`, later lifecycle messages cannot move it back to `Warming` or `Ready`.
 - The test also covers 100 connected clients: `Quit` sends `quit` to every other client, does not send `quit` back to the requesting client, and rejects a re-entrant `Quit` submission through the Lifecycle Channel while effects are being delivered.
-- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is config-owned, so the reducer models lifecycle/presence/switch/quit only.
+- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is server-owned and changed only by explicit live width commands from the TUI slider, so the reducer models lifecycle/presence/switch/quit only.
 
 Live red contract:
 
@@ -182,17 +182,17 @@ Earlier we thought `adjusting…` should model width convergence: after one side
 
 Final decision:
 
-> Delete the width-adjustment concept. Sidebar width is Fixed Sidebar Width: configured per Server Generation and never authored by observed tmux pane width. Width drift is repaired, not modeled as a user-visible lifecycle.
+> Delete the width-adjustment concept. Sidebar width is Fixed Sidebar Width: server-owned per Server Generation, seeded by persisted configuration, changed only by explicit live width commands, saved back to configuration, and never authored by observed tmux pane width. Width drift is repaired, not modeled as a user-visible lifecycle.
 
 Why this is simpler:
 
 - there is no competing owner, so stale panes cannot steal width authority
-- manual divider drags, full terminal resizes, pane exits, and tmux layout churn all collapse to the same case: repair back to configured width
+- manual divider drags, full terminal resizes, pane exits, and tmux layout churn all collapse to the same case: repair back to Fixed Sidebar Width
 - `adjusting…` disappears from product state; only `warming up…` and `closing…` remain user-visible lifecycle labels
 
 Recommended ownership rule:
 
-> Configuration owns width. Clients and tmux hooks can report drift, but they cannot mutate Fixed Sidebar Width.
+> The server owns width. The live TUI width slider can send an explicit width command for each movement; the server persists accepted values. Clients and tmux hooks can report drift, but they cannot mutate Fixed Sidebar Width through observations.
 
 Live contract:
 
@@ -211,7 +211,7 @@ enum WidthObservation {
 }
 ```
 
-The key is not a richer transaction enum. The key is that runtime observations do not own the configured width. If an old pane reports width 24 while the configured width is 36, that report cannot become a new target; it can only trigger repair back to 36.
+The key is not a richer transaction enum. The key is that runtime observations do not own Fixed Sidebar Width. If an old pane reports width 24 while Fixed Sidebar Width is 36, that report cannot become a new target; it can only trigger repair back to 36. If the user wants 38, the live TUI slider sends an explicit `set-sidebar-width` command and the server persists it.
 
 ### 3. Server-derived vs client-derived state is blurred
 
@@ -491,7 +491,7 @@ Not enough:
 
 Needed data:
 
-- configured width
+- Fixed Sidebar Width
 - sidebar pane identity/title
 - observed pane width
 - hook/backstop evidence if repair fails
@@ -506,7 +506,7 @@ Recommended answer:
 
 Refinement:
 
-> Competing reports are repaired to configured width. They must not queue a future target width and must not overwrite Fixed Sidebar Width.
+> Competing reports are repaired to Fixed Sidebar Width. They must not queue a future target width and must not overwrite Fixed Sidebar Width.
 
 This is the “use Rust ownership” rule: runtime observations do not own `FixedSidebarWidth`, so they cannot mutate the target width.
 

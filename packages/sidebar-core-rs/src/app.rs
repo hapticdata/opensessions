@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
+
 use crate::generated::protocol::{
     AgentEvent, AgentStatus, ClientCommand, ServerMessage, ServerState, SessionData,
     SessionFilterMode,
@@ -71,6 +73,9 @@ pub enum Modal {
         selected: usize,
         original_theme: Option<String>,
     },
+    WidthSlider {
+        draft_width: u16,
+    },
     KillConfirm {
         session_name: String,
     },
@@ -84,6 +89,7 @@ pub struct App {
     pub my_session: Option<String>,
     pub initializing: bool,
     pub init_label: Option<String>,
+    pub sidebar_width: u16,
     pub theme: Option<String>,
     pub ts: u64,
     /// Locally-driven spinner clock in ms. Advances on every render tick
@@ -129,6 +135,7 @@ impl App {
             my_session: None,
             initializing: state.initializing,
             init_label: state.init_label,
+            sidebar_width: state.sidebar_width.min(u16::MAX as u32) as u16,
             theme: state.theme,
             ts: state.ts,
             spinner_now: 0,
@@ -232,6 +239,7 @@ impl App {
                 self.sessions = state.sessions;
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
+                self.sidebar_width = state.sidebar_width.min(u16::MAX as u32) as u16;
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
@@ -400,6 +408,7 @@ impl App {
                 session_name: self.local_session_name().map(str::to_string),
             }),
             't' => self.open_theme_picker(),
+            'w' => self.open_width_slider(),
             'f' => self.cycle_filter(),
             'a' => self.toggle_agent_panel_scope(),
             _ => {}
@@ -652,6 +661,36 @@ impl App {
         if let Some(name) = self.theme.clone() {
             self.commands.push(ClientCommand::SetTheme { theme: name });
         }
+        self.modal = Modal::None;
+    }
+
+    pub fn open_width_slider(&mut self) {
+        self.modal = Modal::WidthSlider {
+            draft_width: self.sidebar_width,
+        };
+    }
+
+    pub fn adjust_width_slider(&mut self, delta: i16) {
+        if let Modal::WidthSlider { draft_width, .. } = &mut self.modal {
+            let next = (*draft_width as i16 + delta)
+                .clamp(MIN_SIDEBAR_WIDTH as i16, MAX_SIDEBAR_WIDTH as i16)
+                as u16;
+            if next == *draft_width {
+                return;
+            }
+            *draft_width = next;
+            self.sidebar_width = next;
+            self.commands.push(ClientCommand::SetSidebarWidth {
+                width: u32::from(next),
+            });
+        }
+    }
+
+    pub fn close_width_slider(&mut self) {
+        self.modal = Modal::None;
+    }
+
+    pub fn confirm_width_slider(&mut self) {
         self.modal = Modal::None;
     }
 

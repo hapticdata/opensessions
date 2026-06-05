@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -111,6 +112,63 @@ fn tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize() {
     lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "1"]);
 
     lab.wait_for_all_sidebar_widths(36);
+}
+
+#[test]
+fn tmux_sidebar_width_slider_is_the_only_width_author() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-width-slider");
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_all_sidebar_widths(36);
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("Sidebar width"));
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
+    lab.wait_for_all_sidebar_widths(38);
+    assert_eq!(
+        lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
+        "38"
+    );
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+
+    lab.tmux_ok(["resize-pane", "-t", source.as_str(), "-x", "50"]);
+    lab.wait_for_all_sidebar_widths(38);
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.wait_for_capture_pane(&source, |text| text.contains("Sidebar width"));
+    for _ in 0..4 {
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "H"]);
+    }
+    lab.wait_for_all_sidebar_widths(20);
+    assert_eq!(
+        lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
+        "20"
+    );
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
+    lab.wait_for_capture_pane(&source, |text| {
+        text.contains("Sidebar width") && text.contains("20 columns")
+    });
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Right"]);
+    lab.wait_for_all_sidebar_widths(21);
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Esc"]);
+
+    let config = fs::read_to_string(lab.config_path()).expect("read persisted e2e config");
+    assert!(
+        config.contains("\"sidebarWidth\": 21") || config.contains("\"sidebarWidth\":21"),
+        "slider should persist sidebarWidth=21; config={config}"
+    );
+
+    lab.restart_server();
+    lab.wait_for_all_sidebar_widths(21);
+    assert_eq!(
+        lab.tmux(["show-option", "-gqv", "@opensessions_width"]),
+        "21"
+    );
 }
 
 #[test]
@@ -455,14 +513,18 @@ struct Lab {
 
 impl Lab {
     fn new(prefix: &str) -> Self {
-        let unique = format!(
-            "{}-{}-{}",
-            prefix,
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
-        );
+        static LAB_ID: AtomicU64 = AtomicU64::new(1);
+        let id = LAB_ID.fetch_add(1, Ordering::Relaxed);
+        let unique = format!("{}-{}-{}", prefix, std::process::id(), id,);
         let root = std::env::temp_dir().join(&unique);
         fs::create_dir_all(&root).expect("create e2e root");
+        let config_dir = root.join("home/.config/opensessions");
+        fs::create_dir_all(&config_dir).expect("create e2e config dir");
+        fs::write(
+            config_dir.join("config.json"),
+            format!("{{\"plugins\":[],\"sidebarWidth\":{W}}}\n"),
+        )
+        .expect("write e2e config");
         Self {
             socket: unique,
             root,
@@ -598,6 +660,8 @@ time.sleep(300)
         let tmux_env = self.tmux_socket_env();
         let child = Command::new(server)
             .env("TMUX", tmux_env)
+            .env("HOME", self.home_dir())
+            .env_remove("OPENSESSIONS_WIDTH")
             .env("OPENSESSIONS_HOST", "127.0.0.1")
             .env("OPENSESSIONS_PORT", self.port.to_string())
             .env(
@@ -608,13 +672,22 @@ time.sleep(300)
                 "OPENSESSIONS_PID_FILE",
                 self.root.join("server.pid").to_str().unwrap(),
             )
-            .env("OPENSESSIONS_WIDTH", W)
             .stdout(File::create(self.root.join("server.stdout.log")).expect("server stdout log"))
             .stderr(File::create(self.root.join("server.stderr.log")).expect("server stderr log"))
             .spawn()
             .expect("start opensessions server");
         self.server = Some(child);
         self.wait_for_server();
+    }
+
+    fn restart_server(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        self.wait_for_no_sidebar_processes();
+        self.start_server();
+        self.spawn_sidebars();
     }
 
     fn wait_for_server(&self) {
@@ -1197,6 +1270,14 @@ time.sleep(300)
         std::env::var_os("OPENSESSIONS_E2E_SERVER_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| self.target_debug_bin("opensessions-server"))
+    }
+
+    fn home_dir(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.home_dir().join(".config/opensessions/config.json")
     }
 
     fn target_debug_bin(&self, name: &str) -> PathBuf {
