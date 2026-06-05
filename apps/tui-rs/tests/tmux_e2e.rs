@@ -128,6 +128,25 @@ fn tmux_sidebar_quit_closes_the_server_and_every_sidebar_client() {
 }
 
 #[test]
+fn tmux_sidebar_stays_closed_across_session_and_window_switch_hooks() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-open-close");
+    lab.wait_for_all_sidebar_widths(36);
+
+    post_hook(lab.port, "/toggle");
+    lab.wait_for_no_sidebar_processes();
+
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    sleep(Duration::from_millis(800));
+    lab.assert_no_sidebar_panes("closed sidebar must not respawn after session switch");
+
+    lab.tmux_ok(["new-window", "-d", "-t", "effect-ts", "sh"]);
+    lab.tmux_ok(["select-window", "-t", "effect-ts:1"]);
+    sleep(Duration::from_millis(800));
+    lab.assert_no_sidebar_panes("closed sidebar must not respawn after window switch");
+}
+
+#[test]
 fn tmux_sidebar_multiple_clients_keep_independent_active_rows() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-multiclient");
@@ -396,9 +415,16 @@ fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
 }
 
 fn post_refresh(port: u16) {
+    post_hook(port, "/refresh");
+}
+
+fn post_hook(port: u16, path: &str) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect /refresh");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
     stream
-        .write_all(b"POST /refresh HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .write_all(request.as_bytes())
         .expect("write /refresh");
     let mut response = [0; 128];
     let _ = stream.read(&mut response);
@@ -920,6 +946,15 @@ time.sleep(300)
         panic!(
             "timed out waiting for all sidebar panes to exit; panes={:?}\nlogs:\n{}",
             self.sidebar_panes(),
+            self.logs(),
+        );
+    }
+
+    fn assert_no_sidebar_panes(&self, reason: &str) {
+        let panes = self.sidebar_panes();
+        assert!(
+            panes.is_empty(),
+            "{reason}; panes={panes:?}\nlogs:\n{}",
             self.logs(),
         );
     }

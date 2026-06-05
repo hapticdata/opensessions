@@ -418,6 +418,10 @@ impl ReadOnlyMuxStateSource {
             .min(u16::MAX as u32) as u16
     }
 
+    fn is_sidebar_visible(&self) -> bool {
+        self.sidebar_coordinator.lock().unwrap().state().visible
+    }
+
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.now_ms = Arc::new(now_ms);
         self
@@ -1355,6 +1359,10 @@ impl ReadOnlyMuxStateSource {
         // `/ensure-sidebar` handler.
         let width = self.current_sidebar_width_u16();
         self.enforce_sidebar_width(width);
+        if !self.is_sidebar_visible() {
+            debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
+            return;
+        }
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
                 continue;
