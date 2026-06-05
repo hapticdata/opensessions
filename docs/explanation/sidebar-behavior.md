@@ -95,7 +95,7 @@ There is no resize transaction state machine anymore. A sidebar pane can report 
 The accepted rule set is:
 
 - persisted `sidebarWidth` seeds Fixed Sidebar Width for the tmux server
-- `OPENSESSIONS_WIDTH` can override the persisted seed for explicit scripts/tests
+- deprecated `OPENSESSIONS_WIDTH` only seeds Fixed Sidebar Width when persisted config has no `sidebarWidth`; it must not override slider-persisted width on restart
 - debounced `set-sidebar-width` from the live TUI width slider is the only runtime command that mutates Fixed Sidebar Width, and the accepted value is saved back to persisted config
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `report-width` from a TUI client is a drift signal, not a command to change width

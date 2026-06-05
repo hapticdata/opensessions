@@ -31,7 +31,6 @@ PORT_BASE=22000
 TMUX_OPENSESSIONS_PORT="$(tmux show-environment -g OPENSESSIONS_PORT 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_HOST="$(tmux show-environment -g OPENSESSIONS_HOST 2>/dev/null | cut -d= -f2)"
 TMUX_OPENSESSIONS_PID_FILE="$(tmux show-environment -g OPENSESSIONS_PID_FILE 2>/dev/null | cut -d= -f2)"
-TMUX_OPENSESSIONS_WIDTH="$(tmux show-environment -g OPENSESSIONS_WIDTH 2>/dev/null | cut -d= -f2)"
 
 if [ -n "$TMUX_OPENSESSIONS_PORT" ]; then
   PORT="$TMUX_OPENSESSIONS_PORT"
@@ -51,7 +50,6 @@ fi
 
 PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-SERVER_WIDTH="${TMUX_OPENSESSIONS_WIDTH:-26}"
 SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
 START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
 
@@ -105,6 +103,8 @@ release_start_lock() {
 }
 
 ensure_server() {
+  unset OPENSESSIONS_WIDTH
+
   if server_alive; then
     return 0
   fi
@@ -134,7 +134,6 @@ ensure_server() {
   OPENSESSIONS_HOST="$HOST" \
   OPENSESSIONS_PORT="$PORT" \
   OPENSESSIONS_PID_FILE="$PID_FILE" \
-  OPENSESSIONS_WIDTH="$SERVER_WIDTH" \
   OPENSESSIONS_DIR="$PLUGIN_DIR" \
     "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 

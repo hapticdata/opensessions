@@ -85,7 +85,7 @@ The tmux integration reads these tmux options instead of `config.json`:
 | `@opensessions-prefix-key` | `o` | Key after the tmux prefix that enters the opensessions key table (`prefix <key>`) |
 | `@opensessions-focus-global-key` | unset | Optional no-prefix tmux keybinding that reveals and focuses the sidebar pane |
 | `@opensessions-index-keys` | unset | Optional space-separated no-prefix tmux keys mapped in order to visible sessions `1` through `9` |
-| `@opensessions-width` | `26` | exported as `OPENSESSIONS_WIDTH` by the tmux bootstrap script |
+| `@opensessions-width` | deprecated | Use `sidebarWidth` in config or the in-sidebar width slider instead |
 
 The plugin registers these prefix bindings automatically:
 
@@ -120,7 +120,6 @@ source-file /absolute/path/to/opensessions/opensessions.tmux
 Optional overrides:
 
 ```tmux
-set -g @opensessions-width "30"
 set -g @opensessions-prefix-key "o"   # default; change to remap the opensessions key table
 ```
 
@@ -136,6 +135,7 @@ All other tmux options fall back to the defaults shown in the table above.
 | `OPENSESSIONS_DIR` | tmux helper scripts and server | Helps helper scripts find the repo checkout |
 | `OPENSESSIONS_HOST` | helper shell scripts | Script-level override only; the app runtime still uses `127.0.0.1` |
 | `OPENSESSIONS_PORT` | helper shell scripts | Script-level override only; the app runtime still uses `7391` |
+| `OPENSESSIONS_WIDTH` | server fallback | Deprecated; only seeds width when config has no `sidebarWidth`. Persisted `sidebarWidth` wins on restart |
 | `SESSIONIZER_DIR` | tmux sessionizer popup | Colon-separated directories searched for new-session candidates (e.g. `$HOME/Code:$HOME/.config`). Also checked via `tmux show-environment -g` when the shell variable is unset. Defaults to `$HOME/Documents` |
 | `SESSIONIZER_MAXDEPTH` | tmux sessionizer popup | Maximum `find` depth when collecting new-session candidates. Also checked via `tmux show-environment -g` when the shell variable is unset. Defaults to `3` |
 | `BUN_PATH` | helper scripts | Explicit Bun binary path for helper scripts |

@@ -657,7 +657,7 @@ time.sleep(300)
         let child = Command::new(server)
             .env("TMUX", tmux_env)
             .env("HOME", self.home_dir())
-            .env_remove("OPENSESSIONS_WIDTH")
+            .env("OPENSESSIONS_WIDTH", "35")
             .env("OPENSESSIONS_HOST", "127.0.0.1")
             .env("OPENSESSIONS_PORT", self.port.to_string())
             .env(

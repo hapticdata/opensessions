@@ -17,7 +17,7 @@
 #   @opensessions-prefix-key        "o"  — prefix + key to enter opensessions command table
 #   @opensessions-focus-global-key  ""   — optional no-prefix key to reveal and focus sidebar
 #   @opensessions-index-keys        ""   — optional no-prefix keys mapped to visible sessions 1..9
-#   @opensessions-width             "35" — sidebar width in columns
+#   @opensessions-width             deprecated — use config.json sidebarWidth or the in-sidebar width slider
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$CURRENT_DIR/integrations/tmux-plugin/scripts"
@@ -37,7 +37,6 @@ get_option() {
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
-WIDTH=$(get_option "@opensessions-width" "35")
 COMMAND_TABLE="opensessions"
 
 bind_global_key() {
@@ -59,7 +58,7 @@ bind_global_index_keys() {
 
 # Export so scripts can read them
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
-tmux set-environment -g OPENSESSIONS_WIDTH "$WIDTH"
+tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
 
 # --- Bootstrap: kill stale server if version or install path changed ---
 VERSION_FILE="${PID_FILE%.pid}.version"

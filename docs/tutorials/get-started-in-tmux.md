@@ -53,10 +53,10 @@ tmux source-file ~/.tmux.conf
 ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
-All `@opensessions-*` tmux options already have defaults. Add overrides only when you want different width or global keys, for example:
+All `@opensessions-*` tmux options already have defaults. Configure width from the in-sidebar width slider or `~/.config/opensessions/config.json`; add tmux overrides only for global keys, for example:
 
 ```tmux
-set -g @opensessions-width "30"
+set -g @opensessions-focus-global-key "C-e"
 ```
 
 Result: tmux registers direct prefix bindings for sidebar toggle, focus, and session switching.

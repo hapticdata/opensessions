@@ -376,9 +376,8 @@ pub fn default_state_source_from_env(
         let config_width = env("HOME")
             .map(PathBuf::from)
             .and_then(|home| load_config_from_home(&home).sidebar_width);
-        let width = env("OPENSESSIONS_WIDTH")
-            .and_then(|width| width.parse::<u16>().ok())
-            .or(config_width);
+        let width = config_width
+            .or_else(|| env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()));
         if let Some(width) = width {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
