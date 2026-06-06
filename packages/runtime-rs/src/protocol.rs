@@ -23,6 +23,11 @@ pub enum ServerMessage {
         name: String,
         client_tty: Option<String>,
     },
+    ActivateSession {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_pane_id: Option<String>,
+    },
     ReIdentify,
 }
 

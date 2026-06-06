@@ -25,16 +25,18 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-focus");
 
-    lab.wait_for_text("opensessions", "os-demo-worktrees");
+    lab.wait_for_text("opensessions", "Sessions");
     lab.wait_for_text("effect-ts", "effect-ts");
 
     let source = lab.sidebar_pane("opensessions");
     let tab_destination = lab.sidebar_pane("os-demo-feat-agent-panel");
-    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     sleep(Duration::from_millis(250));
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    assert_eq!(lab.active_pane(), source, "sidebar pane must be active before keyboard shortcut");
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "4"]);
     lab.wait_for_client_session("os-demo-feat-agent-panel");
     lab.wait_for_capture("os-demo-feat-agent-panel", |text| {
         row_with(text, "os-demo-feat-agent-panel").is_some_and(|row| row.contains("▌"))
@@ -119,33 +121,77 @@ fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
     let source = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
-    lab.wait_for_text("opensessions", "z-normal");
-    lab.wait_for_capture_pane(&source, |text| {
-        row_index(text, "os-demo-worktrees")
-            .is_some_and(|group| row_index(text, "z-normal").is_some_and(|normal| normal > group))
-    });
-
-    for _ in 0..6 {
-        lab.tmux_ok(["send-keys", "-t", source.as_str(), "Down"]);
-    }
-    lab.wait_for_capture_pane(&source, |text| {
-        row_with(text, "z-normal").is_some_and(|row| row.trim_start().starts_with("›"))
+    assert_eq!(lab.active_pane(), source, "sidebar pane must be active before reorder focus setup");
+    lab.wait_for_session_order(|names| {
+        position(names, "os-demo-preview")
+            .is_some_and(|preview| position(names, "z-normal").is_some_and(|normal| normal > preview))
     });
 
     lab.reorder_session("z-normal", -1);
 
-    lab.wait_for_capture_pane(&source, |text| {
-        row_index(text, "z-normal").is_some_and(|normal| {
-            row_index(text, "os-demo-worktrees").is_some_and(|group| normal < group)
+    lab.wait_for_session_order(|names| {
+        position(names, "z-normal").is_some_and(|normal| {
+            position(names, "os-demo-feat-agent-panel").is_some_and(|first_worktree| normal < first_worktree)
         })
     });
 
     lab.reorder_session("z-normal", 1);
 
+    lab.wait_for_session_order(|names| {
+        position(names, "os-demo-preview")
+            .is_some_and(|preview| position(names, "z-normal").is_some_and(|normal| normal > preview))
+    });
+}
+
+#[test]
+fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-rehome-return-focus");
+    let second_window = lab.spawn_window_with_sidebar("opensessions", "second-sidebar");
+    let source = lab.sidebar_pane("opensessions");
+    let second = lab.sidebar_pane_in_window("opensessions", &second_window);
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
     lab.wait_for_capture_pane(&source, |text| {
-        row_index(text, "z-normal").is_some_and(|normal| {
-            row_index(text, "os-demo-worktrees").is_some_and(|group| normal > group)
-        })
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    lab.wait_for_capture_pane(&second, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+    });
+
+    lab.move_focus_off_active(&source, "opensessions");
+    lab.move_focus_off_active(&second, "opensessions");
+    let stale_capture = lab.capture_pane(&source);
+    assert!(
+        has_non_active_focus_marker(&stale_capture, "opensessions"),
+        "test setup should leave a stale non-active focus row before switching away; got:\n{stale_capture}",
+    );
+    let second_stale_capture = lab.capture_pane(&second);
+    assert!(
+        has_non_active_focus_marker(&second_stale_capture, "opensessions"),
+        "test setup should leave every opensessions sidebar with stale temporary focus; got:\n{second_stale_capture}",
+    );
+
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
+    lab.wait_for_client_session("effect-ts");
+    let effect = lab.sidebar_pane("effect-ts");
+    lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
+    lab.click_session_row(&effect, "opensessions");
+
+    let first_visible = lab.first_capture_after_client_session("opensessions", &source);
+    assert!(
+        row_with(&first_visible, "opensessions").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(&first_visible, "opensessions"),
+        "first visible opensessions sidebar frame after sidebar-driven switch must not show stale temporary focus; got:\n{first_visible}",
+    );
+
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(text, "opensessions")
+    });
+    lab.wait_for_capture_pane(&second, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(text, "opensessions")
     });
 }
 
@@ -436,7 +482,7 @@ fn tmux_sidebar_switch_stays_responsive_with_100_connected_clients() {
         }
 
         let started = Instant::now();
-        lab.tmux_ok(["send-keys", "-t", source.as_str(), "Tab"]);
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "C-i"]);
         lab.wait_for_client_session("os-demo-feat-agent-panel");
         let elapsed = started.elapsed();
         assert!(
@@ -525,6 +571,15 @@ fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
 
 fn row_index(text: &str, needle: &str) -> Option<usize> {
     text.lines().position(|line| line.contains(needle))
+}
+
+fn position(names: &[String], needle: &str) -> Option<usize> {
+    names.iter().position(|name| name == needle)
+}
+
+fn has_non_active_focus_marker(text: &str, active_session: &str) -> bool {
+    text.lines()
+        .any(|line| line.contains("›") && !line.contains(active_session))
 }
 
 fn post_refresh(port: u16) {
@@ -902,6 +957,26 @@ time.sleep(300)
         );
     }
 
+    fn first_capture_after_client_session(&self, expected: &str, pane: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
+            if output.lines().any(|line| line.trim() == expected) {
+                return self.capture_pane(pane);
+            }
+            sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for client session {expected}; clients:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
+    }
+
     fn wait_for_client_sessions<const N: usize>(&self, expected: [&str; N]) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -988,9 +1063,31 @@ time.sleep(300)
         );
     }
 
+    fn move_focus_off_active(&self, pane: &str, active_session: &str) {
+        for _ in 0..6 {
+            self.tmux_ok(["send-keys", "-t", pane, "Down"]);
+            sleep(Duration::from_millis(100));
+            if has_non_active_focus_marker(&self.capture_pane(pane), active_session) {
+                return;
+            }
+        }
+    }
+
+    fn click_session_row(&self, pane: &str, session: &str) {
+        let capture = self.capture_pane(pane);
+        let y = row_index(&capture, session)
+            .unwrap_or_else(|| panic!("no row for {session} in pane {pane}; got:\n{capture}"))
+            + 1;
+        let x = 6;
+        let press = format!("\x1b[<0;{x};{y}M");
+        let release = format!("\x1b[<0;{x};{y}m");
+        self.tmux_ok(["send-keys", "-t", pane, "-l", &press]);
+        self.tmux_ok(["send-keys", "-t", pane, "-l", &release]);
+    }
+
     fn measure_tab_switch(&self, from_session: &str, source_pane: &str) -> Duration {
         let started = Instant::now();
-        self.tmux_ok(["send-keys", "-t", source_pane, "Tab"]);
+        self.tmux_ok(["send-keys", "-t", source_pane, "C-i"]);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
@@ -1041,6 +1138,51 @@ time.sleep(300)
             ws.close().await.expect("close reorder ws client");
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
+    }
+
+    fn wait_for_session_order<F>(&self, predicate: F)
+    where
+        F: Fn(&[String]) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = Vec::new();
+        while Instant::now() < deadline {
+            last = self.session_names();
+            if predicate(&last) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for session order; last={last:?}\nlogs:\n{}", self.logs());
+    }
+
+    fn session_names(&self) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect session-order ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let state = ws
+                .next()
+                .await
+                .expect("read ws initial state")
+                .expect("ws initial state");
+            let state = String::from_utf8(state.as_payload().to_vec()).expect("state text");
+            ws.close().await.expect("close session-order ws client");
+            let json = serde_json::from_str::<serde_json::Value>(&state).expect("parse state json");
+            json.get("sessions")
+                .and_then(serde_json::Value::as_array)
+                .expect("state sessions array")
+                .iter()
+                .filter_map(|session| session.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
     }
 
     fn wait_for_no_sidebar_processes(&self) {
@@ -1106,8 +1248,35 @@ time.sleep(300)
     fn sidebar_pane(&self, session: &str) -> String {
         let output = self.tmux([
             "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_title}",
+        ]);
+        output
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('\t');
+                let pane_session = parts.next()?;
+                let pane = parts.next()?;
+                let command = parts.next()?;
+                let title = parts.next()?;
+                (pane_session == session
+                    && (title == "opensessions-sidebar" || command.starts_with("opensessions")))
+                    .then(|| pane.to_string())
+            })
+            .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+    }
+
+    fn active_pane(&self) -> String {
+        self.tmux(["display-message", "-p", "#{pane_id}"])
+    }
+
+    fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
+        let target = format!("{session}:{window}");
+        let output = self.tmux([
+            "list-panes",
             "-t",
-            session,
+            &target,
             "-F",
             "#{pane_id} #{pane_current_command}",
         ]);
@@ -1119,11 +1288,12 @@ time.sleep(300)
                     .starts_with("opensessions")
                     .then(|| pane.to_string())
             })
-            .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
+            .unwrap_or_else(|| panic!("no sidebar pane found for {target}; panes:\n{output}"))
     }
 
     fn next_window_index(&self, session: &str) -> u32 {
-        self.tmux(["list-windows", "-t", session, "-F", "#{window_index}"])
+        let target = exact_session_target(session);
+        self.tmux(["list-windows", "-t", &target, "-F", "#{window_index}"])
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
             .max()
@@ -1146,10 +1316,11 @@ time.sleep(300)
     }
 
     fn non_sidebar_panes(&self, session: &str) -> Vec<String> {
+        let target = exact_session_target(session);
         self.tmux([
             "list-panes",
             "-t",
-            session,
+            &target,
             "-F",
             "#{pane_id}\t#{pane_title}",
         ])
@@ -1302,6 +1473,10 @@ time.sleep(300)
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn exact_session_target(session: &str) -> String {
+    format!("={session}:")
 }
 
 impl Drop for Lab {

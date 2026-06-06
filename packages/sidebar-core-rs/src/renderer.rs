@@ -824,11 +824,7 @@ fn build_session_detail_row(
     }
     if has_diff_stats {
         let spaces = width.saturating_sub(line.width() + diff_stats_width(session));
-        line.push_hit(
-            " ".repeat(spaces),
-            palette.white,
-            HitTarget::DiffCount(session.name.clone()),
-        );
+        line.push(" ".repeat(spaces), palette.white);
         push_diff_stats(&mut line, palette, session, app);
     }
     line.end(CellStyle {
@@ -2457,3 +2453,68 @@ pub fn palette_for_theme(name: Option<&str>) -> Palette {
 
 // Default foreground used for the screen-filling Block in `render_model`.
 const WHITE: Rgb = Rgb::new(255, 255, 255);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::generated::protocol::{ServerState, SessionData};
+
+    fn app_with_diff_stats() -> App {
+        App::from_state(ServerState {
+            sessions: vec![SessionData {
+                name: "opensessions".to_string(),
+                created_at: 0,
+                dir: "/tmp/opensessions".to_string(),
+                branch: "main".to_string(),
+                dirty: true,
+                changed_files: 2,
+                insertions: 12,
+                deletions: 3,
+                is_worktree: false,
+                unseen: false,
+                panes: 1,
+                ports: Vec::new(),
+                local_links: Vec::new(),
+                windows: 1,
+                uptime: "1m".to_string(),
+                agent_state: None,
+                agents: Vec::new(),
+                event_timestamps: Vec::new(),
+                metadata: None,
+            }],
+            focused_session: None,
+            current_session: Some("opensessions".to_string()),
+            theme: None,
+            session_filter: None,
+            sidebar_width: 40,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        })
+    }
+
+    #[test]
+    fn diff_count_hit_target_only_covers_rendered_numbers() {
+        let app = app_with_diff_stats();
+        let width = 40u16;
+        let height = 24u16;
+        let detail_row = 3u16;
+        let diff_start = width as usize - " +12 -3".width();
+
+        assert_eq!(
+            compute_hit_target(&app, (diff_start - 1) as u16, detail_row, width, height),
+            Some(HitTarget::Session("opensessions".to_string())),
+            "padding before diff stats should keep the row's session target"
+        );
+        assert_eq!(
+            compute_hit_target(&app, diff_start as u16, detail_row, width, height),
+            Some(HitTarget::DiffCount("opensessions".to_string()))
+        );
+        assert_eq!(
+            compute_hit_target(&app, width - 1, detail_row, width, height),
+            Some(HitTarget::DiffCount("opensessions".to_string()))
+        );
+    }
+}

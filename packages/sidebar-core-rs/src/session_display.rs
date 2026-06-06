@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::generated::protocol::{AgentStatus, SessionData};
+use crate::generated::protocol::{AgentEvent, AgentStatus, SessionData};
 
 #[derive(Debug, Clone, Default)]
 pub struct GroupSummary {
@@ -92,10 +92,7 @@ pub(crate) fn session_display_entries<'a>(
 fn group_summary(sessions: &[&SessionData]) -> GroupSummary {
     let mut summary = GroupSummary::default();
     for session in sessions {
-        if matches!(
-            session.agent_state.as_ref().map(|agent| agent.status),
-            Some(AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting)
-        ) {
+        if session_has_active_agent(session) {
             summary.running_agents += 1;
         }
         if session.unseen {
@@ -112,6 +109,21 @@ fn group_summary(sessions: &[&SessionData]) -> GroupSummary {
         }
     }
     summary
+}
+
+fn session_has_active_agent(session: &SessionData) -> bool {
+    session
+        .agent_state
+        .iter()
+        .chain(session.agents.iter())
+        .any(|agent| is_active_agent(agent))
+}
+
+fn is_active_agent(agent: &AgentEvent) -> bool {
+    matches!(
+        agent.status,
+        AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
+    )
 }
 
 fn grouped_worktree_keys(sessions: &[&SessionData]) -> HashSet<String> {

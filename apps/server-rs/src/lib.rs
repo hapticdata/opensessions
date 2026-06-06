@@ -872,7 +872,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                 self.toggle_sidebar();
                 Some(self.snapshot_json())
             }
-            "/ensure-sidebar" => self.ensure_sidebar(body).then(|| self.snapshot_json()),
+            "/ensure-sidebar" => {
+                let spawned = self.ensure_sidebar(body);
+                parse_context_session(body)
+                    .map(|name| activate_session_json(name, None))
+                    .or_else(|| spawned.then(|| self.snapshot_json()))
+            }
             "/pane-exited" => {
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes();
@@ -1864,6 +1869,20 @@ fn json_string_or_null(value: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+fn activate_session_json(name: String, source_pane_id: Option<&str>) -> String {
+    match source_pane_id {
+        Some(source_pane_id) => format!(
+            r#"{{"type":"activate-session","name":{},"sourcePaneId":{}}}"#,
+            json_string_or_null(Some(&name)),
+            json_string_or_null(Some(source_pane_id)),
+        ),
+        None => format!(
+            r#"{{"type":"activate-session","name":{}}}"#,
+            json_string_or_null(Some(&name)),
+        ),
+    }
+}
+
 fn parse_metadata_tone(value: &str) -> Option<MetadataTone> {
     match value {
         "neutral" => Some(MetadataTone::Neutral),
@@ -2414,6 +2433,13 @@ async fn handle_connection(
                                 {
                                     websocket.send(Message::text(reply)).await?;
                                 }
+                                if let Some(name) = switch_session_target(&command) {
+                                    let _ = state_updates.send(activate_session_json(
+                                        name,
+                                        client_context.pane_id.as_deref(),
+                                    ));
+                                    tokio::task::yield_now().await;
+                                }
                                 if let Some(payload) = state_source
                                     .as_ref()
                                     .and_then(|state_source| state_source.handle_client_command_with_context(&command, Some(&client_context)))
@@ -2444,6 +2470,10 @@ async fn handle_connection(
                             if state == QUIT_JSON {
                                 let _ = websocket.send(Message::text(QUIT_JSON)).await;
                                 return Ok(());
+                            }
+                            if is_immediate_server_message(&state) {
+                                websocket.send(Message::text(state)).await?;
+                                continue;
                             }
                             pending_state = Some(state);
                         }
@@ -2637,6 +2667,15 @@ fn is_client_view_command(command: &Value) -> bool {
         command.get("type").and_then(Value::as_str),
         Some("switch-session" | "switch-index")
     )
+}
+
+fn switch_session_target(command: &Value) -> Option<String> {
+    (command.get("type").and_then(Value::as_str) == Some("switch-session"))
+        .then(|| command.get("name")?.as_str().map(str::to_string))?
+}
+
+fn is_immediate_server_message(payload: &str) -> bool {
+    payload.contains(r#""type":"activate-session""#)
 }
 
 fn parse_command(message: &Message) -> Option<Value> {

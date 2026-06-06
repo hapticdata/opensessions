@@ -549,6 +549,7 @@ fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
         };
     } else if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
+            KeyCode::Char('i') => Some(UiKey::Tab { shift: false }),
             KeyCode::Char('j') => Some(UiKey::CtrlJ),
             KeyCode::Char('k') => Some(UiKey::CtrlK),
             _ => None,
@@ -560,6 +561,7 @@ fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
         KeyCode::Char('k') | KeyCode::Up => Some(UiKey::Up),
         KeyCode::Left => Some(UiKey::Left),
         KeyCode::Right => Some(UiKey::Right),
+        KeyCode::Char('\t') => Some(UiKey::Tab { shift: false }),
         KeyCode::Char(ch) => Some(UiKey::Char(ch)),
         KeyCode::Tab => Some(UiKey::Tab { shift: false }),
         KeyCode::BackTab => Some(UiKey::Tab { shift: true }),
@@ -697,10 +699,11 @@ fn maybe_launch_lazydiff(
 }
 
 fn lazydiffs_command(branch: &str) -> String {
+    let lazydiff = "/Users/palanikannanm/Documents/work/lazydiff/target/dev-fast/lazydiff";
     if branch.is_empty() {
-        "lazydiff".to_string()
+        lazydiff.to_string()
     } else {
-        "lazydiff --branch".to_string()
+        format!("{lazydiff} --branch")
     }
 }
 

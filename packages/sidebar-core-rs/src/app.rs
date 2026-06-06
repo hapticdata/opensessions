@@ -261,6 +261,23 @@ impl App {
             ServerMessage::YourSession { name, .. } => {
                 self.confirm_local_session(name, true);
             }
+            ServerMessage::ActivateSession {
+                name,
+                source_pane_id,
+            } => {
+                let from_this_pane = self
+                    .pane_identity
+                    .as_ref()
+                    .and_then(|identity| {
+                        source_pane_id
+                            .as_ref()
+                            .map(|source| source == &identity.pane_id)
+                    })
+                    .unwrap_or(false);
+                if !from_this_pane && self.confirmed_local_session_name() == Some(name.as_str()) {
+                    self.confirm_local_session(name, true);
+                }
+            }
             ServerMessage::ReIdentify => {
                 if let Some(identity) = self.pane_identity.clone() {
                     self.commands.push(ClientCommand::IdentifyPane {
