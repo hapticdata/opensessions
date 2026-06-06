@@ -1870,17 +1870,11 @@ fn json_string_or_null(value: Option<&str>) -> String {
 }
 
 fn activate_session_json(name: String, source_pane_id: Option<&str>) -> String {
-    match source_pane_id {
-        Some(source_pane_id) => format!(
-            r#"{{"type":"activate-session","name":{},"sourcePaneId":{}}}"#,
-            json_string_or_null(Some(&name)),
-            json_string_or_null(Some(source_pane_id)),
-        ),
-        None => format!(
-            r#"{{"type":"activate-session","name":{}}}"#,
-            json_string_or_null(Some(&name)),
-        ),
-    }
+    serde_json::to_string(&SidebarServerMessage::ActivateSession {
+        name,
+        source_pane_id: source_pane_id.map(str::to_string),
+    })
+    .expect("activate-session must serialize")
 }
 
 fn parse_metadata_tone(value: &str) -> Option<MetadataTone> {
