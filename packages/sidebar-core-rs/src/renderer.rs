@@ -285,17 +285,12 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
     let running = app
         .sessions
         .iter()
-        .filter(|session| {
-            matches!(
-                session.agent_state.as_ref().map(|agent| agent.status),
-                Some(AgentStatus::Running | AgentStatus::ToolRunning)
-            )
-        })
+        .filter(|session| session_attention_signal(session).is_active())
         .count();
     let unseen = app.sessions.iter().filter(|session| session.unseen).count();
 
     let mut line = StyledLine::blank();
-    line.push("Sessions", palette.subtext0);
+    line.push(" sessions", palette.subtext0);
 
     if app.initializing {
         let label = app.init_label.as_deref().unwrap_or("warming up…");
@@ -312,24 +307,31 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
             line.push(label, palette.peach);
         }
     } else {
-        let count = sessions.to_string();
-        let spaces = width.saturating_sub(line.width() + count.width());
+        let mut right = Vec::new();
+        if running > 0 {
+            right.push(format!("⚡{running}"));
+        }
+        if unseen > 0 {
+            right.push(format!("●{unseen}"));
+        }
+        right.push(sessions.to_string());
+        let right = right.join(" ");
+        let spaces = width.saturating_sub(line.width() + right.width());
         if spaces > 0 {
             line.push(" ".repeat(spaces), palette.white);
         }
-        line.push(count, palette.overlay0);
-    }
-
-    if running > 0 {
-        let extra = format!(" ⚡{running}");
-        if line.width() + extra.width() <= width {
-            line.push(extra, palette.yellow);
-        }
-    }
-    if unseen > 0 {
-        let extra = format!(" ● {unseen}");
-        if line.width() + extra.width() <= width {
-            line.push(extra, palette.teal);
+        for (idx, part) in right.split(' ').enumerate() {
+            if idx > 0 {
+                line.push(" ", palette.white);
+            }
+            let color = if part.starts_with('⚡') {
+                palette.yellow
+            } else if part.starts_with('●') {
+                palette.teal
+            } else {
+                palette.overlay0
+            };
+            line.push(part, color);
         }
     }
     line.end(CellStyle::fg(palette.white))
@@ -420,17 +422,25 @@ enum SessionListRow<'a> {
         entry_idx: usize,
         index: usize,
         session: &'a SessionData,
-        indented: bool,
+        tree: TreePosition,
     },
     SessionDetail {
         entry_idx: usize,
         session: &'a SessionData,
-        indented: bool,
+        tree: TreePosition,
     },
     Spacer {
         entry_idx: usize,
-        group_rail: bool,
+        tree: TreePosition,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreePosition {
+    None,
+    Middle,
+    Last,
+    Rail,
 }
 
 impl<'a> SessionListRow<'a> {
@@ -466,18 +476,13 @@ impl<'a> SessionListRow<'a> {
             Self::SessionName {
                 index,
                 session,
-                indented,
+                tree,
                 ..
-            } => build_session_name_row(app, palette, index, session, indented),
-            Self::SessionDetail {
-                session, indented, ..
-            } => build_session_detail_row(app, palette, session, indented, width),
-            Self::Spacer {
-                group_rail: true, ..
-            } => inner_rail_blank(palette),
-            Self::Spacer {
-                group_rail: false, ..
-            } => rail_blank(palette),
+            } => build_session_name_row(app, palette, index, session, tree),
+            Self::SessionDetail { session, tree, .. } => {
+                build_session_detail_row(app, palette, session, tree, width)
+            }
+            Self::Spacer { tree, .. } => tree_blank(palette, tree),
         }
     }
 }
@@ -492,37 +497,60 @@ fn flatten_session_rows<'a>(entries: &'a [DisplaySessionEntry<'a>]) -> Vec<Sessi
                 count,
                 collapsed,
                 summary,
-            } => rows.push(SessionListRow::Group {
-                entry_idx,
-                key,
-                label,
-                count: *count,
-                collapsed: *collapsed,
-                summary,
-            }),
+            } => {
+                rows.push(SessionListRow::Group {
+                    entry_idx,
+                    key,
+                    label,
+                    count: *count,
+                    collapsed: *collapsed,
+                    summary,
+                });
+                rows.push(SessionListRow::Spacer {
+                    entry_idx,
+                    tree: if *collapsed {
+                        TreePosition::None
+                    } else {
+                        TreePosition::Rail
+                    },
+                });
+            }
             DisplaySessionEntry::Session {
                 index,
                 session,
                 indented,
             } => {
-                rows.push(SessionListRow::SessionName {
-                    entry_idx,
-                    index: *index,
-                    session,
-                    indented: *indented,
-                });
-                rows.push(SessionListRow::SessionDetail {
-                    entry_idx,
-                    session,
-                    indented: *indented,
-                });
                 let next_is_group_child = matches!(
                     entries.get(entry_idx + 1),
                     Some(DisplaySessionEntry::Session { indented: true, .. })
                 );
+                let tree = if *indented {
+                    if next_is_group_child {
+                        TreePosition::Middle
+                    } else {
+                        TreePosition::Last
+                    }
+                } else {
+                    TreePosition::None
+                };
+                rows.push(SessionListRow::SessionName {
+                    entry_idx,
+                    index: *index,
+                    session,
+                    tree,
+                });
+                rows.push(SessionListRow::SessionDetail {
+                    entry_idx,
+                    session,
+                    tree,
+                });
                 rows.push(SessionListRow::Spacer {
                     entry_idx,
-                    group_rail: *indented && next_is_group_child,
+                    tree: if *indented && next_is_group_child {
+                        TreePosition::Rail
+                    } else {
+                        TreePosition::None
+                    },
                 });
             }
         }
@@ -561,21 +589,14 @@ fn build_group_row(
     let bg = (focused || flashed).then_some(palette.surface1);
 
     let mut row = StyledLine::with_bg(bg);
-    let marker = if active_surrogate {
-        "▌"
-    } else if focused {
-        "›"
-    } else {
-        " "
-    };
     let marker_color = if active_surrogate {
         palette.green
     } else {
         palette.lavender
     };
-    row.push(marker, marker_color);
-    row.push(" ", palette.surface2);
-    row.push(if collapsed { "▸" } else { "▾" }, palette.overlay0);
+    row.push(if collapsed { "  ▸    " } else { "  ▾    " }, marker_color);
+    let (signal, signal_color) = group_signal(app, key, palette, spinner_clock(app));
+    row.push(signal, signal_color);
     row.push(" ", palette.white);
     row.push(
         label,
@@ -593,7 +614,7 @@ fn build_group_row(
     if row.width() + count_text.width() <= width {
         row.push(count_text, palette.overlay0);
     }
-    push_group_summary(&mut row, palette, summary, collapsed, width);
+    push_group_summary(&mut row, palette, summary, width);
 
     let mut line = row.end(CellStyle {
         fg: palette.white,
@@ -645,32 +666,37 @@ fn push_group_summary(
     line: &mut StyledLine,
     palette: &Palette,
     summary: &crate::session_display::GroupSummary,
-    collapsed: bool,
     width: usize,
 ) {
     let mut wrote = false;
-    if collapsed && summary.running_agents > 0 {
+    if summary.running_agents > 0 {
         let text = format!("⚡{}", summary.running_agents);
         if line.width() + text.width() <= width {
+            if !wrote {
+                line.push(" ", palette.white);
+            }
             line.push(text, palette.yellow);
             wrote = true;
         }
     }
-    if collapsed && summary.unseen > 0 {
+    if summary.unseen > 0 {
         let text = if wrote { " ●" } else { "●" };
         if line.width() + text.width() <= width {
+            if !wrote {
+                line.push(" ", palette.white);
+            }
             line.push(text, palette.teal);
             wrote = true;
         }
     }
-    if collapsed && (summary.insertions > 0 || summary.deletions > 0) {
+    if summary.insertions > 0 || summary.deletions > 0 {
         let text = format!(" +{} -{}", summary.insertions, summary.deletions);
         if line.width() + text.width() <= width {
             line.push(text, palette.green);
             wrote = true;
         }
     }
-    if collapsed && let Some(port) = summary.first_port {
+    if let Some(port) = summary.first_port {
         let text = if summary.extra_ports == 0 {
             format!(" ⌁{port}")
         } else {
@@ -714,7 +740,7 @@ fn build_session_name_row(
     palette: &Palette,
     idx: usize,
     session: &SessionData,
-    indented: bool,
+    tree: TreePosition,
 ) -> StyledLine {
     let index = idx;
     let focused = app.focused_session_name() == Some(session.name.as_str());
@@ -750,13 +776,25 @@ fn build_session_name_row(
     } else {
         " "
     };
-    if indented {
-        row.push("  │", palette.surface2);
-        row.push(marker, marker_color);
-    } else {
-        row.push(format!("{marker} "), marker_color);
+    match tree {
+        TreePosition::Middle => {
+            row.push(marker, marker_color);
+            row.push(" │ ", palette.surface2);
+        }
+        TreePosition::Last => {
+            row.push(marker, marker_color);
+            row.push(" ╰ ", palette.surface2);
+        }
+        TreePosition::Rail => {
+            row.push(marker, marker_color);
+            row.push(" │ ", palette.surface2);
+        }
+        TreePosition::None => row.push(format!("{marker} "), marker_color),
     }
-    row.push(format!("{index:02}  "), index_color);
+    row.push(format!("{index:02} "), index_color);
+    let (signal, signal_color) = session_signal_glyph(palette, session, spinner_clock(app));
+    row.push(signal, signal_color);
+    row.push(" ", palette.white);
     row.push(&session.name, name_color);
     row.end(CellStyle {
         fg: palette.white,
@@ -769,7 +807,7 @@ fn build_session_detail_row(
     app: &App,
     palette: &Palette,
     session: &SessionData,
-    indented: bool,
+    tree: TreePosition,
     width: usize,
 ) -> StyledLine {
     let focused = app.focused_session_name() == Some(session.name.as_str());
@@ -795,10 +833,7 @@ fn build_session_detail_row(
         palette.overlay0
     };
     let mut line = StyledLine::with_bg(bg);
-    line.push(
-        if indented { "  │     " } else { "      " },
-        palette.surface2,
-    );
+    line.push(tree_detail_prefix(tree), palette.surface2);
     let mut suffix_width = 0;
     if has_ports {
         suffix_width += if session.ports.len() == 1 {
@@ -838,10 +873,21 @@ fn rail_blank(palette: &Palette) -> StyledLine {
     StyledLine::blank().end(CellStyle::fg(palette.white))
 }
 
-fn inner_rail_blank(palette: &Palette) -> StyledLine {
+fn tree_blank(palette: &Palette, tree: TreePosition) -> StyledLine {
+    if tree == TreePosition::None {
+        return rail_blank(palette);
+    }
     let mut line = StyledLine::blank();
     line.push("  │", palette.surface2);
     line.end(CellStyle::fg(palette.white))
+}
+
+fn tree_detail_prefix(tree: TreePosition) -> &'static str {
+    match tree {
+        TreePosition::Middle | TreePosition::Rail => "  │      ",
+        TreePosition::Last => "         ",
+        TreePosition::None => "      ",
+    }
 }
 
 fn diff_stats_width(session: &SessionData) -> usize {
@@ -964,7 +1010,7 @@ fn render_agent_panel_header(
     if agent_count > 0 {
         line.push(format!(" {agent_count}"), palette.overlay0);
     }
-    let right = format!("a:{scope}");
+    let right = scope.to_string();
     if line.width() + 1 + right.width() <= width {
         let spaces = width.saturating_sub(line.width() + right.width());
         line.push(" ".repeat(spaces), palette.white);
@@ -1589,6 +1635,22 @@ fn compact_agent_panel_block(
     );
     line.push(icon, icon_color);
     line.push(" ", palette.white);
+    if app.agent_panel_scope == AgentPanelScope::All {
+        line.push(&entry.session.name, palette.subtext1);
+        line.push(" · ", palette.overlay0);
+        if let Some(thread_name) = entry.agent.thread_name.as_deref() {
+            line.push(truncate_right(thread_name, 18), palette.overlay1);
+        } else {
+            line.push(entry.agent.agent.as_str(), palette.overlay1);
+        }
+        return vec![
+            line.end(CellStyle {
+                fg: palette.white,
+                bg,
+            })
+            .with_hit(hit),
+        ];
+    }
     if let Some(thread_name) = entry.agent.thread_name.as_deref() {
         line.push(truncate_right(thread_name, 26), palette.subtext1);
     } else {
@@ -1651,6 +1713,98 @@ fn detail_status_icon_for_agent(
         AgentStatus::Error => ("✗", palette.red),
         AgentStatus::Stale => ("⚠", palette.yellow),
         AgentStatus::Interrupted => ("⚠", palette.peach),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AttentionSignal {
+    Unknown,
+    Idle,
+    DoneSeen,
+    Working,
+    ToolWorking,
+    DoneUnseen,
+    Waiting,
+    Interrupted,
+    Stale,
+    Error,
+}
+
+impl AttentionSignal {
+    fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Working
+                | Self::ToolWorking
+                | Self::Waiting
+                | Self::Interrupted
+                | Self::Stale
+                | Self::Error
+        )
+    }
+}
+
+fn session_signal_glyph(
+    palette: &Palette,
+    session: &SessionData,
+    spinner_ts: u64,
+) -> (&'static str, Rgb) {
+    attention_signal_glyph(palette, session_attention_signal(session), spinner_ts)
+}
+
+fn group_signal(app: &App, key: &str, palette: &Palette, spinner_ts: u64) -> (&'static str, Rgb) {
+    let signal = app
+        .sessions
+        .iter()
+        .filter(|session| worktree_group_key(session).as_deref() == Some(key))
+        .map(session_attention_signal)
+        .max()
+        .unwrap_or(AttentionSignal::Unknown);
+    attention_signal_glyph(palette, signal, spinner_ts)
+}
+
+fn attention_signal_glyph(
+    palette: &Palette,
+    signal: AttentionSignal,
+    spinner_ts: u64,
+) -> (&'static str, Rgb) {
+    match signal {
+        AttentionSignal::Error => ("✗", palette.red),
+        AttentionSignal::Stale => ("⚠", palette.yellow),
+        AttentionSignal::Interrupted => ("⚠", palette.peach),
+        AttentionSignal::Waiting => ("◉", palette.blue),
+        AttentionSignal::DoneUnseen => ("●", palette.teal),
+        AttentionSignal::ToolWorking => ("⚙", palette.sky),
+        AttentionSignal::Working => (agent_spinner(spinner_ts), palette.yellow),
+        AttentionSignal::DoneSeen => ("✓", palette.green),
+        AttentionSignal::Idle => ("○", palette.surface2),
+        AttentionSignal::Unknown => ("○", palette.surface2),
+    }
+}
+
+fn session_attention_signal(session: &SessionData) -> AttentionSignal {
+    session
+        .agent_state
+        .iter()
+        .chain(session.agents.iter())
+        .map(|agent| agent_attention_signal(agent, session.unseen))
+        .max()
+        .unwrap_or(AttentionSignal::Unknown)
+}
+
+fn agent_attention_signal(agent: &AgentEvent, session_unseen: bool) -> AttentionSignal {
+    match agent.status {
+        AgentStatus::Error => AttentionSignal::Error,
+        AgentStatus::Stale => AttentionSignal::Stale,
+        AgentStatus::Interrupted => AttentionSignal::Interrupted,
+        AgentStatus::Waiting => AttentionSignal::Waiting,
+        AgentStatus::Done if session_unseen || agent.unseen == Some(true) => {
+            AttentionSignal::DoneUnseen
+        }
+        AgentStatus::ToolRunning => AttentionSignal::ToolWorking,
+        AgentStatus::Running => AttentionSignal::Working,
+        AgentStatus::Done => AttentionSignal::DoneSeen,
+        AgentStatus::Idle => AttentionSignal::Idle,
     }
 }
 
@@ -2458,7 +2612,85 @@ const WHITE: Rgb = Rgb::new(255, 255, 255);
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::generated::protocol::{ServerState, SessionData};
+    use crate::generated::protocol::{AgentEvent, ServerState, SessionData};
+
+    fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
+        AgentEvent {
+            agent: agent.to_string(),
+            session: String::new(),
+            status,
+            ts: 0,
+            thread_id: None,
+            thread_name: thread_name.map(str::to_string),
+            unseen: None,
+            pane_id: None,
+            liveness: None,
+        }
+    }
+
+    fn session(name: &str, dir: &str, branch: &str) -> SessionData {
+        SessionData {
+            name: name.to_string(),
+            created_at: 0,
+            dir: dir.to_string(),
+            branch: branch.to_string(),
+            dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
+            is_worktree: false,
+            unseen: false,
+            panes: 1,
+            ports: Vec::new(),
+            local_links: Vec::new(),
+            windows: 1,
+            uptime: "1m".to_string(),
+            agent_state: None,
+            agents: Vec::new(),
+            event_timestamps: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    fn app_from_sessions(sessions: Vec<SessionData>) -> App {
+        let mut app = App::from_state(ServerState {
+            sessions,
+            focused_session: None,
+            current_session: Some("opensessions".to_string()),
+            theme: None,
+            session_filter: None,
+            sidebar_width: 40,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 240,
+        });
+        app.current_session = Some("opensessions".to_string());
+        app
+    }
+
+    fn render_text(app: &App, width: usize, height: usize) -> Vec<String> {
+        build_model(app, width, height)
+            .lines
+            .iter()
+            .map(|line| {
+                line.parts
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_has_line(lines: &[String], expected: &str) {
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "expected line not found: {expected:?}\nrendered:\n{}",
+            lines.join("\n")
+        );
+    }
 
     fn app_with_diff_stats() -> App {
         App::from_state(ServerState {
@@ -2516,5 +2748,173 @@ mod tests {
             compute_hit_target(&app, width - 1, detail_row, width, height),
             Some(HitTarget::DiffCount("opensessions".to_string()))
         );
+    }
+
+    #[test]
+    fn session_rows_show_inline_agent_signals_and_spaced_header() {
+        let no_agent = session("effect-ts", "/tmp/effect-ts", "");
+        let mut idle = session("learning", "/tmp/learning", "main");
+        idle.agents.push(agent("amp", AgentStatus::Idle, None));
+        let mut running = session("background-export", "/tmp/background-export", "feat/export");
+        running
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Export PDFs")));
+        let mut unseen = session(
+            "pdf-word-formatting",
+            "/tmp/pdf-word-formatting",
+            "chore-docs",
+        );
+        unseen.unseen = true;
+        unseen
+            .agents
+            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+        let mut tool = session("opensessions", "/tmp/opensessions", "ratatui-migration");
+        tool.agents
+            .push(agent("amp", AgentStatus::ToolRunning, Some("Query tmux")));
+
+        let app = app_from_sessions(vec![idle, running, unseen, tool, no_agent]);
+        let lines = render_text(&app, 40, 32);
+
+        assert_has_line(&lines, " sessions                       ⚡2 ●1 5");
+        assert_has_line(&lines, "› 01 ○ learning");
+        assert_has_line(&lines, "  02 ⠹ background-export");
+        assert_has_line(&lines, "  03 ● pdf-word-formatting");
+        assert_has_line(&lines, "▌ 04 ⚙ opensessions");
+        assert_has_line(&lines, "  05 ○ effect-ts");
+    }
+
+    #[test]
+    fn expanded_worktree_groups_render_a_continuous_tree_with_child_spacing() {
+        let mut first = session("edit-pages", "/tmp/plane-wt/edit-pages", "feat/edit-pages");
+        first.is_worktree = true;
+        first.agents.push(agent("amp", AgentStatus::Idle, None));
+        let mut second = session(
+            "background-export",
+            "/tmp/plane-wt/background-export",
+            "feat-background-exports",
+        );
+        second.is_worktree = true;
+        second
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Export PDFs")));
+        let mut third = session(
+            "pdf-word-formatting",
+            "/tmp/plane-wt/pdf-word-formatting",
+            "chore-relation-pqls",
+        );
+        third.is_worktree = true;
+        third.unseen = true;
+        third
+            .agents
+            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+
+        let mut app = app_from_sessions(vec![first, second, third]);
+        app.current_session = Some("background-export".to_string());
+        let lines = render_text(&app, 40, 32);
+
+        assert_has_line(&lines, "  ▾    ● plane-wt        3wt ⚡1 ●");
+        assert_has_line(&lines, "  │");
+        assert_has_line(&lines, "  │ 01 ○ edit-pages");
+        assert_has_line(&lines, "  │      feat/edit-pages");
+        assert_has_line(&lines, "▌ │ 02 ⠹ background-export");
+        assert_has_line(&lines, "  │      feat-background-exports");
+        assert_has_line(&lines, "  ╰ 03 ● pdf-word-formatting");
+        assert_has_line(&lines, "         chore-relation-pqls");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains('├') || line.contains("▾──") || line.contains("▸──")),
+            "expanded worktree tree should avoid noisy branch/horizontal connectors\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn collapsed_worktree_groups_keep_the_highest_priority_agent_signal() {
+        let mut first = session("edit-pages", "/tmp/plane-wt/edit-pages", "feat/edit-pages");
+        first.is_worktree = true;
+        first.agents.push(agent("amp", AgentStatus::Idle, None));
+        let mut second = session(
+            "background-export",
+            "/tmp/plane-wt/background-export",
+            "feat-background-exports",
+        );
+        second.is_worktree = true;
+        second
+            .agents
+            .push(agent("amp", AgentStatus::Waiting, Some("Need approval")));
+
+        let mut app = App::from_state(ServerState {
+            sessions: vec![first, second],
+            focused_session: None,
+            current_session: None,
+            theme: None,
+            session_filter: None,
+            sidebar_width: 40,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: vec!["/tmp/plane-wt".to_string()],
+            ts: 240,
+        });
+        app.set_sidebar_focus(crate::app::SidebarFocus::WorktreeGroup(
+            "/tmp/plane-wt".to_string(),
+        ));
+        let lines = render_text(&app, 40, 18);
+
+        assert_has_line(&lines, "  ▸    ◉ plane-wt        2wt ⚡1");
+        assert!(
+            !lines.iter().any(|line| line.contains("edit-pages")),
+            "collapsed group should hide children\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn agent_panel_uses_clean_current_and_all_scope_labels() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current.agents.push(agent(
+            "amp",
+            AgentStatus::ToolRunning,
+            Some("Query tmux for open sessions"),
+        ));
+        let mut other = session("plane", "/tmp/plane", "feature");
+        other.unseen = true;
+        other
+            .agents
+            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+        let mut app = app_from_sessions(vec![current, other]);
+        app.set_focused_session("opensessions");
+
+        let current_lines = render_text(&app, 40, 24);
+        assert_has_line(&current_lines, " agents 1                        current");
+        assert_has_line(&current_lines, "  ⚙ Query tmux for open sessions");
+        assert_has_line(&current_lines, "    working · amp");
+
+        app.toggle_agent_panel_scope();
+        let all_lines = render_text(&app, 40, 24);
+        assert_has_line(&all_lines, " agents 2                            all");
+        assert_has_line(&all_lines, "  ⚙ opensessions · Query tmux for op…");
+        assert_has_line(&all_lines, "  ● plane · Review PR");
+    }
+
+    #[test]
+    fn initializing_loader_keeps_spinner_and_detail_copy() {
+        let app = App::from_state(ServerState {
+            sessions: Vec::new(),
+            focused_session: None,
+            current_session: None,
+            theme: None,
+            session_filter: None,
+            sidebar_width: 40,
+            initializing: true,
+            init_label: Some("warming up…".to_string()),
+            collapsed_worktree_groups: Vec::new(),
+            ts: 240,
+        });
+        let lines = render_text(&app, 40, 24);
+
+        assert_has_line(&lines, " sessions 0 ⠹ warming up…");
+        assert_has_line(&lines, "  ⠹ warming up…");
+        assert_has_line(&lines, "    reading tmux + git state");
     }
 }

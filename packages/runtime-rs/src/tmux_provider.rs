@@ -803,7 +803,7 @@ fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     None
 }
 
-// Keep this broad and process/title based, like herdr's zero-config agent
+// Keep this broad and process/title based for zero-config agent
 // awareness. Transcript/file watchers still provide richer status where we
 // have native integrations; this path makes panes from other popular CLIs show
 // up immediately instead of disappearing from the sidebar.

@@ -303,10 +303,19 @@ impl App {
                 SessionFilterMode::Active => {
                     !session.agents.is_empty() || session.agent_state.is_some()
                 }
-                SessionFilterMode::Running => matches!(
-                    session.agent_state.as_ref().map(|agent| agent.status),
-                    Some(AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting),
-                ),
+                SessionFilterMode::Running => {
+                    matches!(
+                        session.agent_state.as_ref().map(|agent| agent.status),
+                        Some(
+                            AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
+                        ),
+                    ) || session.agents.iter().any(|agent| {
+                        matches!(
+                            agent.status,
+                            AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
+                        )
+                    })
+                }
             }
         })
     }
