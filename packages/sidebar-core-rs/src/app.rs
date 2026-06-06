@@ -311,6 +311,78 @@ impl App {
             .collect()
     }
 
+    pub fn reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
+        let entries = self.display_session_entries();
+        let index = entries.iter().position(|entry| match entry {
+            DisplaySessionEntry::Session { session, .. } => session.name == name,
+            DisplaySessionEntry::Group { .. } => false,
+        })?;
+        let target_index = index as isize + delta as isize;
+        if target_index < 0 || target_index >= entries.len() as isize {
+            return None;
+        }
+
+        let mut names = self
+            .display_sessions()
+            .into_iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        match &entries[target_index as usize] {
+            DisplaySessionEntry::Session {
+                session, indented, ..
+            } => {
+                let current = names.iter().position(|candidate| candidate == name)?;
+                if *indented && delta < 0 {
+                    let key = worktree_group_key(session)?;
+                    let group_indices = self
+                        .display_sessions()
+                        .into_iter()
+                        .filter_map(|session| {
+                            (worktree_group_key(session).as_deref() == Some(key.as_str()))
+                                .then(|| {
+                                    names
+                                        .iter()
+                                        .position(|candidate| candidate == &session.name)
+                                })
+                                .flatten()
+                        })
+                        .collect::<Vec<_>>();
+                    let name = names.remove(current);
+                    names.insert(group_indices.into_iter().min()?, name);
+                } else {
+                    let target = names
+                        .iter()
+                        .position(|candidate| candidate == &session.name)?;
+                    names.swap(current, target);
+                }
+            }
+            DisplaySessionEntry::Group { key, .. } => {
+                let current = names.iter().position(|candidate| candidate == name)?;
+                let name = names.remove(current);
+                let group_indices = self
+                    .display_sessions()
+                    .into_iter()
+                    .filter_map(|session| {
+                        (worktree_group_key(session).as_deref() == Some(key.as_str()))
+                            .then(|| {
+                                names
+                                    .iter()
+                                    .position(|candidate| candidate == &session.name)
+                            })
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>();
+                let insert_at = if delta < 0 {
+                    group_indices.into_iter().min()?
+                } else {
+                    group_indices.into_iter().max()?.saturating_add(1)
+                };
+                names.insert(insert_at.min(names.len()), name);
+            }
+        }
+        Some(names)
+    }
+
     pub fn focused_session_name(&self) -> Option<&str> {
         self.sidebar_focus.as_ref()?.session_name()
     }

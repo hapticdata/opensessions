@@ -8,6 +8,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_websockets::Message;
+
 const W: &str = "36";
 const SIDEBAR_SESSIONS: &[&str] = &[
     "opensessions",
@@ -93,6 +96,57 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
             .is_some_and(|row| row.trim_start().starts_with("›")),
         "worktree group header must not remain focused after switching to concrete child; got:\n{destination}",
     );
+}
+
+#[test]
+fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-reorder-worktree-boundary");
+    lab.tmux_ok([
+        "new-session",
+        "-d",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "-s",
+        "z-normal",
+        "-c",
+        lab.root.join("opensessions").to_str().unwrap(),
+        "sh",
+    ]);
+
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_text("opensessions", "z-normal");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_index(text, "os-demo-worktrees")
+            .is_some_and(|group| row_index(text, "z-normal").is_some_and(|normal| normal > group))
+    });
+
+    for _ in 0..6 {
+        lab.tmux_ok(["send-keys", "-t", source.as_str(), "Down"]);
+    }
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "z-normal").is_some_and(|row| row.trim_start().starts_with("›"))
+    });
+
+    lab.reorder_session("z-normal", -1);
+
+    lab.wait_for_capture_pane(&source, |text| {
+        row_index(text, "z-normal").is_some_and(|normal| {
+            row_index(text, "os-demo-worktrees").is_some_and(|group| normal < group)
+        })
+    });
+
+    lab.reorder_session("z-normal", 1);
+
+    lab.wait_for_capture_pane(&source, |text| {
+        row_index(text, "z-normal").is_some_and(|normal| {
+            row_index(text, "os-demo-worktrees").is_some_and(|group| normal > group)
+        })
+    });
 }
 
 #[test]
@@ -467,6 +521,10 @@ fn e2e_serial_guard() -> MutexGuard<'static, ()> {
 
 fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
     text.lines().find(|line| line.contains(needle))
+}
+
+fn row_index(text: &str, needle: &str) -> Option<usize> {
+    text.lines().position(|line| line.contains(needle))
 }
 
 fn post_refresh(port: u16) {
@@ -953,6 +1011,36 @@ time.sleep(300)
             ]),
             self.logs(),
         );
+    }
+
+    fn reorder_session(&self, name: &str, delta: i8) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect reorder ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let _ = ws
+                .next()
+                .await
+                .expect("read ws initial state")
+                .expect("ws initial state");
+            let command = serde_json::json!({
+                "type": "reorder-session",
+                "name": name,
+                "delta": delta,
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send reorder-session command");
+            ws.close().await.expect("close reorder ws client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
     }
 
     fn wait_for_no_sidebar_processes(&self) {

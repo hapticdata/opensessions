@@ -631,11 +631,8 @@ impl StateSource for ReadOnlyMuxStateSource {
             "reorder-session" => {
                 let name = command.get("name")?.as_str()?;
                 let delta = command.get("delta")?.as_i64()? as i8;
-                if let Some(names) = self.sidebar_display_session_names() {
-                    self.session_order
-                        .lock()
-                        .unwrap()
-                        .reorder_visible(&names, name, delta);
+                if let Some(names) = self.sidebar_reordered_session_names(name, delta) {
+                    self.session_order.lock().unwrap().set_visible_order(names);
                 }
                 Some(self.snapshot_json())
             }
@@ -1364,6 +1361,10 @@ impl ReadOnlyMuxStateSource {
                 .map(|session| session.name.clone())
                 .collect()
         })
+    }
+
+    fn sidebar_reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
+        app_from_state_json(&self.snapshot_json())?.reordered_session_names(name, delta)
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
