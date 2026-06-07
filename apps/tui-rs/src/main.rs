@@ -22,6 +22,7 @@ use opensessions_sidebar::runtime_context::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
+use std::path::Path;
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
@@ -120,9 +121,8 @@ async fn main() -> Result<()> {
     let mut pending_sidebar_width: Option<PendingSidebarWidthCommand> = None;
     let mut startup_refocused = false;
     // Render-tick interval: advance the spinner clock and redraw at ~120ms so
-    // the "warming up…" / agent-running spinners animate even
-    // when no server state arrives. Mirrors the React render loop in the TS
-    // sidebar driven by Date.now() inside Yoga's frame timer.
+    // the "warming up…" / agent-running spinners animate even when no server
+    // state arrives.
     let render_epoch = std::time::Instant::now();
     let mut render_tick = tokio::time::interval(tokio::time::Duration::from_millis(120));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -131,12 +131,12 @@ async fn main() -> Result<()> {
         // Hard-exit timer: once the user presses 'q', App::handle_key_char sets
         // `quit_deadline` to now+500ms. If neither the WS Quit response nor the
         // HTTP /quit fallback tears us down before then, we exit anyway so the
-        // user is never stuck in a dead TUI. Mirrors
-        // `setTimeout(() => renderer.destroy(), 500)` in apps/tui/src/index.tsx.
+        // user is never stuck in a dead TUI while still giving the quit command
+        // a short grace period to reach the server before restoring the terminal.
         let quit_deadline = app.as_ref().and_then(|app| app.quit_deadline);
         // Click-flash expiry: when a click arms a 150ms flash highlight, force
-        // a re-render at the deadline so the highlight clears even without
-        // any other event. Mirrors `setTimeout` in TS `triggerFlash`.
+        // a re-render at the deadline so the highlight clears even without any
+        // other event.
         let flash_deadline = app.as_ref().and_then(|app| app.flash_deadline);
         let sidebar_width_due = pending_sidebar_width.as_ref().map(|pending| pending.due_at);
 
@@ -437,8 +437,7 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
         MouseEventKind::Down(MouseButton::Left) => {
             // The hit map is computed against the current terminal size; query
             // it here so callers don't need to thread dimensions through the
-            // event loop. Mirrors per-component `onMouseDown` in
-            // `apps/tui/src/index.tsx`.
+            // event loop.
             let (width, height) = terminal::size().unwrap_or((0, 0));
             Some(UiMouse::Click {
                 x: mouse.column,
@@ -495,9 +494,7 @@ fn ui_key_from_crossterm(key: KeyEvent) -> Option<UiKey> {
 }
 
 /// Run `tmux display-message -p -t <target> <format>` and return the trimmed
-/// stdout if the command succeeds with non-empty output. Mirrors the OpenTUI
-/// client `getLocalSessionName` / `getLocalWindowId` fallback in
-/// `apps/tui/src/index.tsx`.
+/// stdout if the command succeeds with non-empty output.
 fn tmux_display_message(format: &str, target: &str) -> Option<String> {
     let output = std::process::Command::new("tmux")
         .args(["display-message", "-p", "-t", target, format])
@@ -535,8 +532,6 @@ fn tmux_run(args: &[&str]) -> Option<String> {
 }
 
 /// Refocus the main pane after the sidebar finishes drawing its first frame.
-/// Mirrors `apps/tui/src/index.tsx::refocusMainPane` (called from
-/// `doStartupRefocus`).
 fn do_startup_refocus(pane_id: &str) {
     let refocus_window = std::env::var("REFOCUS_WINDOW").ok();
     let plan = refocus_plan(pane_id, refocus_window.as_deref(), tmux_run);
@@ -621,16 +616,89 @@ fn maybe_launch_lazydiff(
 }
 
 fn lazydiffs_command(branch: &str) -> String {
-    let lazydiff = "/Users/palanikannanm/Documents/work/lazydiff/target/dev-fast/lazydiff";
+    let lazydiff = shell_quote(&resolve_lazydiff_binary());
     if branch.is_empty() {
-        lazydiff.to_string()
+        lazydiff
     } else {
         format!("{lazydiff} --branch")
     }
 }
 
+fn resolve_lazydiff_binary() -> String {
+    resolve_lazydiff_binary_from(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var("OPENSESSIONS_LAZYDIFF").ok().as_deref(),
+        Path::exists,
+    )
+}
+
+fn resolve_lazydiff_binary_from(
+    current_exe: Option<&Path>,
+    env_override: Option<&str>,
+    exists: impl Fn(&Path) -> bool,
+) -> String {
+    if let Some(path) = env_override.map(str::trim).filter(|path| !path.is_empty()) {
+        return path.to_string();
+    }
+
+    if let Some(path) = current_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join(lazydiff_binary_name()))
+        .filter(|path| exists(path))
+    {
+        return path.to_string_lossy().into_owned();
+    }
+
+    lazydiff_binary_name().to_string()
+}
+
+fn lazydiff_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "lazydiff.exe"
+    } else {
+        "lazydiff"
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn lazydiff_resolution_prefers_explicit_env_override() {
+        let current = Path::new("/opt/opensessions/bin/opensessions-sidebar");
+
+        assert_eq!(
+            resolve_lazydiff_binary_from(Some(current), Some("/custom/lazydiff"), |_| true),
+            "/custom/lazydiff"
+        );
+    }
+
+    #[test]
+    fn lazydiff_resolution_prefers_bundled_sibling_binary() {
+        let current = Path::new("/opt/opensessions/bin/opensessions-sidebar");
+        let expected = PathBuf::from("/opt/opensessions/bin").join(lazydiff_binary_name());
+
+        assert_eq!(
+            resolve_lazydiff_binary_from(Some(current), None, |path| path == expected),
+            expected.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn lazydiff_resolution_falls_back_to_path_lookup() {
+        let current = Path::new("/opt/opensessions/bin/opensessions-sidebar");
+
+        assert_eq!(
+            resolve_lazydiff_binary_from(Some(current), None, |_| false),
+            lazydiff_binary_name()
+        );
+    }
 }
 
 struct TerminalGuard {

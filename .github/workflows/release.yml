@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  LAZYDIFF_REPO: Ataraxy-Labs/lazydiff
+  LAZYDIFF_REF: v0.1.0-alpha.18
+  LAZYDIFF_CONVEX_URL: https://polished-kingfisher-268.convex.cloud
+  LAZYDIFF_CONVEX_HTTP_URL: https://polished-kingfisher-268.convex.site
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: opensessions-sidebar-x86_64-unknown-linux-gnu.tar.gz
+            lazydiff_flags: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: opensessions-sidebar-aarch64-unknown-linux-gnu.tar.gz
+            lazydiff_flags: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: opensessions-sidebar-aarch64-apple-darwin.tar.gz
+            lazydiff_flags: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: opensessions-sidebar-x86_64-apple-darwin.tar.gz
+            lazydiff_flags: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: opensessions-sidebar-x86_64-pc-windows-msvc.tar.gz
+            lazydiff_flags: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: opensessions-${{ matrix.target }}
+
+      - name: Build opensessions binaries
+        run: cargo build --release --target ${{ matrix.target }} -p opensessions-sidebar -p opensessions-server
+
+      - name: Checkout lazydiff
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAZYDIFF_REPO }}
+          ref: ${{ env.LAZYDIFF_REF }}
+          path: lazydiff-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lazydiff-src -> target
+          shared-key: lazydiff-${{ matrix.target }}
+
+      - name: Build lazydiff
+        working-directory: lazydiff-src
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.lazydiff_flags }}
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package dist
+          exe=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            exe=".exe"
+          fi
+
+          cp "target/${{ matrix.target }}/release/opensessions-sidebar${exe}" "package/opensessions-sidebar${exe}"
+          cp "target/${{ matrix.target }}/release/opensessions-server${exe}" "package/opensessions-server${exe}"
+          cp "lazydiff-src/target/${{ matrix.target }}/release/lazydiff${exe}" "package/lazydiff${exe}"
+
+          "./package/opensessions-sidebar${exe}" --help >/dev/null
+          test -x "./package/opensessions-server${exe}"
+          "./package/lazydiff${exe}" --version
+          "./package/lazydiff${exe}" --help >/dev/null
+
+          tar -czf "dist/${{ matrix.artifact }}" -C package .
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "dist/${{ matrix.artifact }}" | sed 's#dist/##' > "dist/${{ matrix.artifact }}.sha256"
+          else
+            sha256sum "dist/${{ matrix.artifact }}" | sed 's#dist/##' > "dist/${{ matrix.artifact }}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

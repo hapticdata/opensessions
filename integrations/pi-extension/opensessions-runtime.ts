@@ -24,11 +24,10 @@ interface AgentEventPayload {
 
 const DEFAULT_SERVER_PORT = 7391;
 const RUST_SERVER_PORT_BASE = 22000;
-const TS_SERVER_PORT_BASE = 17000;
 const HEARTBEAT_MS = 5_000;
 
 /**
- * Mirror opensessions `packages/runtime/src/shared.ts` port resolution. The
+ * Mirror opensessions Rust runtime port resolution. The
  * server port is derived from a hash of the tmux socket path so concurrent
  * tmux servers on the same machine get independent opensessions servers.
  */
@@ -56,7 +55,6 @@ function resolveServerUrls(): string[] {
     const key = Number.parseInt(explicitKey, 10);
     if (Number.isFinite(key)) {
       add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
 
@@ -66,7 +64,6 @@ function resolveServerUrls(): string[] {
     if (socketPath) {
       const key = hashServerKey(socketPath);
       add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
 

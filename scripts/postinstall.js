@@ -52,14 +52,23 @@ async function main() {
   const { version } = require("../package.json");
   const triple = targetTriple();
   const binDir = path.join(__dirname, "..", "bin");
-  const dest = path.join(binDir, process.platform === "win32" ? "opensessions-sidebar.exe" : "opensessions-sidebar");
+  const executableNames = [
+    process.platform === "win32" ? "opensessions-sidebar.exe" : "opensessions-sidebar",
+    process.platform === "win32" ? "opensessions-server.exe" : "opensessions-server",
+    process.platform === "win32" ? "lazydiff.exe" : "lazydiff",
+  ];
   const tarball = path.join(binDir, "opensessions-sidebar.tmp.tar.gz");
 
   fs.mkdirSync(binDir, { recursive: true });
   await download(releaseUrl(version, triple), tarball);
   execFileSync("tar", ["-xzf", tarball, "-C", binDir]);
   fs.unlinkSync(tarball);
-  fs.chmodSync(dest, 0o755);
+  for (const name of executableNames) {
+    const executable = path.join(binDir, name);
+    if (fs.existsSync(executable)) {
+      fs.chmodSync(executable, 0o755);
+    }
+  }
 }
 
 if (require.main === module) {

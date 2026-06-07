@@ -1,43 +1,77 @@
-# Contracts And Extension Interfaces
+# Contracts And Supported Integration Interfaces
 
-This document is the reference for extending opensessions. It describes the agent event model, watcher interfaces, mux provider capabilities, and the runtime behaviors extension authors need to match.
+This document describes the integration surface that exists in the current Rust runtime. The supported extension path today is HTTP: external tools can push agent state with `/api/agent-event` and session metadata with the metadata endpoints.
 
-For end-user setup, start with the docs linked from [README.md](./README.md). For plugin packaging workflow, see [PLUGINS.md](./PLUGINS.md).
+TypeScript plugin loading, `PluginAPI`, and package-based mux/agent plugins are not supported by the Rust server right now. The `plugins` config field is still parsed for compatibility, but it is not executed.
+
+For end-user setup, start with [README.md](./README.md).
 
 ## Built-In Watchers
 
-opensessions currently registers four built-in watchers at server startup.
+The Rust server scans these agent data sources directly:
 
 ### Amp
 
-- Watches `~/.local/share/amp/threads/T-*.json`.
-- Also watches `~/.local/share/amp/session.json` to clear unseen state when a terminal Amp thread becomes seen there.
-- Uses `fs.watch` plus a 2 second polling pass.
-- Skips stale thread files older than 5 minutes.
-- Resolves the project directory from `env.initial.trees[0].uri`.
+- Reads `~/.local/share/amp/threads/T-*.json`.
+- Reads `~/.local/share/amp/session.json` to clear unseen state when the active terminal thread is seen.
+- Resolves project directories from `env.initial.trees[0].uri`.
 
 ### Claude Code
 
-- Watches `~/.claude/projects/<encoded-path>/*.jsonl`.
-- Uses `fs.watch` plus a 2 second polling pass.
-- Reads only appended bytes after the last observed file size.
+- Reads JSONL transcripts in `~/.claude/projects/<encoded-path>/*.jsonl`.
 - Decodes project directories from folder names such as `-Users-me-project`.
+- Treats recent tool-use silence as `waiting` and long silence as `stale`.
 
 ### Codex
 
-- Watches `~/.codex/sessions/**/*.jsonl` or `$CODEX_HOME/sessions/**/*.jsonl`.
+- Reads transcript JSONL files in `~/.codex/sessions/**/*.jsonl` or `$CODEX_HOME/sessions/**/*.jsonl`.
 - Reads `$CODEX_HOME/session_index.jsonl` for recent thread titles when available.
-- Uses recursive `fs.watch` plus a 2 second polling pass.
-- Skips stale transcript files older than 5 minutes.
-- Resolves mux sessions from `turn_context.cwd` inside the transcript.
-- Treats `user_message`, tool activity, and assistant `commentary` as `running`, assistant `final_answer` and `task_complete` as `done`, and `turn_aborted` as `interrupted`.
+- Resolves sessions from transcript `turn_context.cwd`.
 
 ### OpenCode
 
 - Polls `~/.local/share/opencode/opencode.db` or `$OPENCODE_DB_PATH`.
-- Uses `bun:sqlite` in read-only mode.
-- Polls every 3 seconds.
-- Resolves mux sessions from the OpenCode session row's `directory` field.
+- Resolves sessions from the OpenCode session row's `directory` field.
+
+### Pi and Droid
+
+- The Rust server includes scanner/parser support for Pi and Droid runtime/session state.
+- Pi integrations can also use the Pi runtime API exposed by the server.
+
+## Agent Event HTTP API
+
+External agents should POST JSON to:
+
+```text
+POST /api/agent-event
+```
+
+Example:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:7391/api/agent-event" \
+  -H 'content-type: application/json' \
+  -d '{
+    "agent": "my-agent",
+    "status": "running",
+    "tmuxSession": "work",
+    "threadId": "task-123",
+    "threadName": "Implement search",
+    "lastUserPrompt": "Add search to the sidebar",
+    "paneId": "%7"
+  }'
+```
+
+### Session Resolution
+
+The server resolves the target session from either:
+
+| Input field | Meaning |
+| --- | --- |
+| `tmuxSession` | Exact tmux session name |
+| `projectDir` | Project/worktree directory; exact session-dir match wins, then parent/child prefix matching |
+
+If neither field can be resolved to a known session, the request is rejected.
 
 ## Agent Model
 
@@ -47,13 +81,15 @@ opensessions currently registers four built-in watchers at server startup.
 type AgentStatus =
   | "idle"
   | "running"
+  | "tool-running"
   | "done"
   | "error"
   | "waiting"
-  | "interrupted";
+  | "interrupted"
+  | "stale";
 ```
 
-Terminal states are `done`, `error`, and `interrupted`. The tracker uses those states to decide unseen behavior.
+Terminal states are `done`, `error`, and `interrupted`. The tracker uses those states to decide unseen behavior. `tool-running` is a running subtype used when the agent is actively using tools. `stale` means the last known running/waiting state has aged past the runtime threshold.
 
 ### `AgentEvent`
 
@@ -67,196 +103,84 @@ interface AgentEvent {
   threadName?: string;
   lastUserPrompt?: string;
   unseen?: boolean;
+  paneId?: string;
+  liveness?: "alive" | "exited" | "unknown";
 }
 ```
 
-| Field | Type | Required | Notes |
+External `/api/agent-event` callers send the same shape except they use `tmuxSession` or `projectDir` for session resolution. The serialized server state always contains the resolved `session` field.
+
+| Field | Type | Required for HTTP | Notes |
 | --- | --- | --- | --- |
-| `agent` | `string` | yes | Stable watcher identifier such as `amp`, `claude-code`, `codex`, `opencode`, `pi`, or `droid` |
-| `session` | `string` | yes | Resolved mux session name |
+| `agent` | `string` | yes | Stable agent identifier such as `amp`, `claude-code`, `codex`, `opencode`, `pi`, `droid`, or your integration name |
 | `status` | `AgentStatus` | yes | Current agent state |
-| `ts` | `number` | yes | Millisecond timestamp |
-| `threadId` | `string` | no | Instance key used to track multiple threads in one session |
+| `tmuxSession` | `string` | one of `tmuxSession` / `projectDir` | Exact tmux session name |
+| `projectDir` | `string` | one of `tmuxSession` / `projectDir` | Project directory used for session resolution |
+| `ts` | `number` | no | Millisecond timestamp; server time is used when omitted |
+| `threadId` | `string` | no | Stable instance key for multiple threads in one session |
 | `threadName` | `string` | no | Human-readable label shown in the detail panel |
-| `lastUserPrompt` | `string` | no | Latest real user prompt/intent, shown only in agent detail UI when available |
-| `unseen` | `boolean` | no | Added by the tracker when serializing to the TUI |
+| `lastUserPrompt` | `string` | no | Latest user prompt/intent, shown in agent detail UI |
+| `paneId` | `string` | no | tmux pane id used for focus/kill routing when available |
 
 ### Tracker Semantics
 
-- The tracker keys instances by `agent:threadId` when `threadId` exists, otherwise by `agent`.
+- Instances are keyed by `agent:threadId` when `threadId` exists, otherwise by `agent`.
 - A session can have multiple active agent instances.
 - Unseen state is tracked per instance, then derived to the session level.
 - Non-terminal updates clear unseen state for that instance.
-- Stale `running` events are pruned after 3 minutes.
-- Seen terminal instances are pruned after 5 minutes.
+- Terminal instances become seen when the user focuses the associated pane/session according to the server's tmux focus tracking.
+- Stale/running cleanup is handled by the Rust tracker.
 
-## `AgentWatcher`
+## Metadata HTTP API
 
-```ts
-interface AgentWatcher {
-  readonly name: string;
-  start(ctx: AgentWatcherContext): void;
-  stop(): void;
+Scripts can also attach status, progress, and logs to sessions:
+
+```text
+POST /set-status
+POST /set-progress
+POST /log
+POST /clear-log
+POST /notify
+```
+
+See [docs/reference/programmatic-api.md](./docs/reference/programmatic-api.md) for examples.
+
+## Rust Mux Contract
+
+The supported mux implementation is tmux. The abstraction still lives in Rust so future providers can be added deliberately.
+
+The trait is defined in `packages/runtime-rs/src/mux.rs`:
+
+```rust
+pub trait MuxProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn list_sessions(&self) -> Vec<MuxSessionInfo>;
+    fn switch_session(&self, name: &str, client_tty: Option<&str>);
+    fn get_current_session(&self) -> Option<String>;
+    fn get_session_dir(&self, name: &str) -> String;
+    fn get_pane_count(&self, name: &str) -> u32;
+    fn get_client_tty(&self) -> String;
+    fn create_session(&self, name: Option<&str>, dir: Option<&str>);
+    fn kill_session(&self, name: &str);
+    fn setup_hooks(&self, server_host: &str, server_port: u16);
+    fn cleanup_hooks(&self);
+    // optional capability methods omitted here; see source for full trait
 }
 ```
 
-### `AgentWatcherContext`
-
-```ts
-interface AgentWatcherContext {
-  resolveSession(projectDir: string): string | null;
-  emit(event: AgentEvent): void;
-}
-```
-
-`resolveSession(projectDir)` first checks for an exact directory match across registered mux sessions. If there is no exact match, the server falls back to parent-child prefix matching so nested project paths can still resolve.
-
-### Minimal Watcher Example
-
-```ts
-import type { AgentWatcher, AgentWatcherContext } from "@opensessions/runtime";
-
-export class MyAgentWatcher implements AgentWatcher {
-  readonly name = "my-agent";
-
-  start(ctx: AgentWatcherContext): void {
-    const projectDir = "/path/to/project";
-    const session = ctx.resolveSession(projectDir);
-    if (!session) return;
-
-    ctx.emit({
-      agent: this.name,
-      session,
-      status: "running",
-      ts: Date.now(),
-      threadId: "thread-1",
-      threadName: "Example task",
-    });
-  }
-
-  stop(): void {
-  }
-}
-```
-
-## Mux Contracts
-
-opensessions uses the capability model exported from `@opensessions/mux`. A provider must implement the required `MuxProviderV1` contract and may opt into extra capabilities.
-
-### Core Types
-
-```ts
-interface MuxSessionInfo {
-  readonly name: string;
-  readonly createdAt: number;
-  readonly dir: string;
-  readonly windows: number;
-}
-
-interface ActiveWindow {
-  readonly id: string;
-  readonly sessionName: string;
-  readonly active: boolean;
-}
-
-interface SidebarPane {
-  readonly paneId: string;
-  readonly sessionName: string;
-  readonly windowId: string;
-}
-
-type SidebarPosition = "left" | "right";
-```
-
-### Required Provider Interface
-
-```ts
-interface MuxProviderV1 {
-  readonly specificationVersion: "v1";
-  readonly name: string;
-
-  listSessions(): MuxSessionInfo[];
-  switchSession(name: string, clientTty?: string): void;
-  getCurrentSession(): string | null;
-  getSessionDir(name: string): string;
-  getPaneCount(name: string): number;
-  getClientTty(): string;
-  createSession(name?: string, dir?: string): void;
-  killSession(name: string): void;
-  setupHooks(serverHost: string, serverPort: number): void;
-  cleanupHooks(): void;
-}
-```
-
-### Optional Capabilities
-
-```ts
-interface WindowCapable {
-  listActiveWindows(): ActiveWindow[];
-  getCurrentWindowId(): string | null;
-}
-
-interface SidebarCapable {
-  listSidebarPanes(sessionName?: string): SidebarPane[];
-  spawnSidebar(
-    sessionName: string,
-    windowId: string,
-    width: number,
-    position: SidebarPosition,
-    scriptsDir: string,
-  ): string | null;
-  hideSidebar(paneId: string): void;
-  killSidebarPane(paneId: string): void;
-  resizeSidebarPane(paneId: string, width: number): void;
-  cleanupSidebar(): void;
-}
-
-interface BatchCapable {
-  getAllPaneCounts(): Map<string, number>;
-}
-```
-
-The server narrows providers with the runtime type guards exported from `@opensessions/mux`:
-
-- `isWindowCapable()`
-- `isSidebarCapable()`
-- `isBatchCapable()`
-- `isFullSidebarCapable()`
-
-### Provider Expectations
-
-- `listSessions()` should return enough information for the server to sort and render sessions.
-- `getCurrentSession()` should reflect the session attached to the current client when possible.
-- `setupHooks()` should install mux-native hooks if the mux supports them. If it does not, a no-op implementation is acceptable.
-- `createSession()` and `killSession()` power the TUI's new-session and kill-session flows.
-
-## `PluginAPI`
-
-Plugins are loaded as default-exported factory functions that receive this API:
-
-```ts
-interface PluginAPI {
-  registerMux(provider: MuxProvider): void;
-  registerWatcher(watcher: AgentWatcher): void;
-  readonly serverPort: number;
-  readonly serverHost: string;
-}
-```
-
-The current runtime passes `127.0.0.1:7391` here.
+Provider methods are synchronous because tmux operations are command-driven and the server treats the provider as a simple control surface.
 
 ## Built-In Runtime Behaviors To Know About
 
-- The server merges sessions from all registered providers into one state payload.
-- Session ordering is persisted separately from mux ordering.
+- The server computes `ServerState` from tmux sessions, git/cache state, metadata, ports, and tracked agent events.
+- Session ordering is persisted separately from tmux ordering.
 - tmux sidebars can be hidden into a stash session instead of being killed.
-- tmux is the only supported built-in mux today. Other providers can still target these contracts, but they are currently outside the support bar unless documented otherwise.
-- The TUI expects a WebSocket server on `127.0.0.1:7391`.
-- The server exposes HTTP POST endpoints for programmatic metadata (status, progress, logs, notifications). See [docs/reference/programmatic-api.md](./docs/reference/programmatic-api.md).
+- tmux is the only supported built-in mux today.
+- The sidebar and helper scripts resolve the server port from the tmux socket via `OPENSESSIONS_SERVER_KEY`, defaulting to derived per-socket ports.
+- TPM installs use prebuilt binaries in `bin/`; local builds use `target/release` or `target/debug` as fallback paths.
 
 ## Where To Start
 
-- Build a custom watcher: see the `AgentWatcher` section above.
-- Push metadata from scripts: see [docs/reference/programmatic-api.md](./docs/reference/programmatic-api.md).
-- Build a plugin package or local plugin: see [PLUGINS.md](./PLUGINS.md).
-- Understand the end-to-end runtime: see [docs/explanation/architecture.md](./docs/explanation/architecture.md).
+- Integrate an agent: POST `/api/agent-event` with stable `agent`, `threadId`, and `projectDir` or `tmuxSession`.
+- Push build/deploy metadata: use [docs/reference/programmatic-api.md](./docs/reference/programmatic-api.md).
+- Understand runtime behavior: read [docs/explanation/architecture.md](./docs/explanation/architecture.md).

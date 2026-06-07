@@ -357,10 +357,9 @@ Before shipping any sidebar behavior change, verify all of these.
 - `apps/tui-rs/tests/tmux_e2e.rs`
 - `packages/runtime-rs/src/sidebar_coordinator.rs`
 - `packages/sidebar-core-rs/src/app.rs`
-- `packages/runtime/src/server/sidebar-coordinator.ts`
-- `packages/runtime/src/server/index.ts`
-- `packages/mux/providers/tmux/src/provider.ts`
-- `packages/mux/tmux-sdk/src/index.ts`
-- `apps/tui/src/index.tsx`
+- `packages/runtime-rs/src/mux.rs`
+- `packages/runtime-rs/src/tmux_provider.rs`
+- `apps/tui/scripts/start.sh`
+- `integrations/tmux-plugin/scripts/server-common.sh`
 
 If a future change violates this doc but seems necessary, update the doc in the same change and explain the new invariant explicitly.

@@ -13,12 +13,12 @@ where
 }
 
 /// Resolve the running pane's identity, mirroring
-/// `apps/tui/src/index.tsx` (`getLocalSessionName` / `getLocalWindowId`).
+/// tmux display-message fallback used by the live sidebar.
 ///
 /// `env` reads process environment variables. `tmux_query` invokes
 /// `tmux display-message -p -t <target> <format>` and returns the trimmed
 /// stdout. Tmux is only consulted when the corresponding `OPENSESSIONS_*`
-/// env vars are absent, matching the OpenTUI client priority.
+/// env vars are absent.
 pub fn pane_identity_resolve<F, T>(env: F, tmux_query: T) -> Option<PaneIdentity>
 where
     F: Fn(&str) -> Option<String>,
@@ -60,7 +60,7 @@ pub struct RefocusPlan {
     pub select_pane: String,
 }
 
-/// Mirror of `apps/tui/src/index.tsx::refocusMainPane` as a pure function.
+/// Refocus-main-pane planning as a pure function.
 ///
 /// `tmux_query` is invoked with the argv slice that should be passed to
 /// `tmux <args>`. It must return the trimmed stdout when the command succeeds

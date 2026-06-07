@@ -44,7 +44,7 @@ pub struct AgentPaneTarget {
 /// Compute a per-row hit map for the current frame. Each entry corresponds to
 /// one screen row; `Some(target)` means a click on that row activates the
 /// target. Mirrors the per-component `onMouseDown` handlers in
-/// `apps/tui/src/index.tsx`.
+/// the old row-level click handlers.
 pub fn compute_hit_map(app: &App, width: u16, height: u16) -> Vec<Option<HitTarget>> {
     let model = build_model(app, width as usize, height as usize);
     model
@@ -261,7 +261,7 @@ fn render_lines(frame: &mut Frame<'_>, lines: &[StyledLine], start: usize, area:
 
     // Edge-to-edge highlight: ratatui's `Paragraph` only paints cells covered
     // by spans. Patch trailing cells for rows that intentionally carry a bg so
-    // selection / flash highlights fill the full component width like OpenTUI.
+    // selection / flash highlights fill the full component width.
     let buffer = frame.buffer_mut();
     for (offset, line) in lines
         .iter()
@@ -2053,8 +2053,8 @@ fn separator(palette: &Palette, width: usize) -> StyledLine {
 }
 
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
-/// state, matching `apps/tui/src/index.tsx::SPINNERS`. Frame cadence is
-/// 120ms — the same period as the render tick in `apps/tui-rs/src/main.rs`,
+/// state. Frame cadence is 120ms — the same period as the render tick in
+/// `apps/tui-rs/src/main.rs`,
 /// so the glyph advances exactly once per tick (smooth, no stutter).
 fn agent_spinner(ts: u64) -> &'static str {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

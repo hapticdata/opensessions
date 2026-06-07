@@ -38,7 +38,6 @@ function plog(msg: string): void {
 
 const DEFAULT_SERVER_PORT = 7391;
 const RUST_SERVER_PORT_BASE = 22000;
-const TS_SERVER_PORT_BASE = 17000;
 const POST_TIMEOUT_MS = 750;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
@@ -118,8 +117,7 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
 
 /**
  * Port resolution — matches the tmux-scoped opensessions server namespace.
- * Rust servers use 22000+server_key; the older TS server used 17000+server_key.
- * Try Rust first, then TS, so one installed plugin works while people migrate.
+ * Rust servers use 22000+server_key.
  */
 function hashServerKey(input: string): number {
   let hash = 0;
@@ -145,7 +143,6 @@ function resolveServerUrls(): string[] {
     const key = Number.parseInt(explicitKey, 10);
     if (Number.isFinite(key)) {
       add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
 
@@ -155,7 +152,6 @@ function resolveServerUrls(): string[] {
     if (socketPath) {
       const key = hashServerKey(socketPath);
       add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
-      add(`http://127.0.0.1:${TS_SERVER_PORT_BASE + key}`);
     }
   }
 

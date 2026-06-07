@@ -54,7 +54,9 @@ SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
 START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
 
 RUST_SERVER_BIN=""
-if [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
+if [ -x "$PLUGIN_DIR/bin/opensessions-server" ]; then
+  RUST_SERVER_BIN="$PLUGIN_DIR/bin/opensessions-server"
+elif [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
   RUST_SERVER_BIN="$PLUGIN_DIR/target/release/opensessions-server"
 elif [ -x "$PLUGIN_DIR/target/debug/opensessions-server" ]; then
   RUST_SERVER_BIN="$PLUGIN_DIR/target/debug/opensessions-server"
@@ -124,7 +126,7 @@ ensure_server() {
   fi
 
   if [ -z "$RUST_SERVER_BIN" ]; then
-    show_startup_error "opensessions: server binary not found. Run: cd $PLUGIN_DIR && cargo build --release -p opensessions-server"
+    show_startup_error "opensessions: server binary not found. Reinstall/update opensessions, or build locally with: cd $PLUGIN_DIR && cargo build --release -p opensessions-server"
     release_start_lock
     return 1
   fi

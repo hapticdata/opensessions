@@ -186,8 +186,7 @@ impl App {
 
     /// Record the running pane's identity and queue an `IdentifyPane` command.
     /// Calling again replaces the stored identity so subsequent `ReIdentify`
-    /// requests use the freshest values, matching `apps/tui/src/index.tsx`'s
-    /// `reIdentify()` behavior.
+    /// requests use the freshest values.
     pub fn identify_pane(
         &mut self,
         pane_id: String,
@@ -703,9 +702,7 @@ impl App {
         }
     }
 
-    /// Click on a session row in the list. Mirrors the TS
-    /// `onSelect={() => switchToSession(session.name)}` handler in
-    /// `apps/tui/src/index.tsx::SessionCard`.
+    /// Click on a session row in the list.
     pub fn click_session(&mut self, name: String) {
         self.activate_hit_target(HitTarget::Session(name));
     }
@@ -758,11 +755,9 @@ impl App {
         self.queue_focus_agent_pane(target);
     }
 
-    /// Queue a `SetTheme` command for the server. Mirrors the TS
-    /// `applyTheme(themeName) => send({ type: "set-theme", theme: themeName })`
-    /// in `apps/tui/src/index.tsx`. The server replies with a fresh `State`
-    /// broadcast carrying the new theme name, which `apply_server_message`
-    /// stores on `self.theme`.
+    /// Queue a `SetTheme` command for the server. The server replies with a
+    /// fresh `State` broadcast carrying the new theme name, which
+    /// `apply_server_message` stores on `self.theme`.
     pub fn set_theme_request(&mut self, theme: String) {
         self.commands.push(ClientCommand::SetTheme { theme });
     }

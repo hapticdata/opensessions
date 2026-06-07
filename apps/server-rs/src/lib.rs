@@ -49,9 +49,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
 
-pub const SERVER_VERSION: &str = "0.2.0-alpha.5";
+pub const SERVER_VERSION: &str = "0.2.0-alpha.7";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.5"}"#;
+pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.7"}"#;
 pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -348,9 +348,8 @@ pub struct ReadOnlyMuxStateSource {
     git_command_runner: Arc<dyn GitCommandRunner>,
     git_info_cache: Mutex<HashMap<String, CachedGitInfo>>,
     // The sidebar coordinator owns the single source of truth for the current
-    // width (`SidebarCoordinator::state().width`). Mirrors the TS server where
-    // `getSidebarWidth()` always reads from the XState coordinator — there is no
-    // separate mirror field to drift out of sync.
+    // width (`SidebarCoordinator::state().width`), so there is no separate
+    // mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
     detail_panel_height: Mutex<u16>,
     agent_panel_scope: Mutex<AgentPanelScope>,
@@ -1693,10 +1692,9 @@ async fn run_sidebar_lifecycle_loop(
 }
 
 /// Poll tmux state on a fixed cadence and broadcast a fresh snapshot whenever
-/// the JSON differs from the last broadcast. Mirrors the periodic
-/// session/window/pane refresh in `packages/runtime/src/server/index.ts`'s
-/// `setInterval` so the sidebar picks up new sessions, agent panes, focus
-/// changes, and other mux state without requiring an explicit hook.
+/// the JSON differs from the last broadcast, so the sidebar picks up new
+/// sessions, agent panes, focus changes, and other mux state without requiring
+/// an explicit hook.
 async fn run_tmux_state_poll_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,

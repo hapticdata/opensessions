@@ -107,7 +107,7 @@ pub fn resolve_server_port(server_key: Option<&str>, explicit: Option<&str>) -> 
 /// Mirrors the `PORT_BASE` branch in
 /// `integrations/tmux-plugin/scripts/server-common.sh` so the Rust server can
 /// pin 22000+server_key when `OPENSESSIONS_RUST=1` and coexist with the TS
-/// bun server (17000+server_key) on the same tmux socket.
+/// legacy server (17000+server_key) on the same tmux socket.
 pub fn resolve_server_port_with_base(
     server_key: Option<&str>,
     explicit: Option<&str>,
