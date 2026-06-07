@@ -69,6 +69,14 @@ jobs:
           ref: ${{ env.LAZYDIFF_REF }}
           path: lazydiff-src
 
+      - name: Isolate lazydiff workspace
+        shell: bash
+        run: |
+          cat >> lazydiff-src/Cargo.toml <<'EOF'
+
+          [workspace]
+          EOF
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: lazydiff-src -> target
