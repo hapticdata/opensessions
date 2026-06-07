@@ -1,6 +1,5 @@
 use crate::app::{App, Modal, PanelFocus};
-use crate::generated::protocol::ClientCommand;
-use crate::renderer::{HitTarget, THEME_NAMES, compute_hit_map};
+use crate::renderer::{THEME_NAMES, compute_hit_target, detail_separator_row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiKey {
@@ -21,10 +20,33 @@ pub enum UiKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMouse {
-    ScrollUp { x: u16, y: u16 },
-    ScrollDown { x: u16, y: u16 },
-    Click { x: u16, y: u16, width: u16, height: u16 },
-    Drag { y: u16 },
+    ScrollUp {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    ScrollDown {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    Click {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    Move {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    Drag {
+        y: u16,
+    },
     DragEnd,
 }
 
@@ -63,8 +85,7 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
         UiKey::Right => {
             if app.panel_focus == PanelFocus::Sessions {
                 let agent_count = app
-                    .focused_session
-                    .as_deref()
+                    .focused_session_name()
                     .and_then(|name| app.sessions.iter().find(|s| s.name == name))
                     .map(|s| s.agents.len())
                     .unwrap_or(0);
@@ -86,6 +107,7 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
 fn apply_modal_key(app: &mut App, key: UiKey) {
     match &app.modal {
         Modal::ThemePicker { .. } => apply_theme_picker_key(app, key),
+        Modal::WidthSlider { .. } => apply_width_slider_key(app, key),
         Modal::KillConfirm { .. } => apply_kill_confirm_key(app, key),
         Modal::None => {}
     }
@@ -165,11 +187,8 @@ fn apply_theme_picker_key(app: &mut App, key: UiKey) {
 fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
     match key {
         UiKey::Char('y') => {
-            if let Modal::KillConfirm { session_name } = app.modal.clone() {
-                app.modal = Modal::None;
-                app.commands_push(ClientCommand::KillSession {
-                    name: session_name,
-                });
+            if matches!(app.modal, Modal::KillConfirm { .. }) {
+                app.confirm_kill_target();
             }
         }
         _ => {
@@ -178,47 +197,84 @@ fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
     }
 }
 
+fn apply_width_slider_key(app: &mut App, key: UiKey) {
+    match key {
+        UiKey::Left | UiKey::Down => app.adjust_width_slider(-1),
+        UiKey::Right | UiKey::Up => app.adjust_width_slider(1),
+        UiKey::Char('h') => app.adjust_width_slider(-1),
+        UiKey::Char('l') => app.adjust_width_slider(1),
+        UiKey::Char('H') => app.adjust_width_slider(-5),
+        UiKey::Char('L') => app.adjust_width_slider(5),
+        UiKey::Enter => app.confirm_width_slider(),
+        UiKey::Esc => app.close_width_slider(),
+        _ => {}
+    }
+}
+
 pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
     match event {
-        UiMouse::ScrollUp { .. } => {
-            if app.panel_focus == PanelFocus::Agents {
+        UiMouse::ScrollUp {
+            x: _,
+            y,
+            width,
+            height,
+        } => {
+            let separator_row = detail_separator_row(app, width, height);
+            let session_rows = separator_row.saturating_sub(3) as usize;
+            if y < separator_row {
+                app.scroll_sessions(-1, session_rows);
+            } else if app.panel_focus == PanelFocus::Agents {
                 app.move_agent_focus(-1);
             } else {
-                app.move_focus(-1);
+                app.scroll_sessions(-1, session_rows);
             }
         }
-        UiMouse::ScrollDown { .. } => {
-            if app.panel_focus == PanelFocus::Agents {
+        UiMouse::ScrollDown {
+            x: _,
+            y,
+            width,
+            height,
+        } => {
+            let separator_row = detail_separator_row(app, width, height);
+            let session_rows = separator_row.saturating_sub(3) as usize;
+            if y < separator_row {
+                app.scroll_sessions(1, session_rows);
+            } else if app.panel_focus == PanelFocus::Agents {
                 app.move_agent_focus(1);
             } else {
-                app.move_focus(1);
+                app.scroll_sessions(1, session_rows);
             }
         }
-        UiMouse::Click { x: _, y, width, height } => {
+        UiMouse::Click {
+            x,
+            y,
+            width,
+            height,
+        } => {
             // Check if clicking on the separator row to start a drag resize
-            let sep_row = (height as usize).saturating_sub(3 + app.detail_panel_height);
-            if y as usize == sep_row {
+            if y == detail_separator_row(app, width, height) {
                 app.resize_drag_state = Some((y, app.detail_panel_height));
                 return;
             }
 
-            let hits = compute_hit_map(app, width, height);
-            let target = hits.get(y as usize).cloned().flatten();
-            match target {
-                Some(HitTarget::Session(name)) => {
-                    app.click_session(name);
-                }
-                Some(HitTarget::Agent(idx)) => {
-                    app.click_agent(idx);
-                }
-                None => {}
+            let target = compute_hit_target(app, x, y, width, height);
+            if let Some(target) = target {
+                app.activate_hit_target(target);
             }
+        }
+        UiMouse::Move {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            app.set_hover_target(compute_hit_target(app, x, y, width, height));
         }
         UiMouse::Drag { y } => {
             if let Some((start_y, start_height)) = app.resize_drag_state {
                 let delta = start_y as i16 - y as i16;
                 let new_height = (start_height as i16 + delta).max(4) as usize;
-                app.detail_panel_height = new_height;
+                app.set_detail_panel_height(new_height);
             }
         }
         UiMouse::DragEnd => {

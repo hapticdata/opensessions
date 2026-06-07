@@ -4,23 +4,22 @@ opensessions is a local coordination layer between your multiplexer, your agent 
 
 It is easiest to think about it as four pieces:
 
-1. mux providers that know how to inspect and control the active multiplexer
-2. agent watchers that translate external agent data into `AgentEvent`s
-3. a Bun server that merges state and broadcasts it
-4. an OpenTUI client that renders the sidebar and sends user commands back
+1. a Rust tmux provider that knows how to inspect and control tmux
+2. Rust agent watchers and HTTP APIs that translate agent data into `AgentEvent`s
+3. a Rust WebSocket/HTTP server that merges state and broadcasts it
+4. a Rust ratatui sidebar client that renders the UI and sends user commands back
 
 ## Startup Flow
 
-When the TUI starts, it first calls `ensureServer()` from `@opensessions/runtime`.
+When the tmux plugin or sidebar starts, the helper scripts ensure an `opensessions-server` process is running for the current tmux socket.
 
-If no healthy server is listening on `127.0.0.1:7391`, `ensureServer()` launches `apps/server/src/main.ts` in the background. The server then:
+If no healthy server is listening, `integrations/tmux-plugin/scripts/server-common.sh` launches the Rust `opensessions-server` binary. The server then:
 
 1. loads config from `~/.config/opensessions/config.json`
-2. dynamically registers the built-in mux providers from `@opensessions/mux-tmux` and `@opensessions/mux-zellij`
-3. loads local plugins and configured package plugins
-4. resolves the primary mux provider
-5. registers the built-in Amp, Claude Code, Codex, and OpenCode watchers
-6. starts the WebSocket and HTTP control server
+2. registers the built-in tmux provider
+3. resolves the primary mux provider
+4. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid
+5. starts the WebSocket and HTTP control server
 
 ## State Assembly
 
@@ -28,18 +27,18 @@ The server computes a single `ServerState` payload for every connected sidebar c
 
 That state is assembled from several sources:
 
-- session lists from every registered mux provider
+- session lists from the active mux provider
 - custom session order stored on disk
 - Git branch and dirty information from each session directory
 - pane counts and window counts from providers
 - detected listening ports from descendant processes in tmux sessions
 - tracked agent instances and unseen state from `AgentTracker`
 
-The result is one merged view even when multiple mux providers are active.
+The result is one live view of the current tmux universe.
 
 ## Agent Tracking Model
 
-Watchers do not know about the TUI. They only know how to emit `AgentEvent`s through the watcher context.
+Watchers and external integrations do not know about the TUI. They only emit `AgentEvent`s into the server, either through built-in Rust scanners or `POST /api/agent-event`.
 
 The `AgentTracker` is where those raw events become UI-friendly state:
 
@@ -72,7 +71,7 @@ Notable design choices:
 - tmux global hooks notify the server about focus changes, session creation, window changes, and resize events
 - hidden sidebars are moved into a dedicated stash session named `_os_stash` instead of being destroyed
 - the TUI refocuses the main pane after capability detection to avoid escape-sequence leakage into the main pane
-- a small typed tmux SDK exists under `packages/mux/tmux-sdk` for lower-level command work
+- typed tmux command helpers live in the Rust tmux provider and tmux scripting modules
 - the tmux integration scripts live under `integrations/tmux-plugin`, while the sidebar launcher itself lives with the TUI app in `apps/tui/scripts/start.sh`
 
 ## Experimental Providers
@@ -104,18 +103,19 @@ The runtime keeps a small set of operational files:
 
 Some pieces are intentionally still narrow in scope:
 
-- the server and TUI are effectively pinned to `127.0.0.1:7391`
-- parsed config fields `port` and `keybinding` are not yet wired through the runtime
+- the server and TUI are local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden
+- parsed config field `keybinding` is not yet wired through the runtime
 - inline theme objects exist in the core API surface, but the running server currently uses theme names
 - tmux is the only supported mux today
 
 ## Why The Codebase Is Split This Way
 
-The repository now follows a clearer monorepo boundary model:
+The repository now follows a Rust-first monorepo boundary model:
 
-- `apps/*` contains runnable entrypoints such as the server bootstrap and the TUI
-- `packages/runtime` contains reusable runtime logic that both apps depend on
-- `packages/mux/*` groups the mux contract, concrete mux providers, and the lower-level tmux SDK in one place
+- `apps/server-rs` contains the Rust control-plane server
+- `apps/tui-rs` contains the Rust ratatui sidebar client
+- `packages/runtime-rs` contains reusable runtime logic that both apps depend on
+- `packages/sidebar-core-rs` contains shared sidebar state, input, layout, and rendering logic
 - `integrations/tmux-plugin` contains host-specific tmux glue instead of runtime library code
 
 That keeps entrypoints, reusable libraries, mux adapters, and host integrations separate enough that new contributors can tell what owns what at a glance.

@@ -24,8 +24,8 @@ tmux is the only supported mux today. There is older zellij integration code in 
 Requirements:
 
 - `tmux`
-- `cargo` ([install Rust](https://rustup.rs))
 - [TPM](https://github.com/tmux-plugins/tpm)
+- `curl` or `wget` for downloading prebuilt binaries on first load
 
 Add this to `~/.tmux.conf`:
 
@@ -40,21 +40,21 @@ tmux source-file ~/.tmux.conf
 ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
-Build the binaries:
+Open the sidebar with `prefix o → s`.
+
+TPM clones the repo into `~/.tmux/plugins/opensessions`. On first load, opensessions downloads the matching prebuilt release bundle into `bin/`; that bundle includes `opensessions-sidebar`, `opensessions-server`, and `lazydiff`.
+
+If your platform is unsupported or you are developing locally, you can still build from source:
 
 ```bash
 cd ~/.tmux/plugins/opensessions
 cargo build --release
 ```
 
-Open the sidebar with `prefix o → s`.
-
-TPM clones the repo into `~/.tmux/plugins/opensessions`. The sidebar and server run as native Rust binaries from `target/release/`.
-
 If you want the same setup as a single shell command:
 
 ```bash
-grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins && cd ~/.tmux/plugins/opensessions && cargo build --release
+grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
 ## Update
@@ -65,11 +65,9 @@ Use TPM's built-in update (`prefix + U`) or run:
 ~/.tmux/plugins/tpm/bin/update_plugins opensessions
 ```
 
-Then rebuild:
+No rebuild step:
 
-```bash
-cd ~/.tmux/plugins/opensessions && cargo build --release
-```
+No local rebuild is needed for normal installs. Reload tmux after TPM updates the plugin; opensessions will download the matching release bundle if `bin/` is missing or incomplete.
 
 The plugin automatically restarts the server on update so it picks up the new binary. Toggle the sidebar back on with `prefix o → s` if it was open.
 
@@ -90,8 +88,8 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 - Session context in the UI: branch in the list, working directory in the detail panel, thread names, and detected localhost ports.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
 - Fast switching with `j`/`k`, arrows, `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
-- `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, in-app theme switching, and plugin hooks for more mux providers or watchers.
-- Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local WebSocket server on `127.0.0.1:7391`.
+- `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, and in-app theme switching.
+- Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local Rust WebSocket/HTTP server.
 
 ## Programmatic API
 
@@ -153,8 +151,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 - [Features and keybindings reference](./docs/reference/features-and-keybindings.md)
 - [Programmatic API reference](./docs/reference/programmatic-api.md)
 - [Architecture explanation](./docs/explanation/architecture.md)
-- [Contracts and extension interfaces](./CONTRACTS.md)
-- [Plugin authoring guide](./PLUGINS.md)
+- [Contracts and supported integration interfaces](./CONTRACTS.md)
 
 ## A Few Concrete Bits
 
@@ -172,14 +169,12 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 - `apps/tui-rs/` — Rust ratatui sidebar client (connects to server over WebSocket)
 - `apps/server-rs/` — Rust server that assembles state from mux providers and agent watchers
-- `apps/sidebar-shim-rs/` — Lightweight shim for sidebar process management
 - `apps/tui/scripts/` — Shell scripts for tmux sidebar launch and session switching
 
 ### Packages
 
 - `packages/runtime-rs/` — Shared Rust runtime: tmux provider, agent watchers, config, tracker, protocol
-- `packages/sidebar-core-rs/` — Core sidebar rendering logic, extractable for snapshot tests
-- `packages/sidebar-protocol-rs/` — Shared protocol types between server and sidebar
+- `packages/sidebar-core-rs/` — Core sidebar state, input, and rendering logic
 
 ### Integrations
 
@@ -190,8 +185,8 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 ## Current Caveats
 
-- The app is effectively pinned to `127.0.0.1:7391` today.
-- `theme`, `sidebarWidth`, `sidebarPosition`, `plugins`, and `mux` are wired through the runtime; other typed config fields are not all live yet.
+- The app is local-only; the default host is `127.0.0.1`, and ports are derived per tmux socket unless explicitly overridden.
+- `theme`, `sidebarWidth`, `sidebarPosition`, `detailPanelHeight`, `sessionFilter`, and `mux` are wired through the runtime. `plugins`, `port`, and `keybinding` are parsed for compatibility but are not active runtime extension hooks today.
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
 

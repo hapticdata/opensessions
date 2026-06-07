@@ -5,7 +5,7 @@
 # Install:
 #   1. Add to .tmux.conf:  set -g @plugin 'Ataraxy-Labs/opensessions'
 #   2. Press prefix + I to install
-#   3. Requires: cargo (https://rustup.rs) — build with: cargo build --release
+#   3. Prebuilt release binaries are downloaded automatically on first load
 #
 # Default keybindings:
 #   prefix + o → s   — reveal and focus sidebar
@@ -17,11 +17,21 @@
 #   @opensessions-prefix-key        "o"  — prefix + key to enter opensessions command table
 #   @opensessions-focus-global-key  ""   — optional no-prefix key to reveal and focus sidebar
 #   @opensessions-index-keys        ""   — optional no-prefix keys mapped to visible sessions 1..9
-#   @opensessions-width             "26" — sidebar width in columns
+#   @opensessions-width             deprecated — use config.json sidebarWidth or the in-sidebar width slider
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$CURRENT_DIR/integrations/tmux-plugin/scripts"
 SCRIPT_DIR="$SCRIPTS_DIR"
+
+# TPM installs from GitHub source, so fetch the matching release binaries instead
+# of asking users to build Rust locally. Local/dev checkouts can set
+# OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1 and use target/{debug,release}.
+PACKAGE_VERSION="$(grep -o '"version": *"[^"]*"' "$CURRENT_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)"
+BIN_VERSION="$(cat "$CURRENT_DIR/bin/.opensessions-version" 2>/dev/null || true)"
+if [ ! -x "$CURRENT_DIR/bin/opensessions-sidebar" ] || [ ! -x "$CURRENT_DIR/bin/opensessions-server" ] || [ ! -x "$CURRENT_DIR/bin/lazydiff" ] || [ "$BIN_VERSION" != "$PACKAGE_VERSION" ]; then
+  sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1 || true
+fi
+
 . "$SCRIPTS_DIR/server-common.sh"
 
 # --- Read user options with defaults ---
@@ -37,7 +47,6 @@ get_option() {
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
-WIDTH=$(get_option "@opensessions-width" "26")
 COMMAND_TABLE="opensessions"
 
 bind_global_key() {
@@ -59,11 +68,11 @@ bind_global_index_keys() {
 
 # Export so scripts can read them
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
-tmux set-environment -g OPENSESSIONS_WIDTH "$WIDTH"
+tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
 
 # --- Bootstrap: kill stale server if version or install path changed ---
 VERSION_FILE="${PID_FILE%.pid}.version"
-CURRENT_VERSION="${CURRENT_DIR}:$(grep -o '"version": *"[^"]*"' "$CURRENT_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)"
+CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}"
 RUNNING_VERSION=""
 [ -f "$VERSION_FILE" ] && RUNNING_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
 
@@ -75,10 +84,7 @@ if [ "$CURRENT_VERSION" != "$RUNNING_VERSION" ]; then
 
   echo -n "$CURRENT_VERSION" > "$VERSION_FILE"
 
-  # --- Bootstrap: rebuild on version change if needed ---
-  if [ -x "$CURRENT_DIR/target/release/opensessions-sidebar" ]; then
-    : # Binary already built
-  fi
+  : # Version file is only used to restart stale server processes.
 fi
 
 # --- Bind tmux shortcuts ---

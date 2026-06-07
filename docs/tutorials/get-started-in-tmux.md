@@ -4,9 +4,10 @@ This tutorial gets opensessions running as a real tmux sidebar, either through T
 
 ## Prerequisites
 
-- Bun installed and available on `PATH`
 - tmux installed
 - Either TPM already installed or a local checkout of this repository
+- `curl` or `wget` if you install with TPM, so opensessions can download prebuilt release binaries
+- Rust/Cargo only if you are developing locally or your platform is not covered by the release binaries
 
 ## 1. Fast path with TPM
 
@@ -16,19 +17,19 @@ If you already use [TPM](https://github.com/tmux-plugins/tpm), run:
 grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
-Result: TPM clones the GitHub repo for you, installs the plugin, and `opensessions.tmux` bootstraps the Bun workspace from the plugin checkout the first time it loads.
+Result: TPM clones the GitHub repo for you. The first time tmux loads the plugin, opensessions downloads the matching prebuilt binaries into `~/.tmux/plugins/opensessions/bin/`.
 
 If you do not use TPM yet, continue with the local-clone flow below.
 
-## 2. Install workspace dependencies
+## 2. Local development only: build from source
 
-From the repository root:
+Skip this step for normal TPM installs. If you run from a local clone or need to build for an unsupported platform, build the Rust binaries from the repository root:
 
 ```bash
-bun install
+cargo build --release
 ```
 
-Result: the workspace packages are installed and the TUI can run.
+Result: the plugin can run binaries from `target/release/` instead of downloaded release binaries in `bin/`.
 
 ## 3. Add opensessions to your tmux config
 
@@ -53,10 +54,10 @@ tmux source-file ~/.tmux.conf
 ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
-All `@opensessions-*` tmux options already have defaults. Add overrides only when you want different width or global keys, for example:
+All `@opensessions-*` tmux options already have defaults. Configure width from the in-sidebar width slider or `~/.config/opensessions/config.json`; add tmux overrides only for global keys, for example:
 
 ```tmux
-set -g @opensessions-width "30"
+set -g @opensessions-focus-global-key "C-e"
 ```
 
 Result: tmux registers direct prefix bindings for sidebar toggle, focus, and session switching.

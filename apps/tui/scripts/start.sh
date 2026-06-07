@@ -7,14 +7,16 @@ fi
 OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 
 RUST_BIN=""
-if [ -x "$OPENSESSIONS_DIR/target/release/opensessions-sidebar" ]; then
+if [ -x "$OPENSESSIONS_DIR/bin/opensessions-sidebar" ]; then
+    RUST_BIN="$OPENSESSIONS_DIR/bin/opensessions-sidebar"
+elif [ -x "$OPENSESSIONS_DIR/target/release/opensessions-sidebar" ]; then
     RUST_BIN="$OPENSESSIONS_DIR/target/release/opensessions-sidebar"
 elif [ -x "$OPENSESSIONS_DIR/target/debug/opensessions-sidebar" ]; then
     RUST_BIN="$OPENSESSIONS_DIR/target/debug/opensessions-sidebar"
 fi
 
 if [ -z "$RUST_BIN" ]; then
-    echo "opensessions: sidebar binary not found. Run: cd $OPENSESSIONS_DIR && cargo build --release -p opensessions-sidebar" >&2
+    echo "opensessions: sidebar binary not found. Reinstall/update opensessions, or build locally with: cd $OPENSESSIONS_DIR && cargo build --release -p opensessions-sidebar" >&2
     exit 1
 fi
 

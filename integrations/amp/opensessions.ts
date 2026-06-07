@@ -27,7 +27,7 @@
 
 // @i-know-the-amp-plugin-api-is-wip-and-very-experimental-right-now
 import type { PluginAPI } from "@ampcode/plugin";
-import { appendFileSync, readFileSync } from "fs";
+import { appendFileSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -37,7 +37,11 @@ function plog(msg: string): void {
 }
 
 const DEFAULT_SERVER_PORT = 7391;
-const POST_TIMEOUT_MS = 3_000;
+const RUST_SERVER_PORT_BASE = 22000;
+const POST_TIMEOUT_MS = 750;
+const RETRY_INITIAL_MS = 250;
+const RETRY_MAX_MS = 2_000;
+const RETRY_FOR_MS = 30_000;
 
 type Status = "idle" | "running" | "tool-running" | "done" | "error" | "interrupted";
 
@@ -46,7 +50,9 @@ interface EventPayload {
   status: Status;
   threadId?: string;
   threadName?: string;
+  lastUserPrompt?: string;
   tmuxSession?: string;
+  paneId?: string;
   projectDir: string;
   ts: number;
 }
@@ -110,10 +116,8 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
 }
 
 /**
- * Port resolution — matches opensessions `packages/runtime/src/shared.ts`.
- * The server port is derived from the tmux socket path so that two users on
- * the same machine (or the same user with multiple tmux servers) don't fight
- * over the default port.
+ * Port resolution — matches the tmux-scoped opensessions server namespace.
+ * Rust servers use 22000+server_key.
  */
 function hashServerKey(input: string): number {
   let hash = 0;
@@ -123,25 +127,73 @@ function hashServerKey(input: string): number {
   return hash;
 }
 
-function resolveServerPort(): number {
+function resolveServerUrls(): string[] {
+  const urls: string[] = [];
+  const add = (url: string | undefined): void => {
+    if (url && !urls.includes(url)) urls.push(url);
+  };
+
+  add(process.env.OPENSESSIONS_URL);
+
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  if (Number.isFinite(explicit) && explicit > 0) add(`http://127.0.0.1:${explicit}`);
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 17000 + Number.parseInt(explicitKey, 10);
+  if (explicitKey) {
+    const key = Number.parseInt(explicitKey, 10);
+    if (Number.isFinite(key)) {
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+    }
+  }
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
     const socketPath = tmux.split(",", 1)[0];
-    if (socketPath) return 17000 + hashServerKey(socketPath);
+    if (socketPath) {
+      const key = hashServerKey(socketPath);
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+    }
   }
-  return DEFAULT_SERVER_PORT;
+
+  // Broadcast agent telemetry to every opensessions server currently known on
+  // this machine. Each server maps projectDir/tmuxSession against its own tmux
+  // sessions and no-ops events for folders it does not own.
+  try {
+    for (const entry of readdirSync("/tmp")) {
+      const match = /^opensessions\.(\d+)\.pid$/.exec(entry);
+      if (!match) continue;
+      if (!pidFileIsAlive(join("/tmp", entry))) continue;
+      const key = Number.parseInt(match[1], 10);
+      if (!Number.isFinite(key)) continue;
+      add(`http://127.0.0.1:${RUST_SERVER_PORT_BASE + key}`);
+    }
+  } catch {}
+
+  if (urls.length === 0) add(`http://127.0.0.1:${DEFAULT_SERVER_PORT}`);
+  return urls;
 }
 
-const SERVER_URL = process.env.OPENSESSIONS_URL ?? `http://127.0.0.1:${resolveServerPort()}`;
-const ENDPOINT = `${SERVER_URL}/api/agent-event`;
+function pidFileIsAlive(path: string): boolean {
+  try {
+    const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-plog(`plugin loaded endpoint=${ENDPOINT} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
+function serverUrls(): string[] {
+  // Resolve at send time, not plugin-load time. Amp plugin processes can live
+  // across opensessions restarts and tmux env changes; stale endpoints during
+  // a restart should not strand events until Amp itself is restarted.
+  return resolveServerUrls();
+}
+
+let preferredServerUrl: string | undefined;
+
+plog(`plugin loaded endpoints=${serverUrls().join(",")} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
 
 async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
   try {
@@ -153,27 +205,112 @@ async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
   }
 }
 
-async function post(payload: EventPayload): Promise<void> {
+async function resolveTmuxPane($: PluginAPI["$"]): Promise<string | null> {
   try {
-    const res = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-    });
-    plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
-  } catch (err) {
-    plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
+    const result = await $`tmux display-message -p '#{pane_id}'`;
+    const paneId = result.stdout.trim();
+    return paneId.length > 0 ? paneId : null;
+  } catch {
+    return null;
   }
+}
+
+type PendingPayload = EventPayload & { firstAttemptTs: number; retryDelayMs: number };
+
+const pendingByThread = new Map<string, PendingPayload>();
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+function pendingKey(payload: EventPayload): string {
+  return payload.threadId ?? `${payload.projectDir}:${payload.tmuxSession ?? ""}`;
+}
+
+function scheduleRetry(): void {
+  if (retryTimer || pendingByThread.size === 0) return;
+  const nextDelay = Math.min(
+    ...Array.from(pendingByThread.values()).map((payload) => payload.retryDelayMs),
+  );
+  retryTimer = setTimeout(() => {
+    retryTimer = undefined;
+    void flushPending();
+  }, nextDelay);
+}
+
+async function flushPending(): Promise<void> {
+  const now = Date.now();
+  for (const [key, payload] of Array.from(pendingByThread.entries())) {
+    if (now - payload.firstAttemptTs > RETRY_FOR_MS) {
+      pendingByThread.delete(key);
+      plog(`retry drop status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ageMs=${now - payload.firstAttemptTs}`);
+      continue;
+    }
+    const { firstAttemptTs, retryDelayMs, ...eventPayload } = payload;
+    if (await postOnce(eventPayload)) {
+      pendingByThread.delete(key);
+    } else {
+      pendingByThread.set(key, {
+        ...payload,
+        retryDelayMs: Math.min(retryDelayMs * 2, RETRY_MAX_MS),
+      });
+    }
+  }
+  scheduleRetry();
+}
+
+async function postOnce(payload: EventPayload): Promise<boolean> {
+  const urls = serverUrls();
+  const candidates = preferredServerUrl
+    ? [preferredServerUrl, ...urls.filter((url) => url !== preferredServerUrl)]
+    : urls;
+  let lastError: unknown;
+  for (const serverUrl of candidates) {
+    const endpoint = `${serverUrl}/api/agent-event`;
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+      });
+      if (res.status === 204) {
+        preferredServerUrl = serverUrl;
+        plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
+        return true;
+      }
+      plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} name=${payload.threadName ?? "-"} -> ${res.status}`);
+    } catch (err) {
+      lastError = err;
+      plog(`POST endpoint=${endpoint} status=${payload.status} thread=${payload.threadId?.slice(0, 8)} ERROR ${String(err)}`);
+    }
+  }
+  plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} failed all endpoints last=${String(lastError)}`);
+  return false;
+}
+
+async function post(payload: EventPayload): Promise<void> {
+  if (await postOnce(payload)) return;
+
+  const key = pendingKey(payload);
+  const existing = pendingByThread.get(key);
+  pendingByThread.set(key, {
+    ...payload,
+    firstAttemptTs: existing?.firstAttemptTs ?? Date.now(),
+    retryDelayMs: RETRY_INITIAL_MS,
+  });
+  plog(`retry queued status=${payload.status} thread=${payload.threadId?.slice(0, 8)} key=${key} pending=${pendingByThread.size}`);
+  scheduleRetry();
 }
 
 export default function (amp: PluginAPI) {
   const projectDir = process.cwd();
   let tmuxSession: string | null = null;
+  let paneId: string | null = null;
 
   // Resolve tmux session eagerly so we have it ready for the first event.
   resolveTmuxSession(amp.$).then((name) => {
     tmuxSession = name;
+  });
+  resolveTmuxPane(amp.$).then((id) => {
+    paneId = id;
   });
 
   /**
@@ -186,6 +323,7 @@ export default function (amp: PluginAPI) {
    * ctx.thread.id gives us otherwise.
    */
   const threadByToolUseID = new Map<string, string>();
+  const lastPromptByThread = new Map<string, string>();
   let lastKnownThreadId: string | undefined;
 
   // Title cache. On first encounter of a thread we fire an async cloud fetch
@@ -219,15 +357,18 @@ export default function (amp: PluginAPI) {
     if (threadId) lastKnownThreadId = threadId;
   };
 
-  const send = async (status: Status, threadId: string | undefined): Promise<void> => {
+  const send = async (status: Status, threadId: string | undefined, lastUserPrompt?: string): Promise<void> => {
     rememberThreadId(threadId);
     const tid = threadId ?? lastKnownThreadId;
+    if (tid && lastUserPrompt) lastPromptByThread.set(tid, lastUserPrompt);
     await post({
       agent: "amp",
       status,
       threadId: tid,
       threadName: resolveTitle(tid),
+      lastUserPrompt: lastUserPrompt ?? (tid ? lastPromptByThread.get(tid) : undefined),
       tmuxSession: tmuxSession ?? undefined,
+      paneId: paneId ?? undefined,
       projectDir,
       ts: Date.now(),
     });
@@ -235,11 +376,12 @@ export default function (amp: PluginAPI) {
 
   amp.on("session.start", async (event, ctx) => {
     if (!tmuxSession) tmuxSession = await resolveTmuxSession(ctx.$);
+    if (!paneId) paneId = await resolveTmuxPane(ctx.$);
     await send("idle", event.thread?.id ?? ctx.thread?.id);
   });
 
-  amp.on("agent.start", async (_event, ctx) => {
-    await send("running", ctx.thread?.id);
+  amp.on("agent.start", async (event, ctx) => {
+    await send("running", ctx.thread?.id, event.message);
     return {};
   });
 
@@ -248,7 +390,7 @@ export default function (amp: PluginAPI) {
       event.status === "done" ? "done" :
       event.status === "error" ? "error" :
       "interrupted";
-    await send(status, ctx.thread?.id);
+    await send(status, ctx.thread?.id, event.message);
   });
 
   amp.on("tool.call", async (event, ctx) => {
