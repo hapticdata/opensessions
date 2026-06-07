@@ -2,6 +2,20 @@
 
 You are working on **opensessions**, an agent-agnostic, mux-agnostic terminal session manager.
 
+## North Star
+
+**opensessions is becoming the parallel-agent operating system.** It should make many CLI agents, panes, mux sessions, and git worktrees feel like one coherent control plane instead of a pile of terminals.
+
+The product direction is:
+
+- **Observe everything**: track mux sessions, windows, panes, focused pane, layouts, worktrees, git state, agent status, approval state, unread/done state, and session activity as first-class runtime state.
+- **One worktree === one session by default** for opensessions-created work: a new isolated task should get a worktree-backed mux session with predictable naming, pane layout, agent launch, and cleanup.
+- **Existing work stays valid**: users and agents must also be able to launch agents inside existing worktrees, existing sessions, and existing panes when that is the right workflow.
+- **Server as control plane**: the server should own durable state, synchronization, launch jobs, mux/worktree mappings, and agent-facing APIs. The sidebar is one UI over that control plane, not the control plane itself.
+- **CLI/API for agents**: opensessions should expose commands and eventually an API/MCP surface that lets agents create sessions, launch sibling agents, inspect panes, read useful context, send prompts, wait for state changes, and report handoffs safely.
+- **Mux-native, not mux-hostile**: tmux/zellij/etc. remain the substrate. opensessions should repair and manage only what it owns, preserve user layouts by default, and reserve fully managed layouts for explicit modes.
+- **Review and merge are part of the OS**: parallel execution is only useful when the user can compare outputs, detect conflicts, review diffs, merge winning work, and clean up sessions/worktrees without ceremony.
+
 ## Project Structure
 
 ```

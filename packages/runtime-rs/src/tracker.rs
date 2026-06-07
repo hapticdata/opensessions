@@ -10,6 +10,7 @@ const SYNTHETIC_PANE_MARKER: &str = ":pane:";
 pub struct PanePresenceInput {
     pub agent: String,
     pub pane_id: String,
+    pub active: bool,
     pub thread_id: Option<String>,
     pub thread_name: Option<String>,
 }
@@ -40,9 +41,17 @@ impl AgentTracker {
         session_instances
             .iter()
             .filter(|(key, _)| !is_synthetic_pane_key(key))
-            .map(|(_, event)| event)
+            .map(|(key, event)| {
+                let mut event = event.clone();
+                if self
+                    .unseen_instances
+                    .contains(&self.unseen_key(session, key))
+                {
+                    event.unseen = Some(true);
+                }
+                event
+            })
             .max_by_key(|event| status_priority(event.status))
-            .cloned()
     }
 
     pub fn get_agents(&self, session: &str) -> Vec<AgentEvent> {
@@ -53,12 +62,11 @@ impl AgentTracker {
         let mut agents = session_instances
             .iter()
             .filter(|(key, _)| !is_synthetic_pane_key(key))
-            .map(|(_, event)| {
+            .map(|(key, event)| {
                 let mut event = event.clone();
-                let key = instance_key(&event.agent, event.thread_id.as_deref());
                 if self
                     .unseen_instances
-                    .contains(&self.unseen_key(session, &key))
+                    .contains(&self.unseen_key(session, key))
                 {
                     event.unseen = Some(true);
                 }
@@ -329,11 +337,38 @@ impl AgentTracker {
         let Some(session_instances) = self.instances.get(session) else {
             return false;
         };
-        let keys = session_instances
+        let mut keys = session_instances
             .iter()
             .filter(|(_, event)| event.pane_id.as_deref() == Some(pane_id))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
+
+        let pane_agents = session_instances
+            .iter()
+            .filter(|(key, event)| {
+                is_synthetic_pane_key(key) && event.pane_id.as_deref() == Some(pane_id)
+            })
+            .map(|(_, event)| (event.agent.as_str(), event.thread_id.as_deref()))
+            .collect::<Vec<_>>();
+        for (agent, thread_id) in pane_agents {
+            let matching_logical_keys = session_instances
+                .iter()
+                .filter(|(key, event)| {
+                    !is_synthetic_pane_key(key)
+                        && event.pane_id.is_none()
+                        && event.agent == agent
+                        && thread_id
+                            .is_none_or(|thread_id| event.thread_id.as_deref() == Some(thread_id))
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            if matching_logical_keys.len() == 1 {
+                keys.extend(matching_logical_keys);
+            }
+        }
+
+        keys.sort();
+        keys.dedup();
 
         let mut changed = false;
         for key in keys {
@@ -451,40 +486,8 @@ impl AgentTracker {
                     continue;
                 }
 
-                let exact_synthetic_key =
-                    synthetic_pane_key(&pane.agent, &pane.pane_id, Some(thread_id));
-                if self
-                    .instances
-                    .get(session)
-                    .and_then(|instances| instances.get(&exact_synthetic_key))
-                    .is_some()
-                {
-                    if self.stamp_alive(session, &exact_synthetic_key, &pane.pane_id) {
-                        changed = true;
-                    }
-                    continue;
-                }
-
                 let generic_synthetic_key = synthetic_pane_key(&pane.agent, &pane.pane_id, None);
                 self.remove_instance(session, &generic_synthetic_key);
-
-                let synthetic = AgentEvent {
-                    agent: pane.agent,
-                    session: session.to_string(),
-                    status: AgentStatus::Running,
-                    ts: now_ms(),
-                    thread_id: Some(thread_id.to_string()),
-                    thread_name: pane.thread_name,
-                    last_user_prompt: None,
-                    unseen: None,
-                    pane_id: Some(pane.pane_id),
-                    liveness: Some(AgentLiveness::Alive),
-                };
-                self.instances
-                    .get_mut(session)
-                    .expect("session instances exist")
-                    .insert(exact_synthetic_key, synthetic);
-                changed = true;
                 continue;
             }
 
@@ -582,30 +585,25 @@ impl AgentTracker {
                 if self.stamp_alive(session, &synthetic_key, &pane.pane_id) {
                     changed = true;
                 }
-            } else {
-                self.instances
-                    .get_mut(session)
-                    .expect("session instances exist")
-                    .insert(
-                        synthetic_key,
-                        AgentEvent {
-                            agent: pane.agent,
-                            session: session.to_string(),
-                            status: AgentStatus::Running,
-                            ts: now_ms(),
-                            thread_id: None,
-                            thread_name: pane.thread_name,
-                            last_user_prompt: None,
-                            unseen: None,
-                            pane_id: Some(pane.pane_id),
-                            liveness: Some(AgentLiveness::Alive),
-                        },
-                    );
-                changed = true;
             }
         }
 
         changed
+    }
+
+    pub fn active_pane_ids(&self, session: &str) -> Vec<String> {
+        self.instances
+            .get(session)
+            .map(|instances| {
+                instances
+                    .values()
+                    .filter(|event| event.liveness == Some(AgentLiveness::Alive))
+                    .filter_map(|event| event.pane_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn apply_event_with_options(&mut self, event: &mut AgentEvent, _seed: bool) {
@@ -911,6 +909,7 @@ mod tests {
             vec![PanePresenceInput {
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
+                active: false,
                 thread_id: Some("T-1".to_string()),
                 thread_name: Some("Fix focus".to_string()),
             }],
@@ -935,6 +934,7 @@ mod tests {
             vec![PanePresenceInput {
                 agent: "amp".to_string(),
                 pane_id: "%9".to_string(),
+                active: false,
                 thread_id: None,
                 thread_name: Some("Review PR".to_string()),
             }],
@@ -947,6 +947,34 @@ mod tests {
             .expect("tracked agent");
         assert_eq!(agent.pane_id.as_deref(), Some("%9"));
         assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn pane_presence_without_matching_events_does_not_create_fake_agent_instances() {
+        let mut tracker = AgentTracker::new();
+
+        tracker.apply_pane_presence(
+            "work",
+            vec![
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%7".to_string(),
+                    active: false,
+                    thread_id: None,
+                    thread_name: Some("Roadmap".to_string()),
+                },
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%8".to_string(),
+                    active: true,
+                    thread_id: None,
+                    thread_name: Some("Release".to_string()),
+                },
+            ],
+        );
+
+        assert!(tracker.get_agents("work").is_empty());
+        assert!(tracker.get_state("work").is_none());
     }
 
     #[test]
@@ -1068,12 +1096,14 @@ mod tests {
                 PanePresenceInput {
                     agent: "amp".to_string(),
                     pane_id: "%7".to_string(),
+                    active: false,
                     thread_id: None,
                     thread_name: Some("Seen - amp - focused".to_string()),
                 },
                 PanePresenceInput {
                     agent: "amp".to_string(),
                     pane_id: "%8".to_string(),
+                    active: false,
                     thread_id: None,
                     thread_name: Some("Unseen - amp - background".to_string()),
                 },
@@ -1107,6 +1137,71 @@ mod tests {
             .expect("unseen thread");
         assert_eq!(seen.unseen, None);
         assert_eq!(unseen.unseen, Some(true));
+    }
+
+    #[test]
+    fn aggregate_state_reports_same_unseen_flag_as_agent_list() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("T-1"),
+            Some("Fix focus"),
+            Some("%7"),
+        ));
+
+        assert_eq!(tracker.get_state("work").unwrap().unseen, Some(true));
+        assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+
+        assert!(tracker.mark_pane_seen("work", "%7"));
+
+        assert_eq!(tracker.get_state("work").unwrap().unseen, None);
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+    }
+
+    #[test]
+    fn focusing_pane_does_not_guess_for_unattached_logical_event() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%7".to_string(),
+                active: false,
+                thread_id: None,
+                thread_name: Some("Amp running here".to_string()),
+            }],
+        );
+        tracker.apply_event(terminal_event("amp", "work", Some("T-1"), None, None));
+
+        assert!(tracker.is_unseen("work"));
+        assert!(!tracker.mark_pane_seen("work", "%7"));
+
+        assert!(tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
+
+    #[test]
+    fn focusing_pane_does_not_guess_when_multiple_unattached_events_match_live_agent() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%7".to_string(),
+                active: false,
+                thread_id: None,
+                thread_name: Some("Amp running here".to_string()),
+            }],
+        );
+        tracker.apply_event(terminal_event("amp", "work", Some("T-1"), None, None));
+        tracker.apply_event(terminal_event("amp", "work", Some("T-2"), None, None));
+
+        assert!(!tracker.mark_pane_seen("work", "%7"));
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().all(|agent| agent.unseen == Some(true)));
     }
 
     #[test]

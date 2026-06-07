@@ -36,16 +36,15 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
-/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` points at a log
-/// file. Mirrors the helper in `apps/server-rs/src/lib.rs` so live tmux A/B
-/// harness tracing can be enabled without making production resize/input paths
-/// append to disk.
+/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
+/// so live focus/agent-state issues can be diagnosed without extra env setup;
+/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
-        return;
-    };
+    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
+        .ok()
+        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
     if path.is_empty() {
         return;
     }

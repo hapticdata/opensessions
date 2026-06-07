@@ -28,7 +28,17 @@ pub enum HitTarget {
     Group(String),
     DiffCount(String),
     Agent(usize),
+    AgentPane(AgentPaneTarget),
     AgentScopeToggle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPaneTarget {
+    pub session: String,
+    pub agent: String,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub pane_id: Option<String>,
 }
 
 /// Compute a per-row hit map for the current frame. Each entry corresponds to
@@ -319,7 +329,7 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
     } else {
         let mut right = Vec::new();
         if running > 0 {
-            right.push(format!("⚡{running}"));
+            right.push(format!("{}{running}", agent_spinner(spinner_clock(app))));
         }
         if unseen > 0 {
             right.push(format!("●{unseen}"));
@@ -334,7 +344,7 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
             if idx > 0 {
                 line.push(" ", palette.white);
             }
-            let color = if part.starts_with('⚡') {
+            let color = if part.starts_with(agent_spinner(spinner_clock(app))) {
                 palette.yellow
             } else if part.starts_with('●') {
                 palette.teal
@@ -604,10 +614,15 @@ fn build_group_row(
     } else {
         palette.lavender
     };
-    row.push(if collapsed { "  ▸    " } else { "  ▾    " }, marker_color);
-    let (signal, signal_color) = group_signal(app, key, palette, spinner_clock(app));
-    row.push(signal, signal_color);
-    row.push(" ", palette.white);
+    let marker = if active_surrogate {
+        "▌"
+    } else if focused {
+        "›"
+    } else {
+        " "
+    };
+    row.push(format!("{marker} "), marker_color);
+    row.push(if collapsed { "▸ " } else { "▾ " }, marker_color);
     row.push(
         label,
         if focused {
@@ -617,14 +632,14 @@ fn build_group_row(
         },
     );
     let count_text = format!("{count}wt");
-    let spaces = 25usize.saturating_sub(row.width());
+    let spaces = 24usize.saturating_sub(row.width());
     if spaces > 0 {
         row.push(" ".repeat(spaces), palette.white);
     }
     if row.width() + count_text.width() <= width {
         row.push(count_text, palette.overlay0);
     }
-    push_group_summary(&mut row, palette, summary, width);
+    push_group_summary(&mut row, palette, summary, width, spinner_clock(app));
 
     let mut line = row.end(CellStyle {
         fg: palette.white,
@@ -677,10 +692,11 @@ fn push_group_summary(
     palette: &Palette,
     summary: &crate::session_display::GroupSummary,
     width: usize,
+    spinner_ts: u64,
 ) {
     let mut wrote = false;
     if summary.running_agents > 0 {
-        let text = format!("⚡{}", summary.running_agents);
+        let text = format!("{}{}", agent_spinner(spinner_ts), summary.running_agents);
         if line.width() + text.width() <= width {
             if !wrote {
                 line.push(" ", palette.white);
@@ -803,7 +819,7 @@ fn build_session_name_row(
         TreePosition::None => row.push(format!("{marker} "), marker_color),
     }
     row.push(format!("{index:02} "), index_color);
-    let badges = session_agent_badges(palette, session);
+    let badges = session_agent_badges(app, palette, session, spinner_clock(app));
     let badge_width = agent_badges_width(&badges);
     let gap_width = usize::from(badge_width > 0);
     let name_width = width.saturating_sub(row.width() + badge_width + gap_width);
@@ -821,23 +837,39 @@ fn build_session_name_row(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum AgentBadgeKind {
+enum AgentVisualKind {
     DoneSeen,
-    Active,
     DoneUnseen,
+    Running,
+    ToolRunning,
     Waiting,
-    Warning,
+    Interrupted,
+    Stale,
     Error,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AgentBadge {
-    kind: AgentBadgeKind,
-    glyph: &'static str,
+struct AgentVisual {
+    kind: AgentVisualKind,
+    glyph: String,
     color: Rgb,
+    label: &'static str,
 }
 
-fn session_agent_badges(palette: &Palette, session: &SessionData) -> Vec<AgentBadge> {
+#[derive(Debug, Clone)]
+struct AgentBadge {
+    kind: AgentVisualKind,
+    glyph: String,
+    color: Rgb,
+    bg: Option<Rgb>,
+    target: Option<AgentPaneTarget>,
+}
+
+fn session_agent_badges(
+    app: &App,
+    palette: &Palette,
+    session: &SessionData,
+    spinner_ts: u64,
+) -> Vec<AgentBadge> {
     let agents = if session.agents.is_empty() {
         session.agent_state.iter().collect::<Vec<_>>()
     } else {
@@ -847,81 +879,133 @@ fn session_agent_badges(palette: &Palette, session: &SessionData) -> Vec<AgentBa
         return Vec::new();
     }
 
-    let mut kinds = agents.into_iter().map(agent_badge_kind).collect::<Vec<_>>();
-    kinds.sort_by(|a, b| b.cmp(a));
-    kinds.dedup();
-
-    let overflow = kinds.len() > 3;
-    kinds.truncate(3);
-    let mut badges = kinds
+    let mut badge_sources = agents
         .into_iter()
-        .map(|kind| agent_badge_for_kind(palette, kind))
+        .map(|agent| (agent_visual_kind(agent), agent_focus_target(session, agent)))
         .collect::<Vec<_>>();
-    if overflow {
+    badge_sources.sort_by(|a, b| b.0.cmp(&a.0));
+    let overflow_count = badge_sources.len().saturating_sub(3);
+    badge_sources.truncate(3);
+    let mut badges = badge_sources
+        .into_iter()
+        .map(|(kind, target)| {
+            let visual = agent_visual_for_kind(palette, kind, spinner_ts);
+            let hovered = app.hover_target.as_ref() == Some(&HitTarget::AgentPane(target.clone()));
+            let flashed = app.active_flash_target() == Some(&HitTarget::AgentPane(target.clone()));
+            AgentBadge {
+                kind: visual.kind,
+                glyph: visual.glyph,
+                color: if hovered || flashed {
+                    palette.text
+                } else {
+                    visual.color
+                },
+                bg: (hovered || flashed).then_some(palette.surface2),
+                target: Some(target),
+            }
+        })
+        .collect::<Vec<_>>();
+    if overflow_count > 0 {
         badges.push(AgentBadge {
-            kind: AgentBadgeKind::DoneSeen,
-            glyph: "+",
+            kind: AgentVisualKind::DoneSeen,
+            glyph: format!("+{overflow_count}"),
             color: palette.overlay0,
+            bg: None,
+            target: None,
         });
     }
     badges
 }
 
-fn agent_badge_kind(agent: &AgentEvent) -> AgentBadgeKind {
-    match agent.status {
-        AgentStatus::Error => AgentBadgeKind::Error,
-        AgentStatus::Stale | AgentStatus::Interrupted => AgentBadgeKind::Warning,
-        AgentStatus::Waiting => AgentBadgeKind::Waiting,
-        AgentStatus::Done if agent.unseen == Some(true) => AgentBadgeKind::DoneUnseen,
-        AgentStatus::ToolRunning | AgentStatus::Running => AgentBadgeKind::Active,
-        AgentStatus::Done => AgentBadgeKind::DoneSeen,
-        AgentStatus::Idle => AgentBadgeKind::DoneSeen,
+pub fn agent_focus_target(session: &SessionData, agent: &AgentEvent) -> AgentPaneTarget {
+    AgentPaneTarget {
+        session: session.name.clone(),
+        agent: agent.agent.clone(),
+        thread_id: agent.thread_id.clone(),
+        thread_name: agent.thread_name.clone(),
+        pane_id: agent.pane_id.clone(),
     }
 }
 
-fn agent_badge_for_kind(palette: &Palette, kind: AgentBadgeKind) -> AgentBadge {
-    match kind {
-        AgentBadgeKind::Error => AgentBadge {
-            kind,
-            glyph: "✗",
-            color: palette.red,
-        },
-        AgentBadgeKind::Warning => AgentBadge {
-            kind,
-            glyph: "⚠",
-            color: palette.yellow,
-        },
-        AgentBadgeKind::Waiting => AgentBadge {
-            kind,
-            glyph: "◉",
-            color: palette.blue,
-        },
-        AgentBadgeKind::DoneUnseen => AgentBadge {
-            kind,
-            glyph: "●",
-            color: palette.teal,
-        },
-        AgentBadgeKind::Active => AgentBadge {
-            kind,
-            glyph: "⚡",
-            color: palette.yellow,
-        },
-        AgentBadgeKind::DoneSeen => AgentBadge {
-            kind,
-            glyph: "✓",
-            color: palette.green,
-        },
+fn agent_visual_kind(agent: &AgentEvent) -> AgentVisualKind {
+    match agent.status {
+        AgentStatus::Error => AgentVisualKind::Error,
+        AgentStatus::Stale => AgentVisualKind::Stale,
+        AgentStatus::Interrupted => AgentVisualKind::Interrupted,
+        AgentStatus::Waiting => AgentVisualKind::Waiting,
+        AgentStatus::ToolRunning => AgentVisualKind::ToolRunning,
+        AgentStatus::Running => AgentVisualKind::Running,
+        AgentStatus::Done if agent.unseen == Some(true) => AgentVisualKind::DoneUnseen,
+        AgentStatus::Done | AgentStatus::Idle => AgentVisualKind::DoneSeen,
+    }
+}
+
+fn agent_visual_for_agent(palette: &Palette, agent: &AgentEvent, spinner_ts: u64) -> AgentVisual {
+    agent_visual_for_kind(palette, agent_visual_kind(agent), spinner_ts)
+}
+
+fn agent_visual_for_kind(palette: &Palette, kind: AgentVisualKind, spinner_ts: u64) -> AgentVisual {
+    let glyph = match kind {
+        AgentVisualKind::Error => "✗".to_string(),
+        AgentVisualKind::Stale | AgentVisualKind::Interrupted => "⚠".to_string(),
+        AgentVisualKind::Waiting => "◉".to_string(),
+        AgentVisualKind::ToolRunning => "⚙".to_string(),
+        AgentVisualKind::Running => agent_spinner(spinner_ts).to_string(),
+        AgentVisualKind::DoneUnseen => "●".to_string(),
+        AgentVisualKind::DoneSeen => "✓".to_string(),
+    };
+    let color = match kind {
+        AgentVisualKind::Error => palette.red,
+        AgentVisualKind::Stale => palette.yellow,
+        AgentVisualKind::Interrupted => palette.peach,
+        AgentVisualKind::Waiting => palette.blue,
+        AgentVisualKind::ToolRunning => palette.sky,
+        AgentVisualKind::Running => palette.yellow,
+        AgentVisualKind::DoneUnseen => palette.teal,
+        AgentVisualKind::DoneSeen => palette.green,
+    };
+    let label = match kind {
+        AgentVisualKind::Error => "error",
+        AgentVisualKind::Stale => "stale",
+        AgentVisualKind::Interrupted => "stopped",
+        AgentVisualKind::Waiting => "blocked",
+        AgentVisualKind::ToolRunning => "using tools",
+        AgentVisualKind::Running => "working",
+        AgentVisualKind::DoneUnseen => "done",
+        AgentVisualKind::DoneSeen => "idle",
+    };
+    AgentVisual {
+        kind,
+        glyph,
+        color,
+        label,
     }
 }
 
 fn agent_badges_width(badges: &[AgentBadge]) -> usize {
-    badges.iter().map(|badge| badge.glyph.width()).sum()
+    badges
+        .iter()
+        .map(|badge| badge.glyph.width())
+        .sum::<usize>()
+        + badges.len().saturating_sub(1)
 }
 
 fn push_agent_badges(line: &mut StyledLine, badges: Vec<AgentBadge>) {
-    for badge in badges {
+    for (idx, badge) in badges.into_iter().enumerate() {
         let _ = badge.kind;
-        line.push(badge.glyph, badge.color);
+        if idx > 0 {
+            line.push(" ", WHITE);
+        }
+        if let Some(target) = badge.target {
+            line.push_hit_with_bg(
+                badge.glyph,
+                badge.color,
+                badge.bg,
+                HitTarget::AgentPane(target),
+            );
+        } else {
+            line.push(badge.glyph, badge.color);
+        }
     }
 }
 
@@ -1006,9 +1090,9 @@ fn tree_blank(palette: &Palette, tree: TreePosition) -> StyledLine {
 
 fn tree_detail_prefix(tree: TreePosition) -> &'static str {
     match tree {
-        TreePosition::Middle | TreePosition::Rail => "  │      ",
-        TreePosition::Last => "         ",
-        TreePosition::None => "      ",
+        TreePosition::Middle | TreePosition::Rail => "  │    ",
+        TreePosition::Last => "       ",
+        TreePosition::None => "     ",
     }
 }
 
@@ -1750,16 +1834,11 @@ fn agent_panel_block(
     let flashed = app.active_flash_target() == Some(&hit);
     let highlight = focused || flashed;
     let bg = highlight.then_some(palette.surface1);
+    let visual = agent_visual_for_agent(palette, entry.agent, spinner_clock(app));
 
     let mut primary = StyledLine::with_bg(bg);
     primary.push("  ", palette.white);
-    let (icon, icon_color) = detail_status_icon_for_agent(
-        palette,
-        entry.agent,
-        entry.agent.unseen == Some(true),
-        spinner_clock(app),
-    );
-    primary.push(icon, icon_color);
+    primary.push(&visual.glyph, visual.color);
     primary.push(" ", palette.white);
     if let Some(thread_name) = entry.agent.thread_name.as_deref() {
         primary.push(
@@ -1783,14 +1862,7 @@ fn agent_panel_block(
 
     let mut secondary = StyledLine::with_bg(bg);
     secondary.push("    ", palette.white);
-    secondary.push(
-        semantic_agent_status_text(entry.agent),
-        agent_detail_color(
-            palette,
-            entry.agent.status,
-            entry.agent.unseen == Some(true),
-        ),
-    );
+    secondary.push(visual.label, visual.color);
     secondary.push(" · ", palette.overlay0);
     secondary.push(&entry.agent.agent, palette.overlay0);
 
@@ -1841,15 +1913,10 @@ fn compact_agent_panel_block(
         && app.focused_agent_idx == entry.global_idx;
     let hit = HitTarget::Agent(entry.global_idx);
     let bg = focused.then_some(palette.surface1);
+    let visual = agent_visual_for_agent(palette, entry.agent, spinner_clock(app));
     let mut line = StyledLine::with_bg(bg);
     line.push("  ", palette.white);
-    let (icon, icon_color) = detail_status_icon_for_agent(
-        palette,
-        entry.agent,
-        entry.agent.unseen == Some(true),
-        spinner_clock(app),
-    );
-    line.push(icon, icon_color);
+    line.push(&visual.glyph, visual.color);
     line.push(" ", palette.white);
     if app.agent_panel_scope == AgentPanelScope::All {
         line.push(&entry.session.name, palette.subtext1);
@@ -1890,48 +1957,6 @@ fn compact_agent_panel_block(
     ]
 }
 
-fn semantic_agent_status_text(agent: &AgentEvent) -> &'static str {
-    match agent.status {
-        AgentStatus::Waiting => "blocked",
-        AgentStatus::Running | AgentStatus::ToolRunning => "working",
-        AgentStatus::Done if agent.unseen == Some(true) => "done",
-        AgentStatus::Done | AgentStatus::Idle => "idle",
-        AgentStatus::Error => "error",
-        AgentStatus::Stale => "stale",
-        AgentStatus::Interrupted => "stopped",
-    }
-}
-
-fn detail_status_icon_for_agent(
-    palette: &Palette,
-    agent: &AgentEvent,
-    agent_unseen: bool,
-    spinner_ts: u64,
-) -> (&'static str, Rgb) {
-    if is_unseen_terminal(agent, agent_unseen) {
-        return ("●", status_color(palette, agent.status, true));
-    }
-    if is_terminal(agent) {
-        return match agent.status {
-            AgentStatus::Done => ("✓", palette.green),
-            AgentStatus::Error => ("✗", palette.red),
-            AgentStatus::Stale => ("⚠", palette.yellow),
-            AgentStatus::Interrupted => ("⚠", palette.peach),
-            _ => ("○", palette.surface2),
-        };
-    }
-    match agent.status {
-        AgentStatus::ToolRunning => ("⚙", palette.sky),
-        AgentStatus::Running => (agent_spinner(spinner_ts), palette.yellow),
-        AgentStatus::Waiting => ("◉", palette.blue),
-        AgentStatus::Idle => ("○", palette.surface2),
-        AgentStatus::Done => ("✓", palette.green),
-        AgentStatus::Error => ("✗", palette.red),
-        AgentStatus::Stale => ("⚠", palette.yellow),
-        AgentStatus::Interrupted => ("⚠", palette.peach),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AttentionSignal {
     Unknown,
@@ -1960,36 +1985,6 @@ impl AttentionSignal {
     }
 }
 
-fn group_signal(app: &App, key: &str, palette: &Palette, spinner_ts: u64) -> (&'static str, Rgb) {
-    let signal = app
-        .sessions
-        .iter()
-        .filter(|session| worktree_group_key(session).as_deref() == Some(key))
-        .map(session_attention_signal)
-        .max()
-        .unwrap_or(AttentionSignal::Unknown);
-    attention_signal_glyph(palette, signal, spinner_ts)
-}
-
-fn attention_signal_glyph(
-    palette: &Palette,
-    signal: AttentionSignal,
-    spinner_ts: u64,
-) -> (&'static str, Rgb) {
-    match signal {
-        AttentionSignal::Error => ("✗", palette.red),
-        AttentionSignal::Stale => ("⚠", palette.yellow),
-        AttentionSignal::Interrupted => ("⚠", palette.peach),
-        AttentionSignal::Waiting => ("◉", palette.blue),
-        AttentionSignal::DoneUnseen => ("●", palette.teal),
-        AttentionSignal::ToolWorking => ("⚙", palette.sky),
-        AttentionSignal::Working => (agent_spinner(spinner_ts), palette.yellow),
-        AttentionSignal::DoneSeen => ("✓", palette.green),
-        AttentionSignal::Idle => ("○", palette.surface2),
-        AttentionSignal::Unknown => ("○", palette.surface2),
-    }
-}
-
 fn session_attention_signal(session: &SessionData) -> AttentionSignal {
     session
         .agent_state
@@ -2011,18 +2006,6 @@ fn agent_attention_signal(agent: &AgentEvent) -> AttentionSignal {
         AgentStatus::Running => AttentionSignal::Working,
         AgentStatus::Done => AttentionSignal::DoneSeen,
         AgentStatus::Idle => AttentionSignal::Idle,
-    }
-}
-
-fn agent_detail_color(palette: &Palette, status: AgentStatus, unseen: bool) -> Rgb {
-    match status {
-        AgentStatus::ToolRunning => palette.overlay0,
-        _ if unseen => palette.teal,
-        AgentStatus::Done => palette.green,
-        AgentStatus::Error => palette.red,
-        AgentStatus::Stale | AgentStatus::Interrupted | AgentStatus::Running => palette.yellow,
-        AgentStatus::Waiting => palette.blue,
-        AgentStatus::Idle => palette.overlay0,
     }
 }
 
@@ -2069,17 +2052,6 @@ fn separator(palette: &Palette, width: usize) -> StyledLine {
     line
 }
 
-fn is_terminal(agent: &AgentEvent) -> bool {
-    matches!(
-        agent.status,
-        AgentStatus::Done | AgentStatus::Error | AgentStatus::Stale | AgentStatus::Interrupted
-    ) && agent.liveness != Some(crate::generated::protocol::AgentLiveness::Alive)
-}
-
-fn is_unseen_terminal(agent: &AgentEvent, agent_unseen: bool) -> bool {
-    agent_unseen && is_terminal(agent)
-}
-
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
 /// state, matching `apps/tui/src/index.tsx::SPINNERS`. Frame cadence is
 /// 120ms — the same period as the render tick in `apps/tui-rs/src/main.rs`,
@@ -2098,20 +2070,6 @@ fn spinner_clock(app: &App) -> u64 {
         app.spinner_now
     } else {
         app.ts
-    }
-}
-
-fn status_color(palette: &Palette, status: AgentStatus, unseen: bool) -> Rgb {
-    match status {
-        AgentStatus::Done if unseen => palette.teal,
-        AgentStatus::Done => palette.green,
-        AgentStatus::Error => palette.red,
-        AgentStatus::Stale => palette.yellow,
-        AgentStatus::Interrupted => palette.peach,
-        AgentStatus::ToolRunning => palette.sky,
-        AgentStatus::Running => palette.yellow,
-        AgentStatus::Waiting => palette.blue,
-        AgentStatus::Idle => palette.surface2,
     }
 }
 
@@ -2863,7 +2821,7 @@ const WHITE: Rgb = Rgb::new(255, 255, 255);
 mod tests {
     use super::*;
     use crate::app::{App, KillTarget, Modal};
-    use crate::generated::protocol::{AgentEvent, ServerState, SessionData};
+    use crate::generated::protocol::{AgentEvent, ClientCommand, ServerState, SessionData};
 
     fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
         AgentEvent {
@@ -3031,6 +2989,77 @@ mod tests {
     }
 
     #[test]
+    fn session_agent_badge_hit_target_only_covers_rendered_glyph() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        let mut done = agent("amp", AgentStatus::Done, Some("Review PR"));
+        done.thread_id = Some("thread-1".to_string());
+        done.pane_id = Some("%7".to_string());
+        done.unseen = Some(true);
+        current.agents.push(done);
+        let app = app_from_sessions(vec![current]);
+        let width = 44u16;
+        let height = 24u16;
+        let row = 2u16;
+        let rendered = render_text(&app, width as usize, height as usize);
+        let row_text = &rendered[row as usize];
+        let badge_x = row_text
+            .split_once('●')
+            .map(|(prefix, _)| prefix.width())
+            .unwrap_or_else(|| panic!("missing agent badge row:\n{}", rendered.join("\n")));
+
+        assert_eq!(
+            compute_hit_target(&app, badge_x.saturating_sub(1) as u16, row, width, height),
+            Some(HitTarget::Session("opensessions".to_string())),
+            "padding before the status glyph should keep the row's session target"
+        );
+        assert_eq!(
+            compute_hit_target(&app, badge_x as u16, row, width, height),
+            Some(HitTarget::AgentPane(AgentPaneTarget {
+                session: "opensessions".to_string(),
+                agent: "amp".to_string(),
+                thread_id: Some("thread-1".to_string()),
+                thread_name: Some("Review PR".to_string()),
+                pane_id: Some("%7".to_string()),
+            }))
+        );
+    }
+
+    #[test]
+    fn clicking_session_agent_badge_uses_agent_panel_focus_pane_command_path() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        let mut running = agent("amp", AgentStatus::Running, Some("Release build"));
+        running.thread_id = Some("thread-2".to_string());
+        running.pane_id = Some("%8".to_string());
+        current.agents.push(running);
+        let mut app = app_from_sessions(vec![current]);
+
+        app.activate_hit_target(HitTarget::AgentPane(AgentPaneTarget {
+            session: "opensessions".to_string(),
+            agent: "amp".to_string(),
+            thread_id: Some("thread-2".to_string()),
+            thread_name: Some("Release build".to_string()),
+            pane_id: Some("%8".to_string()),
+        }));
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::SwitchSession {
+                    name: "opensessions".to_string(),
+                    client_tty: None,
+                },
+                ClientCommand::FocusAgentPane {
+                    session: "opensessions".to_string(),
+                    agent: "amp".to_string(),
+                    thread_id: Some("thread-2".to_string()),
+                    thread_name: Some("Release build".to_string()),
+                    pane_id: Some("%8".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn session_rows_show_inline_agent_signals_and_spaced_header() {
         let no_agent = session("effect-ts", "/tmp/effect-ts", "");
         let mut idle = session("learning", "/tmp/learning", "main");
@@ -3055,11 +3084,11 @@ mod tests {
         let app = app_from_sessions(vec![idle, running, unseen, tool, no_agent]);
         let lines = render_text(&app, 40, 32);
 
-        assert_has_line(&lines, " sessions                       ⚡2 ●1 5");
+        assert_has_line(&lines, " sessions                        ⠹2 ●1 5");
         assert_has_line(&lines, "› 01 learning                          ✓");
-        assert_has_line(&lines, "  02 background-export                ⚡");
+        assert_has_line(&lines, "  02 background-export                 ⠹");
         assert_has_line(&lines, "  03 pdf-word-formatting               ●");
-        assert_has_line(&lines, "▌ 04 opensessions                     ⚡");
+        assert_has_line(&lines, "▌ 04 opensessions                      ⚙");
         assert_has_line(&lines, "  05 effect-ts");
     }
 
@@ -3083,7 +3112,7 @@ mod tests {
 
         let lines = render_text(&app, 36, 24);
 
-        assert_has_line(&lines, "› 01 very-long-opensessions-age… ◉●✓");
+        assert_has_line(&lines, "› 01 very-long-opensessions-a… ◉ ● ✓");
     }
 
     #[test]
@@ -3115,14 +3144,14 @@ mod tests {
         app.current_session = Some("background-export".to_string());
         let lines = render_text(&app, 40, 32);
 
-        assert_has_line(&lines, "  ▾    ● plane-wt        3wt ⚡1 ●");
+        assert_has_line(&lines, "› ▾ plane-wt            3wt ⠹1 ●");
         assert_has_line(&lines, "  │");
         assert_has_line(&lines, "  │ 01 edit-pages                      ✓");
-        assert_has_line(&lines, "  │      feat/edit-pages");
-        assert_has_line(&lines, "▌ │ 02 background-export              ⚡");
-        assert_has_line(&lines, "  │      feat-background-exports");
+        assert_has_line(&lines, "  │    feat/edit-pages");
+        assert_has_line(&lines, "▌ │ 02 background-export               ⠹");
+        assert_has_line(&lines, "  │    feat-background-exports");
         assert_has_line(&lines, "  ╰ 03 pdf-word-formatting             ●");
-        assert_has_line(&lines, "         chore-relation-pqls");
+        assert_has_line(&lines, "       chore-relation-pqls");
         assert!(
             !lines
                 .iter()
@@ -3166,7 +3195,7 @@ mod tests {
         ));
         let lines = render_text(&app, 40, 18);
 
-        assert_has_line(&lines, "  ▸    ◉ plane-wt        2wt ⚡1");
+        assert_has_line(&lines, "› ▸ plane-wt            2wt ⠹1");
         assert!(
             !lines.iter().any(|line| line.contains("edit-pages")),
             "collapsed group should hide children\n{}",
@@ -3193,7 +3222,7 @@ mod tests {
         let current_lines = render_text(&app, 40, 24);
         assert_has_line(&current_lines, " agents 1                        current");
         assert_has_line(&current_lines, "  ⚙ Query tmux for open sessions");
-        assert_has_line(&current_lines, "    working · amp");
+        assert_has_line(&current_lines, "    using tools · amp");
 
         app.toggle_agent_panel_scope();
         let all_lines = render_text(&app, 40, 24);
@@ -3257,7 +3286,7 @@ mod tests {
 
         let lines = render_text(&app, 44, 24);
 
-        assert_has_line(&lines, "▌ 01 opensessions                         ⚡");
+        assert_has_line(&lines, "▌ 01 opensessions                          ⠹");
         assert!(
             !lines
                 .iter()
@@ -3268,6 +3297,89 @@ mod tests {
         assert_has_line(&lines, "    “Make the grouped session tree tighter");
         assert_has_line(&lines, "     and keep the focused marker stable");
         assert_has_line(&lines, "     without letting a very long prompt co…”");
+    }
+
+    #[test]
+    fn session_row_shows_two_repeated_agent_statuses_without_count() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Roadmap")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Release")));
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "▌ 01 opensessions                        ⠹ ⠹");
+    }
+
+    #[test]
+    fn session_row_shows_three_repeated_agent_statuses_without_count() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Roadmap")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Release")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Review")));
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "▌ 01 opensessions                      ⠹ ⠹ ⠹");
+    }
+
+    #[test]
+    fn session_row_overflow_counts_hidden_repeated_statuses() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Roadmap")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Release")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Review")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Polish")));
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "▌ 01 opensessions                   ⠹ ⠹ ⠹ +1");
+    }
+
+    #[test]
+    fn session_row_overflow_counts_hidden_distinct_status_kinds() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Error, Some("Error")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Waiting, Some("Waiting")));
+        current
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("Running")));
+        let mut unseen_done = agent("amp", AgentStatus::Done, Some("Done unseen"));
+        unseen_done.unseen = Some(true);
+        current.agents.push(unseen_done);
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "▌ 01 opensessions                   ✗ ◉ ⠹ +1");
     }
 
     #[test]

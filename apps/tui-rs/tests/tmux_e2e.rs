@@ -25,7 +25,7 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-focus");
 
-    lab.wait_for_text("opensessions", "Sessions");
+    lab.wait_for_text("opensessions", "sessions");
     lab.wait_for_text("effect-ts", "effect-ts");
 
     let source = lab.sidebar_pane("opensessions");
@@ -78,6 +78,8 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     lab.wait_for_capture_pane(&worktree_source, |text| {
         text.contains("▾ os-demo-worktrees")
     });
+    let expanded_worktree = lab.capture_pane(&worktree_source);
+    assert_worktree_group_columns(&expanded_worktree);
 
     lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Down"]);
     lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Down"]);
@@ -328,7 +330,131 @@ fn tmux_sidebar_tracks_agent_state_per_focused_pane() {
     lab.focus_agent_pane("opensessions", "amp", "seen-thread", &seen_pane);
 
     lab.wait_for_capture_pane(&sidebar, |text| {
-        row_with(text, "opensessions").is_some_and(|row| row.contains("◉●✓"))
+        row_with(text, "opensessions").is_some_and(|row| row.contains("◉ ● ✓"))
+    });
+}
+
+#[test]
+fn tmux_sidebar_marks_done_event_seen_when_its_pane_is_already_focused() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-focused-pane-done-seen");
+
+    let focused_pane = lab.spawn_agent_pane("opensessions", "Focused - amp - done");
+    let background_pane = lab.spawn_agent_pane("opensessions", "Background - amp - done");
+    assert_ne!(focused_pane, background_pane, "agent panes must differ");
+    sleep(Duration::from_millis(500));
+    lab.restart_server();
+    let sidebar = lab.sidebar_pane("opensessions");
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", focused_pane.as_str()]);
+    sleep(Duration::from_millis(250));
+
+    lab.post_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "focused-done-thread",
+        &focused_pane,
+    );
+    lab.post_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "background-done-thread",
+        &background_pane,
+    );
+
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions").is_some_and(|row| {
+            row.contains("● ✓") && !row.contains("● ●") && !row.contains("● ✓ +")
+        })
+    });
+}
+
+#[test]
+fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pane() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-agent-seen-state-machine");
+
+    let first_pane = lab.spawn_agent_pane("opensessions", "Agent One - amp - working");
+    let second_pane = lab.spawn_agent_pane("opensessions", "Agent Two - amp - working");
+    assert_ne!(first_pane, second_pane, "agent panes must differ");
+    sleep(Duration::from_millis(500));
+    lab.restart_server();
+    let sidebar = lab.sidebar_pane("opensessions");
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", first_pane.as_str()]);
+    sleep(Duration::from_millis(250));
+    lab.post_watcher_like_agent_event(
+        "opensessions",
+        "amp",
+        "running",
+        "agent-one-thread",
+        "Agent One",
+    );
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains('⠹'))
+            && text.lines().any(|line| line.contains("⠹ Agent One"))
+    });
+
+    lab.tmux_ok(["select-pane", "-t", second_pane.as_str()]);
+    sleep(Duration::from_millis(250));
+    lab.post_watcher_like_agent_event(
+        "opensessions",
+        "amp",
+        "running",
+        "agent-two-thread",
+        "Agent Two",
+    );
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("⠹ Agent One"))
+            && text.lines().any(|line| line.contains("⠹ Agent Two"))
+    });
+
+    lab.post_watcher_like_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "agent-one-thread",
+        "Agent One",
+    );
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains('●'))
+            && text.lines().any(|line| line.contains("● Agent One"))
+            && text.lines().any(|line| line.contains("⠹ Agent Two"))
+    });
+
+    lab.tmux_ok(["select-pane", "-t", first_pane.as_str()]);
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions")
+            .is_some_and(|row| row.contains('✓') && row.contains('⠹') && !row.contains('●'))
+            && text.lines().any(|line| line.contains("✓ Agent One"))
+            && text.lines().any(|line| line.contains("⠹ Agent Two"))
+            && !text.lines().any(|line| line.contains("● Agent One"))
+    });
+
+    lab.post_watcher_like_agent_event(
+        "opensessions",
+        "amp",
+        "done",
+        "agent-two-thread",
+        "Agent Two",
+    );
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains('●'))
+            && text.lines().any(|line| line.contains("✓ Agent One"))
+            && text.lines().any(|line| line.contains("● Agent Two"))
+    });
+
+    lab.tmux_ok(["select-pane", "-t", second_pane.as_str()]);
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions")
+            .is_some_and(|row| row.contains('✓') && !row.contains('●') && !row.contains('⠹'))
+            && text.lines().any(|line| line.contains("✓ Agent One"))
+            && text.lines().any(|line| line.contains("✓ Agent Two"))
+            && !text.lines().any(|line| line.contains("● Agent"))
     });
 }
 
@@ -510,6 +636,62 @@ fn tmux_sidebar_pane_exit_does_not_steal_sidebar_width() {
 
     lab.wait_for_non_sidebar_pane_count("opensessions", 1);
     lab.wait_for_all_sidebar_widths(36);
+}
+
+#[test]
+fn tmux_sidebar_closes_window_cleanly_when_last_content_pane_exits() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-last-pane-exit");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    let first_window = lab.current_window_index("opensessions");
+    let second_window = lab.spawn_window_with_sidebar("opensessions", "scratch");
+    lab.tmux_ok([
+        "switch-client",
+        "-t",
+        &format!("opensessions:{second_window}"),
+    ]);
+    lab.wait_for_active_window("opensessions", &second_window);
+
+    let main = lab.main_pane_in_window("opensessions", &second_window);
+    lab.tmux_ok(["kill-pane", "-t", main.as_str()]);
+
+    lab.wait_for_window_absent("opensessions", &second_window);
+    lab.wait_for_active_window("opensessions", &first_window);
+    assert!(
+        !lab.logs().contains("resize-pane") && !lab.logs().contains("returned 1"),
+        "last content pane exit should not surface resize-hook failures; logs:\n{}",
+        lab.logs(),
+    );
+}
+
+#[test]
+fn tmux_sidebar_closes_session_cleanly_when_only_content_shell_exits() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-last-shell-exit");
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    lab.wait_for_client_session("effect-ts");
+    let session_names = lab.session_names();
+    let effect_index = session_names
+        .iter()
+        .position(|name| name == "effect-ts")
+        .unwrap_or_else(|| panic!("effect-ts missing from display sessions: {session_names:?}"));
+    let expected_fallback = effect_index
+        .checked_sub(1)
+        .and_then(|index| session_names.get(index))
+        .or_else(|| session_names.get(effect_index + 1))
+        .cloned()
+        .expect("effect-ts should have a fallback display session");
+
+    let main = lab.main_pane("effect-ts");
+    lab.tmux_ok(["send-keys", "-t", main.as_str(), "exit", "Enter"]);
+
+    lab.wait_for_session_absent_without_sidebar_expansion("effect-ts", 36);
+    lab.wait_for_client_session(&expected_fallback);
+    assert!(
+        !lab.logs().contains("resize-pane") && !lab.logs().contains("returned 1"),
+        "last content shell exit should not surface resize-hook failures; logs:\n{}",
+        lab.logs(),
+    );
 }
 
 #[test]
@@ -717,6 +899,45 @@ fn position(names: &[String], needle: &str) -> Option<usize> {
 fn has_non_active_focus_marker(text: &str, active_session: &str) -> bool {
     text.lines()
         .any(|line| line.contains("›") && !line.contains(active_session))
+}
+
+fn assert_worktree_group_columns(text: &str) {
+    let lines = text.lines().collect::<Vec<_>>();
+    let group = row_with(text, "os-demo-worktrees")
+        .unwrap_or_else(|| panic!("missing worktree group row:\n{text}"));
+    assert!(
+        group.starts_with("  ▾ os-demo-worktrees")
+            || group.starts_with("› ▾ os-demo-worktrees")
+            || group.starts_with("  ▸ os-demo-worktrees")
+            || group.starts_with("› ▸ os-demo-worktrees"),
+        "worktree group root should align with top-level session rows and not include a leading status glyph; row={group:?}\n{text}",
+    );
+    assert!(
+        !group.contains("▾    ")
+            && !group.contains("▸    ")
+            && !group.contains("○ os-demo-worktrees"),
+        "worktree group root should not use the old shifted/status-prefixed layout; row={group:?}\n{text}",
+    );
+
+    let feat_idx = row_index(text, "os-demo-feat-agent-panel")
+        .unwrap_or_else(|| panic!("missing feat-agent-panel child row:\n{text}"));
+    let feat_branch = lines
+        .get(feat_idx + 1)
+        .unwrap_or_else(|| panic!("missing feat-agent-panel branch row:\n{text}"));
+    assert!(
+        feat_branch.starts_with("  │    feat-agent-panel"),
+        "middle child branch should align under the child session name column; row={feat_branch:?}\n{text}",
+    );
+
+    let preview_idx = row_index(text, "os-demo-preview")
+        .unwrap_or_else(|| panic!("missing preview child row:\n{text}"));
+    let preview_branch = lines
+        .get(preview_idx + 1)
+        .unwrap_or_else(|| panic!("missing preview branch row:\n{text}"));
+    assert!(
+        preview_branch.starts_with("       preview"),
+        "last child branch should align under the child session name column without a dangling rail; row={preview_branch:?}\n{text}",
+    );
 }
 
 fn post_refresh(port: u16) {
@@ -1099,6 +1320,26 @@ time.sleep(300)
         post_body(self.port, "/api/agent-event", "application/json", &body);
     }
 
+    fn post_watcher_like_agent_event(
+        &self,
+        session: &str,
+        agent: &str,
+        status: &str,
+        thread_id: &str,
+        thread_name: &str,
+    ) {
+        let body = serde_json::json!({
+            "agent": agent,
+            "status": status,
+            "tmuxSession": session,
+            "threadId": thread_id,
+            "threadName": thread_name,
+            "ts": 1,
+        })
+        .to_string();
+        post_body(self.port, "/api/agent-event", "application/json", &body);
+    }
+
     fn focus_agent_pane(&self, session: &str, agent: &str, thread_id: &str, pane_id: &str) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -1178,6 +1419,46 @@ time.sleep(300)
                 "list-clients",
                 "-F",
                 "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.logs(),
+        );
+    }
+
+    fn wait_for_active_window(&self, session: &str, expected_window: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let target = exact_session_target(session);
+        while Instant::now() < deadline {
+            let output = self.tmux([
+                "list-windows",
+                "-t",
+                &target,
+                "-F",
+                "#{window_index}\t#{window_active}",
+            ]);
+            if output.lines().any(|line| {
+                let mut parts = line.split('\t');
+                matches!(
+                    (parts.next(), parts.next()),
+                    (Some(window_index), Some("1")) if window_index == expected_window
+                )
+            }) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for active window {session}:{expected_window}; clients:\n{}\n\nwindows:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-clients",
+                "-F",
+                "#{client_name} #{client_tty} #{client_session}"
+            ]),
+            self.tmux([
+                "list-windows",
+                "-t",
+                &target,
+                "-F",
+                "#{window_index} #{window_name} active=#{window_active}"
             ]),
             self.logs(),
         );
@@ -1301,6 +1582,39 @@ time.sleep(300)
         }
         panic!(
             "timed out waiting for session {session} to disappear; last={last:?}\nlogs:\n{}",
+            self.logs(),
+        );
+    }
+
+    fn wait_for_session_absent_without_sidebar_expansion(&self, session: &str, max_width: u16) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_sessions = Vec::new();
+        while Instant::now() < deadline {
+            let sidebars = self.sidebar_panes();
+            for pane in &sidebars {
+                assert!(
+                    pane.session != session || pane.width <= max_width,
+                    "sidebar for {session} expanded before immediate cleanup; all sidebars={sidebars:?}\nlogs:\n{}",
+                    self.logs(),
+                );
+            }
+            last_sessions = self.session_names();
+            if !last_sessions.iter().any(|name| name == session) {
+                return;
+            }
+            sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "timed out waiting for session {session} to disappear without sidebar expansion; last={last_sessions:?}\nsidebars={:?}\npanes:\n{}\npane-died hook:\n{}\nhooks:\n{}\nlogs:\n{}",
+            self.sidebar_panes(),
+            self.tmux([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name} #{window_id} #{pane_id} title=#{pane_title} dead=#{pane_dead} width=#{pane_width} command=#{pane_current_command}"
+            ]),
+            self.tmux(["show-hooks", "-g", "pane-died"]),
+            self.tmux(["show-hooks", "-g"]),
             self.logs(),
         );
     }
@@ -1522,6 +1836,34 @@ time.sleep(300)
         self.tmux(["display-message", "-p", "#{pane_id}"])
     }
 
+    fn current_window_index(&self, session: &str) -> String {
+        let target = exact_session_target(session);
+        self.tmux(["display-message", "-p", "-t", &target, "#{window_index}"])
+    }
+
+    fn wait_for_window_absent(&self, session: &str, window_index: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let target = exact_session_target(session);
+        while Instant::now() < deadline {
+            let windows = self.tmux(["list-windows", "-t", &target, "-F", "#{window_index}"]);
+            if !windows.lines().any(|line| line.trim() == window_index) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for window {session}:{window_index} to close; windows:\n{}\n\nlogs:\n{}",
+            self.tmux([
+                "list-windows",
+                "-t",
+                &target,
+                "-F",
+                "#{window_index} #{window_name} panes=#{window_panes} active=#{window_active}"
+            ]),
+            self.logs(),
+        );
+    }
+
     fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
         let target = format!("{session}:{window}");
         let output = self.tmux([
@@ -1540,6 +1882,24 @@ time.sleep(300)
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {target}; panes:\n{output}"))
+    }
+
+    fn main_pane_in_window(&self, session: &str, window: &str) -> String {
+        let target = format!("{session}:{window}");
+        self.tmux([
+            "list-panes",
+            "-t",
+            &target,
+            "-F",
+            "#{pane_id}\t#{pane_title}",
+        ])
+        .lines()
+        .filter_map(|line| {
+            let (pane, title) = line.split_once('\t')?;
+            (title != "opensessions-sidebar").then(|| pane.to_string())
+        })
+        .next()
+        .unwrap_or_else(|| panic!("no main pane found for {target}"))
     }
 
     fn next_window_index(&self, session: &str) -> u32 {

@@ -7,7 +7,7 @@ use crate::generated::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, ClientCommand, ServerMessage,
     ServerState, SessionData, SessionFilterMode,
 };
-use crate::renderer::HitTarget;
+use crate::renderer::{AgentPaneTarget, HitTarget, agent_focus_target};
 pub use crate::session_display::DisplaySessionEntry;
 use crate::session_display::{session_display_entries, worktree_group_key};
 
@@ -739,6 +739,7 @@ impl App {
                 });
             }
             HitTarget::Agent(idx) => self.activate_agent_target(idx),
+            HitTarget::AgentPane(target) => self.activate_agent_pane_target(target),
             HitTarget::AgentScopeToggle => self.toggle_agent_panel_scope(),
         }
     }
@@ -751,6 +752,10 @@ impl App {
         self.panel_focus = PanelFocus::Agents;
         self.focused_agent_idx = idx;
         self.activate_focused_agent();
+    }
+
+    fn activate_agent_pane_target(&mut self, target: AgentPaneTarget) {
+        self.queue_focus_agent_pane(target);
     }
 
     /// Queue a `SetTheme` command for the server. Mirrors the TS
@@ -953,22 +958,26 @@ impl App {
     }
 
     pub fn activate_focused_agent(&mut self) {
-        let Some((session, agent)) = self
+        let Some(target) = self
             .focused_agent()
-            .map(|(session, agent)| (session.name.clone(), agent.clone()))
+            .map(|(session, agent)| agent_focus_target(session, agent))
         else {
             return;
         };
+        self.queue_focus_agent_pane(target);
+    }
+
+    fn queue_focus_agent_pane(&mut self, target: AgentPaneTarget) {
         self.commands.push(ClientCommand::SwitchSession {
-            name: session.clone(),
+            name: target.session.clone(),
             client_tty: None,
         });
         self.commands.push(ClientCommand::FocusAgentPane {
-            session,
-            agent: agent.agent,
-            thread_id: agent.thread_id,
-            thread_name: agent.thread_name,
-            pane_id: agent.pane_id,
+            session: target.session,
+            agent: target.agent,
+            thread_id: target.thread_id,
+            thread_name: target.thread_name,
+            pane_id: target.pane_id,
         });
     }
 

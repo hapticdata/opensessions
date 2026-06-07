@@ -89,13 +89,14 @@ impl ShutdownAnnouncement {
     }
 }
 
-/// Append a single debug line when `OPENSESSIONS_DEBUG_LOG` points at a log
-/// file. Logging is opt-in because many call sites sit on tmux hot paths.
+/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
+/// so live focus/agent-state issues can be diagnosed without extra env setup;
+/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
-    let Ok(path) = std::env::var("OPENSESSIONS_DEBUG_LOG") else {
-        return;
-    };
+    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
+        .ok()
+        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
     if path.is_empty() {
         return;
     }
@@ -355,6 +356,7 @@ pub struct ReadOnlyMuxStateSource {
     agent_panel_scope: Mutex<AgentPanelScope>,
     focused_session: Mutex<Option<String>>,
     focused_pane_by_session: Mutex<HashMap<String, String>>,
+    focused_client_tty: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
@@ -399,6 +401,7 @@ impl ReadOnlyMuxStateSource {
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
             focused_pane_by_session: Mutex::new(HashMap::new()),
+            focused_client_tty: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
@@ -488,18 +491,35 @@ impl ReadOnlyMuxStateSource {
 
     fn sync_agent_pane_presence(&self) -> bool {
         let mut presence_by_session = Vec::new();
+        let mut focused_agent_panes = HashMap::<String, String>::new();
+        let focused_client_tty = self.focused_client_tty.lock().unwrap().clone();
         for provider in &self.providers {
+            let client_focus = provider.get_client_focus(focused_client_tty.as_deref());
             for session in provider.list_sessions() {
                 let pane_agents = provider
                     .list_agent_panes(&session.name)
                     .into_iter()
-                    .map(|pane| PanePresenceInput {
-                        agent: pane.agent,
-                        pane_id: pane.pane_id,
-                        thread_id: pane.thread_id,
-                        thread_name: pane.thread_name,
+                    .map(|pane| {
+                        if client_focus.as_ref().is_some_and(|focus| {
+                            focus.session_name == session.name && focus.pane_id == pane.pane_id
+                        }) {
+                            focused_agent_panes.insert(session.name.clone(), pane.pane_id.clone());
+                        }
+                        PanePresenceInput {
+                            agent: pane.agent,
+                            pane_id: pane.pane_id,
+                            active: pane.active,
+                            thread_id: pane.thread_id,
+                            thread_name: pane.thread_name,
+                        }
                     })
                     .collect::<Vec<_>>();
+                if !pane_agents.is_empty() {
+                    debug_log(format!(
+                        "agent-pane-presence session={} panes={:?}",
+                        session.name, pane_agents,
+                    ));
+                }
                 presence_by_session.push((session.name, pane_agents));
             }
         }
@@ -508,6 +528,18 @@ impl ReadOnlyMuxStateSource {
         let mut tracker = self.agent_tracker.lock().unwrap();
         for (session, pane_agents) in presence_by_session {
             changed = tracker.apply_pane_presence(&session, pane_agents) || changed;
+        }
+        for (session, pane_id) in focused_agent_panes {
+            let previous = self
+                .focused_pane_by_session
+                .lock()
+                .unwrap()
+                .insert(session.clone(), pane_id.clone());
+            let seen_changed = tracker.mark_pane_seen(&session, &pane_id);
+            debug_log(format!(
+                "current-agent-pane-seen session={session} pane={pane_id} previous={previous:?} changed={seen_changed}",
+            ));
+            changed = seen_changed || changed;
         }
         changed
     }
@@ -520,13 +552,21 @@ impl ReadOnlyMuxStateSource {
         let mut tracker = self.agent_tracker.lock().unwrap();
         let mut changed = false;
         for (session, pane_id) in focused {
-            changed = tracker.mark_pane_seen(&session, &pane_id) || changed;
+            let pane_changed = tracker.mark_pane_seen(&session, &pane_id);
+            debug_log(format!(
+                "focused-pane-seen-check session={session} pane={pane_id} changed={pane_changed}",
+            ));
+            changed = pane_changed || changed;
         }
         changed
     }
 
     fn remember_focused_pane(&self, context: &HttpContext) -> bool {
         if context.pane_active == Some(false) {
+            debug_log(format!(
+                "focus-pane ignored inactive session={} pane={:?}",
+                context.session, context.pane_id,
+            ));
             return false;
         }
         let Some(pane_id) = context
@@ -536,6 +576,9 @@ impl ReadOnlyMuxStateSource {
         else {
             return false;
         };
+        if context.client_tty.is_some() {
+            *self.focused_client_tty.lock().unwrap() = context.client_tty.clone();
+        }
         self.focused_pane_by_session
             .lock()
             .unwrap()
@@ -881,6 +924,11 @@ impl StateSource for ReadOnlyMuxStateSource {
             .lock()
             .unwrap()
             .acknowledge_sidebar_connected();
+        if let Some(window_id) = context.window_id.as_deref() {
+            for provider in &self.providers {
+                provider.prepare_sidebar_window(window_id);
+            }
+        }
         if self.is_sidebar_visible() {
             let width = self.current_sidebar_width_u16();
             if !self.repair_context_sidebar_width(Some(context), width) {
@@ -1011,8 +1059,19 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .or_else(|| spawned.then(|| self.snapshot_json()))
             }
             "/pane-exited" => {
+                let fallback_sessions = self
+                    .providers
+                    .iter()
+                    .flat_map(|provider| provider.list_sidebar_panes(None))
+                    .filter_map(|pane| {
+                        let fallback = self
+                            .session_before(&pane.session_name)
+                            .or_else(|| self.session_after(&pane.session_name))?;
+                        Some((pane.session_name, fallback))
+                    })
+                    .collect::<HashMap<_, _>>();
                 for provider in &self.providers {
-                    provider.kill_orphaned_sidebar_panes();
+                    provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
                 }
                 if self.is_sidebar_visible() {
                     self.enforce_sidebar_width(self.current_sidebar_width_u16());
@@ -1104,23 +1163,63 @@ impl ReadOnlyMuxStateSource {
 
     fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
         if snapshot.status == AgentStatus::Idle {
+            debug_log(format!(
+                "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
+                snapshot.agent, snapshot.thread_id, snapshot.thread_name, snapshot.project_dir,
+            ));
             return false;
         }
         let Some(session) = self.resolve_agent_watcher_session(&snapshot) else {
+            debug_log(format!(
+                "watcher-snapshot unresolved agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
+                snapshot.agent,
+                snapshot.status,
+                snapshot.thread_id,
+                snapshot.thread_name,
+                snapshot.project_dir,
+            ));
             return false;
         };
-        self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
-            agent: snapshot.agent.to_string(),
+        let focused_pane = self
+            .focused_pane_by_session
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned();
+        debug_log(format!(
+            "watcher-snapshot applying session={} focused_pane={:?} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
             session,
+            focused_pane,
+            snapshot.agent,
+            snapshot.status,
+            snapshot.thread_id,
+            snapshot.thread_name,
+            snapshot.project_dir,
+        ));
+        let event = AgentEvent {
+            agent: snapshot.agent.to_string(),
+            session: session.clone(),
             status: snapshot.status,
             ts: snapshot.ts,
-            thread_id: snapshot.thread_id,
-            thread_name: snapshot.thread_name,
-            last_user_prompt: snapshot.last_user_prompt,
+            thread_id: snapshot.thread_id.clone(),
+            thread_name: snapshot.thread_name.clone(),
+            last_user_prompt: snapshot.last_user_prompt.clone(),
             unseen: None,
             pane_id: None,
             liveness: None,
-        });
+        };
+        self.agent_tracker.lock().unwrap().apply_event(event);
+        if let Some(pane_id) = focused_pane {
+            let changed = self
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .mark_pane_seen(&session, &pane_id);
+            debug_log(format!(
+                "watcher-snapshot-focused-pane-seen session={} pane={} agent={} thread_id={:?} thread_name={:?} changed={changed}",
+                session, pane_id, snapshot.agent, snapshot.thread_id, snapshot.thread_name,
+            ));
+        }
         true
     }
 
