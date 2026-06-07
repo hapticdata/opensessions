@@ -22,7 +22,6 @@ use opensessions_sidebar::runtime_context::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::path::PathBuf;
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
@@ -232,11 +231,7 @@ async fn main() -> Result<()> {
                         continue;
                     };
 
-                    let detail_height_before = app.detail_panel_height;
                     handle_key(app, key);
-                    if app.detail_panel_height != detail_height_before {
-                        persist_detail_height_for_focus(app);
-                    }
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
                         let is_quit = send_or_queue_client_command(
@@ -288,14 +283,7 @@ async fn main() -> Result<()> {
                     && let Some(app) = &mut app
                     && let Some(ui_mouse) = ui_mouse_from_crossterm(mouse)
                 {
-                    let detail_height_before = app.detail_panel_height;
-                    let was_dragging_detail = app.resize_drag_state.is_some();
                     apply_ui_mouse(app, ui_mouse);
-                    if app.detail_panel_height != detail_height_before
-                        || (was_dragging_detail && app.resize_drag_state.is_none())
-                    {
-                        persist_detail_height_for_focus(app);
-                    }
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
                         send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
@@ -344,11 +332,9 @@ async fn main() -> Result<()> {
                                     identity.window_id,
                                 );
                             }
-                            load_detail_height_for_focus(&mut new_app);
                             *slot = Some(new_app);
                         }
                         (Some(app), ServerMessage::State(state)) => {
-                            let previous_focus = app.focused_session_name().map(str::to_string);
                             debug_log(format!(
                                 "ws: state update init={} init_label={:?} sessions={}",
                                 state.initializing,
@@ -356,9 +342,6 @@ async fn main() -> Result<()> {
                                 state.sessions.len(),
                             ));
                             app.apply_server_message(ServerMessage::State(state));
-                            if app.focused_session_name() != previous_focus.as_deref() {
-                                load_detail_height_for_focus(app);
-                            }
                         }
                         (Some(app), message) => {
                             debug_log(format!("ws: received {message:?}"));
@@ -477,66 +460,6 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
         MouseEventKind::Drag(MouseButton::Left) => Some(UiMouse::Drag { y: mouse.row }),
         MouseEventKind::Up(MouseButton::Left) => Some(UiMouse::DragEnd),
         _ => None,
-    }
-}
-
-fn config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("opensessions")
-            .join("config.json")
-    })
-}
-
-fn load_detail_height_for_focus(app: &mut App) {
-    let Some(session) = app.focused_session_name() else {
-        return;
-    };
-    let Some(path) = config_path() else {
-        return;
-    };
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return;
-    };
-    let Some(height) = value
-        .get("detailPanelHeights")
-        .and_then(|heights| heights.get(session))
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return;
-    };
-    app.detail_panel_height = (height as usize).max(4);
-}
-
-fn persist_detail_height_for_focus(app: &App) {
-    let Some(session) = app.focused_session_name() else {
-        return;
-    };
-    let Some(path) = config_path() else {
-        return;
-    };
-    let mut root = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({ "plugins": [] }));
-
-    if !root.is_object() {
-        root = serde_json::json!({ "plugins": [] });
-    }
-    if root.get("detailPanelHeights").is_none() {
-        root["detailPanelHeights"] = serde_json::json!({});
-    }
-    root["detailPanelHeights"][session] = serde_json::json!(app.detail_panel_height);
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(encoded) = serde_json::to_string_pretty(&root) {
-        let _ = std::fs::write(path, format!("{encoded}\n"));
     }
 }
 

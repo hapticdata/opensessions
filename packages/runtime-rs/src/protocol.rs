@@ -41,7 +41,10 @@ pub struct ServerState {
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
+    #[serde(default)]
+    pub agent_panel_scope: AgentPanelScope,
     pub sidebar_width: u32,
+    pub detail_panel_height: u32,
     pub initializing: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,6 +127,14 @@ impl fmt::Display for AgentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPanelScope {
+    #[default]
+    Current,
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentLiveness {
@@ -145,6 +156,9 @@ pub struct AgentEvent {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unseen: Option<bool>,
@@ -247,6 +261,10 @@ pub enum ClientCommand {
         name: String,
         delta: i8,
     },
+    ReorderWorktreeGroup {
+        key: String,
+        delta: i8,
+    },
     Refresh,
     MarkSeen {
         name: String,
@@ -262,6 +280,12 @@ pub enum ClientCommand {
     },
     SetSidebarWidth {
         width: u32,
+    },
+    SetDetailPanelHeight {
+        height: u32,
+    },
+    SetAgentPanelScope {
+        scope: AgentPanelScope,
     },
     RepairWidth,
     SetFilter {

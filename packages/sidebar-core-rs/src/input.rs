@@ -1,5 +1,4 @@
 use crate::app::{App, Modal, PanelFocus};
-use crate::generated::protocol::ClientCommand;
 use crate::renderer::{THEME_NAMES, compute_hit_target, detail_separator_row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,9 +187,8 @@ fn apply_theme_picker_key(app: &mut App, key: UiKey) {
 fn apply_kill_confirm_key(app: &mut App, key: UiKey) {
     match key {
         UiKey::Char('y') => {
-            if let Modal::KillConfirm { session_name } = app.modal.clone() {
-                app.modal = Modal::None;
-                app.commands_push(ClientCommand::KillSession { name: session_name });
+            if matches!(app.modal, Modal::KillConfirm { .. }) {
+                app.confirm_kill_target();
             }
         }
         _ => {
@@ -276,7 +274,7 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             if let Some((start_y, start_height)) = app.resize_drag_state {
                 let delta = start_y as i16 - y as i16;
                 let new_height = (start_height as i16 + delta).max(4) as usize;
-                app.detail_panel_height = new_height;
+                app.set_detail_panel_height(new_height);
             }
         }
         UiMouse::DragEnd => {

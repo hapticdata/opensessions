@@ -56,7 +56,6 @@ pub struct App {
     pub flash: Option<Flash>,                  // text + expiry Instant
     pub spin_idx: usize,
     pub detail_panel_height: u16,
-    pub detail_panel_heights: HashMap<String, u16>,  // persisted per-session
     pub detail_resize: Option<DetailResizeState>,    // active drag
     pub theme_before_preview: Option<Theme>,
     pub client_tty: Option<String>,

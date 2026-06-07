@@ -6,11 +6,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{AgentPanelScope, App, DisplaySessionEntry, Modal};
-use crate::generated::protocol::{AgentEvent, AgentStatus, MetadataTone, SessionData};
+use crate::app::{App, DisplaySessionEntry, Modal};
+use crate::generated::protocol::{
+    AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData,
+};
 use crate::session_display::worktree_group_key;
+
+const MAX_AGENT_PROMPT_LINES: usize = 3;
 
 pub fn render_app(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -67,7 +71,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     }
     lines.push(separator(&palette, width));
     let footer_separator_row = layout.footer_separator.y as usize;
-    render_detail(app, &palette, &mut lines, footer_separator_row, width);
+    let agent_scrollbar = render_detail(app, &palette, &mut lines, footer_separator_row, width);
 
     while lines.len() < footer_separator_row {
         lines.push(StyledLine::blank());
@@ -89,6 +93,7 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
         lines,
         layout,
         session_scrollbar,
+        agent_scrollbar,
     }
 }
 
@@ -213,19 +218,23 @@ pub(crate) fn render_model(frame: &mut Frame<'_>, model: &RenderModel) {
         footer,
     );
 
-    if let Some(scrollbar) = model.session_scrollbar {
-        let mut state = ScrollbarState::new(scrollbar.content_length)
-            .position(scrollbar.position)
-            .viewport_content_length(scrollbar.viewport_length);
-        let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .track_style(Style::default().fg(scrollbar.track.color()))
-            .thumb_symbol("┃")
-            .thumb_style(Style::default().fg(scrollbar.thumb.color()));
-        widget.render(scrollbar.area, frame.buffer_mut(), &mut state);
-    }
+    render_scrollbar(frame, model.session_scrollbar);
+    render_scrollbar(frame, model.agent_scrollbar);
+}
+
+fn render_scrollbar(frame: &mut Frame<'_>, scrollbar: Option<ScrollbarSpec>) {
+    let Some(scrollbar) = scrollbar else { return };
+    let mut state = ScrollbarState::new(scrollbar.content_length)
+        .position(scrollbar.position)
+        .viewport_content_length(scrollbar.viewport_length);
+    let widget = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(Style::default().fg(scrollbar.track.color()))
+        .thumb_symbol("┃")
+        .thumb_style(Style::default().fg(scrollbar.thumb.color()));
+    widget.render(scrollbar.area, frame.buffer_mut(), &mut state);
 }
 
 fn render_lines(frame: &mut Frame<'_>, lines: &[StyledLine], start: usize, area: Rect) {
@@ -268,6 +277,7 @@ pub(crate) struct RenderModel {
     lines: Vec<StyledLine>,
     layout: SidebarLayout,
     session_scrollbar: Option<ScrollbarSpec>,
+    agent_scrollbar: Option<ScrollbarSpec>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -478,7 +488,7 @@ impl<'a> SessionListRow<'a> {
                 session,
                 tree,
                 ..
-            } => build_session_name_row(app, palette, index, session, tree),
+            } => build_session_name_row(app, palette, index, session, tree, width),
             Self::SessionDetail { session, tree, .. } => {
                 build_session_detail_row(app, palette, session, tree, width)
             }
@@ -741,6 +751,7 @@ fn build_session_name_row(
     idx: usize,
     session: &SessionData,
     tree: TreePosition,
+    width: usize,
 ) -> StyledLine {
     let index = idx;
     let focused = app.focused_session_name() == Some(session.name.as_str());
@@ -792,15 +803,126 @@ fn build_session_name_row(
         TreePosition::None => row.push(format!("{marker} "), marker_color),
     }
     row.push(format!("{index:02} "), index_color);
-    let (signal, signal_color) = session_signal_glyph(palette, session, spinner_clock(app));
-    row.push(signal, signal_color);
-    row.push(" ", palette.white);
-    row.push(&session.name, name_color);
+    let badges = session_agent_badges(palette, session);
+    let badge_width = agent_badges_width(&badges);
+    let gap_width = usize::from(badge_width > 0);
+    let name_width = width.saturating_sub(row.width() + badge_width + gap_width);
+    row.push(truncate_right(&session.name, name_width), name_color);
+    if badge_width > 0 {
+        let spaces = width.saturating_sub(row.width() + badge_width);
+        row.push(" ".repeat(spaces.max(1)), palette.white);
+        push_agent_badges(&mut row, badges);
+    }
     row.end(CellStyle {
         fg: palette.white,
         bg,
     })
     .with_hit(hit)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AgentBadgeKind {
+    DoneSeen,
+    Active,
+    DoneUnseen,
+    Waiting,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentBadge {
+    kind: AgentBadgeKind,
+    glyph: &'static str,
+    color: Rgb,
+}
+
+fn session_agent_badges(palette: &Palette, session: &SessionData) -> Vec<AgentBadge> {
+    let agents = if session.agents.is_empty() {
+        session.agent_state.iter().collect::<Vec<_>>()
+    } else {
+        session.agents.iter().collect::<Vec<_>>()
+    };
+    if agents.is_empty() {
+        return Vec::new();
+    }
+
+    let mut kinds = agents.into_iter().map(agent_badge_kind).collect::<Vec<_>>();
+    kinds.sort_by(|a, b| b.cmp(a));
+    kinds.dedup();
+
+    let overflow = kinds.len() > 3;
+    kinds.truncate(3);
+    let mut badges = kinds
+        .into_iter()
+        .map(|kind| agent_badge_for_kind(palette, kind))
+        .collect::<Vec<_>>();
+    if overflow {
+        badges.push(AgentBadge {
+            kind: AgentBadgeKind::DoneSeen,
+            glyph: "+",
+            color: palette.overlay0,
+        });
+    }
+    badges
+}
+
+fn agent_badge_kind(agent: &AgentEvent) -> AgentBadgeKind {
+    match agent.status {
+        AgentStatus::Error => AgentBadgeKind::Error,
+        AgentStatus::Stale | AgentStatus::Interrupted => AgentBadgeKind::Warning,
+        AgentStatus::Waiting => AgentBadgeKind::Waiting,
+        AgentStatus::Done if agent.unseen == Some(true) => AgentBadgeKind::DoneUnseen,
+        AgentStatus::ToolRunning | AgentStatus::Running => AgentBadgeKind::Active,
+        AgentStatus::Done => AgentBadgeKind::DoneSeen,
+        AgentStatus::Idle => AgentBadgeKind::DoneSeen,
+    }
+}
+
+fn agent_badge_for_kind(palette: &Palette, kind: AgentBadgeKind) -> AgentBadge {
+    match kind {
+        AgentBadgeKind::Error => AgentBadge {
+            kind,
+            glyph: "✗",
+            color: palette.red,
+        },
+        AgentBadgeKind::Warning => AgentBadge {
+            kind,
+            glyph: "⚠",
+            color: palette.yellow,
+        },
+        AgentBadgeKind::Waiting => AgentBadge {
+            kind,
+            glyph: "◉",
+            color: palette.blue,
+        },
+        AgentBadgeKind::DoneUnseen => AgentBadge {
+            kind,
+            glyph: "●",
+            color: palette.teal,
+        },
+        AgentBadgeKind::Active => AgentBadge {
+            kind,
+            glyph: "⚡",
+            color: palette.yellow,
+        },
+        AgentBadgeKind::DoneSeen => AgentBadge {
+            kind,
+            glyph: "✓",
+            color: palette.green,
+        },
+    }
+}
+
+fn agent_badges_width(badges: &[AgentBadge]) -> usize {
+    badges.iter().map(|badge| badge.glyph.width()).sum()
+}
+
+fn push_agent_badges(line: &mut StyledLine, badges: Vec<AgentBadge>) {
+    for badge in badges {
+        let _ = badge.kind;
+        line.push(badge.glyph, badge.color);
+    }
 }
 
 fn build_session_detail_row(
@@ -921,23 +1043,29 @@ fn render_detail(
     lines: &mut Vec<StyledLine>,
     max_lines: usize,
     width: usize,
-) {
+) -> Option<ScrollbarSpec> {
     let Some(session) = app
         .focused_session_name()
         .and_then(|focused| app.sessions.iter().find(|session| session.name == focused))
     else {
-        return;
+        return None;
     };
 
     if lines.len() >= max_lines {
-        return;
+        return None;
     }
 
     render_agent_panel_header(app, palette, lines, max_lines, width);
 
     if app.agent_panel_scope == AgentPanelScope::All {
-        render_agent_blocks(app, palette, lines, max_lines, all_agent_entries(app));
-        return;
+        return render_agent_blocks(
+            app,
+            palette,
+            lines,
+            max_lines,
+            width,
+            all_agent_entries(app),
+        );
     }
 
     let mut path = StyledLine::blank();
@@ -965,15 +1093,17 @@ fn render_detail(
         lines.push(line.end(CellStyle::fg(palette.white)));
     }
 
-    render_agent_blocks(
+    let agent_scrollbar = render_agent_blocks(
         app,
         palette,
         lines,
         max_lines,
+        width,
         current_agent_entries(session),
     );
 
     render_metadata(session, palette, lines, max_lines);
+    agent_scrollbar
 }
 
 fn render_agent_panel_header(
@@ -1061,8 +1191,9 @@ fn render_agent_blocks(
     palette: &Palette,
     lines: &mut Vec<StyledLine>,
     max_lines: usize,
+    width: usize,
     entries: Vec<AgentPanelEntry<'_>>,
-) {
+) -> Option<ScrollbarSpec> {
     if entries.is_empty() || lines.len() >= max_lines {
         if app.initializing && lines.len() + 2 <= max_lines {
             lines.push(StyledLine::blank());
@@ -1073,19 +1204,20 @@ fn render_agent_blocks(
             primary.push("checking agents", palette.subtext0);
             lines.push(primary.end(CellStyle::fg(palette.white)));
         }
-        return;
+        return None;
     }
 
     lines.push(StyledLine::blank());
 
     let agents_available = max_lines.saturating_sub(lines.len());
     if agents_available == 0 {
-        return;
+        return None;
     }
+    let scrollbar_start = lines.len();
 
     let blocks: Vec<Vec<StyledLine>> = entries
         .into_iter()
-        .map(|entry| agent_panel_block(app, palette, entry))
+        .map(|entry| agent_panel_block(app, palette, width, entry))
         .collect();
 
     let focused_idx = if app.panel_focus == crate::app::PanelFocus::Agents {
@@ -1114,6 +1246,54 @@ fn render_agent_blocks(
             consumed += 1;
         }
     }
+
+    agent_scrollbar_for_blocks(
+        &blocks,
+        first_visible,
+        agents_available,
+        scrollbar_start,
+        width,
+        palette,
+    )
+}
+
+fn agent_scrollbar_for_blocks(
+    blocks: &[Vec<StyledLine>],
+    first_visible: usize,
+    viewport_length: usize,
+    start_row: usize,
+    width: usize,
+    palette: &Palette,
+) -> Option<ScrollbarSpec> {
+    let content_length = agent_blocks_total_rows(blocks);
+    if content_length <= viewport_length {
+        return None;
+    }
+    Some(ScrollbarSpec {
+        area: Rect::new(0, start_row as u16, width as u16, viewport_length as u16),
+        content_length,
+        position: agent_block_row_offset(blocks, first_visible),
+        viewport_length,
+        track: palette.surface2,
+        thumb: palette.overlay1,
+    })
+}
+
+fn agent_blocks_total_rows(blocks: &[Vec<StyledLine>]) -> usize {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, block)| block.len() + usize::from(idx > 0))
+        .sum()
+}
+
+fn agent_block_row_offset(blocks: &[Vec<StyledLine>], first_visible: usize) -> usize {
+    blocks
+        .iter()
+        .take(first_visible)
+        .enumerate()
+        .map(|(idx, block)| block.len() + usize::from(idx > 0))
+        .sum()
 }
 
 fn render_metadata(
@@ -1199,8 +1379,9 @@ fn render_modal_overlay(
         Modal::WidthSlider { draft_width, .. } => {
             render_width_slider_overlay(palette, lines, width, height, *draft_width)
         }
-        Modal::KillConfirm { session_name } => {
-            render_kill_confirm_overlay(palette, lines, width, height, session_name)
+        Modal::KillConfirm { target } => {
+            let (title, label) = app.kill_confirm_copy(target);
+            render_kill_confirm_overlay(palette, lines, width, height, &title, &label)
         }
         Modal::None => {}
     }
@@ -1371,13 +1552,16 @@ fn render_kill_confirm_overlay(
     lines: &mut [StyledLine],
     width: usize,
     height: usize,
-    session_name: &str,
+    title: &str,
+    label: &str,
 ) {
-    let box_width: usize = 30.max(session_name.width() + 6);
+    let desired_box_width: usize = 30.max(title.width() + 6).max(label.width() + 6);
+    let max_box_width = width.saturating_sub(2);
     let box_height: usize = 5;
-    if height < box_height + 2 || width < box_width + 2 {
+    if height < box_height + 2 || max_box_width < 12 {
         return;
     }
+    let box_width = desired_box_width.min(max_box_width);
 
     let start_y = (height.saturating_sub(box_height)) / 2;
     let start_x = (width.saturating_sub(box_width)) / 2;
@@ -1385,6 +1569,7 @@ fn render_kill_confirm_overlay(
     let inner_width = box_width - 2;
 
     let make_inner = |content: &str, color: Rgb| -> StyledLine {
+        let content = truncate_right(content, inner_width);
         let pad = inner_width.saturating_sub(content.width());
         let left = pad / 2;
         let right = pad - left;
@@ -1405,8 +1590,8 @@ fn render_kill_confirm_overlay(
     top.push("─".repeat(inner_width), border_color);
     top.push("╮", border_color);
 
-    let title_line = make_inner("Kill session?", palette.red);
-    let name_line = make_inner(session_name, palette.text);
+    let title_line = make_inner(title, palette.red);
+    let name_line = make_inner(label, palette.text);
     let hint_line = make_inner("y / n", palette.overlay0);
 
     // Bottom border
@@ -1549,7 +1734,12 @@ fn compute_agent_window(
     (focused_idx, focused_idx + 1)
 }
 
-fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -> Vec<StyledLine> {
+fn agent_panel_block(
+    app: &App,
+    palette: &Palette,
+    width: usize,
+    entry: AgentPanelEntry<'_>,
+) -> Vec<StyledLine> {
     if app.agent_panel_scope == AgentPanelScope::All {
         return compact_agent_panel_block(app, palette, entry);
     }
@@ -1566,7 +1756,7 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
     let (icon, icon_color) = detail_status_icon_for_agent(
         palette,
         entry.agent,
-        entry.session.unseen,
+        entry.agent.unseen == Some(true),
         spinner_clock(app),
     );
     primary.push(icon, icon_color);
@@ -1594,13 +1784,17 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
     let mut secondary = StyledLine::with_bg(bg);
     secondary.push("    ", palette.white);
     secondary.push(
-        semantic_agent_status_text(entry.agent, entry.session.unseen),
-        agent_detail_color(palette, entry.agent.status, entry.session.unseen),
+        semantic_agent_status_text(entry.agent),
+        agent_detail_color(
+            palette,
+            entry.agent.status,
+            entry.agent.unseen == Some(true),
+        ),
     );
     secondary.push(" · ", palette.overlay0);
     secondary.push(&entry.agent.agent, palette.overlay0);
 
-    vec![
+    let mut block = vec![
         primary
             .end(CellStyle {
                 fg: palette.white,
@@ -1612,8 +1806,30 @@ fn agent_panel_block(app: &App, palette: &Palette, entry: AgentPanelEntry<'_>) -
                 fg: palette.white,
                 bg,
             })
-            .with_hit(hit),
-    ]
+            .with_hit(hit.clone()),
+    ];
+    if let Some(prompt) = entry.agent.last_user_prompt.as_deref() {
+        let prompt_width = width.saturating_sub(6).clamp(12, 72);
+        let wrapped = wrap_truncated_prompt(prompt, prompt_width, MAX_AGENT_PROMPT_LINES);
+        let last_idx = wrapped.len().saturating_sub(1);
+        for (idx, line) in wrapped.into_iter().enumerate() {
+            let mut intent = StyledLine::with_bg(bg);
+            intent.push(if idx == 0 { "    “" } else { "     " }, palette.overlay0);
+            intent.push(line, palette.overlay1);
+            if idx == last_idx {
+                intent.push("”", palette.overlay0);
+            }
+            block.push(
+                intent
+                    .end(CellStyle {
+                        fg: palette.white,
+                        bg,
+                    })
+                    .with_hit(hit.clone()),
+            );
+        }
+    }
+    block
 }
 
 fn compact_agent_panel_block(
@@ -1630,7 +1846,7 @@ fn compact_agent_panel_block(
     let (icon, icon_color) = detail_status_icon_for_agent(
         palette,
         entry.agent,
-        entry.session.unseen,
+        entry.agent.unseen == Some(true),
         spinner_clock(app),
     );
     line.push(icon, icon_color);
@@ -1674,11 +1890,11 @@ fn compact_agent_panel_block(
     ]
 }
 
-fn semantic_agent_status_text(agent: &AgentEvent, session_unseen: bool) -> &'static str {
+fn semantic_agent_status_text(agent: &AgentEvent) -> &'static str {
     match agent.status {
         AgentStatus::Waiting => "blocked",
         AgentStatus::Running | AgentStatus::ToolRunning => "working",
-        AgentStatus::Done if session_unseen || agent.unseen == Some(true) => "done",
+        AgentStatus::Done if agent.unseen == Some(true) => "done",
         AgentStatus::Done | AgentStatus::Idle => "idle",
         AgentStatus::Error => "error",
         AgentStatus::Stale => "stale",
@@ -1689,10 +1905,10 @@ fn semantic_agent_status_text(agent: &AgentEvent, session_unseen: bool) -> &'sta
 fn detail_status_icon_for_agent(
     palette: &Palette,
     agent: &AgentEvent,
-    unseen: bool,
+    agent_unseen: bool,
     spinner_ts: u64,
 ) -> (&'static str, Rgb) {
-    if is_unseen_terminal(agent, unseen) {
+    if is_unseen_terminal(agent, agent_unseen) {
         return ("●", status_color(palette, agent.status, true));
     }
     if is_terminal(agent) {
@@ -1744,14 +1960,6 @@ impl AttentionSignal {
     }
 }
 
-fn session_signal_glyph(
-    palette: &Palette,
-    session: &SessionData,
-    spinner_ts: u64,
-) -> (&'static str, Rgb) {
-    attention_signal_glyph(palette, session_attention_signal(session), spinner_ts)
-}
-
 fn group_signal(app: &App, key: &str, palette: &Palette, spinner_ts: u64) -> (&'static str, Rgb) {
     let signal = app
         .sessions
@@ -1787,20 +1995,18 @@ fn session_attention_signal(session: &SessionData) -> AttentionSignal {
         .agent_state
         .iter()
         .chain(session.agents.iter())
-        .map(|agent| agent_attention_signal(agent, session.unseen))
+        .map(agent_attention_signal)
         .max()
         .unwrap_or(AttentionSignal::Unknown)
 }
 
-fn agent_attention_signal(agent: &AgentEvent, session_unseen: bool) -> AttentionSignal {
+fn agent_attention_signal(agent: &AgentEvent) -> AttentionSignal {
     match agent.status {
         AgentStatus::Error => AttentionSignal::Error,
         AgentStatus::Stale => AttentionSignal::Stale,
         AgentStatus::Interrupted => AttentionSignal::Interrupted,
         AgentStatus::Waiting => AttentionSignal::Waiting,
-        AgentStatus::Done if session_unseen || agent.unseen == Some(true) => {
-            AttentionSignal::DoneUnseen
-        }
+        AgentStatus::Done if agent.unseen == Some(true) => AttentionSignal::DoneUnseen,
         AgentStatus::ToolRunning => AttentionSignal::ToolWorking,
         AgentStatus::Running => AttentionSignal::Working,
         AgentStatus::Done => AttentionSignal::DoneSeen,
@@ -1870,8 +2076,8 @@ fn is_terminal(agent: &AgentEvent) -> bool {
     ) && agent.liveness != Some(crate::generated::protocol::AgentLiveness::Alive)
 }
 
-fn is_unseen_terminal(agent: &AgentEvent, session_unseen: bool) -> bool {
-    session_unseen && is_terminal(agent)
+fn is_unseen_terminal(agent: &AgentEvent, agent_unseen: bool) -> bool {
+    agent_unseen && is_terminal(agent)
 }
 
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
@@ -1943,6 +2149,51 @@ fn truncate_right(value: &str, max_cols: usize) -> String {
         result.push(ch);
     }
     format!("{result}…")
+}
+
+fn wrap_truncated_prompt(value: &str, max_cols: usize, max_lines: usize) -> Vec<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() || max_cols == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut rest = normalized.as_str();
+    let mut lines = Vec::new();
+    while !rest.is_empty() && lines.len() < max_lines {
+        if rest.width() <= max_cols {
+            lines.push(rest.to_string());
+            break;
+        }
+        if lines.len() == max_lines - 1 {
+            lines.push(truncate_right(rest, max_cols));
+            break;
+        }
+
+        let mut cut = 0;
+        let mut last_space = None;
+        let mut cols = 0;
+        for (idx, ch) in rest.char_indices() {
+            let ch_cols = ch.width().unwrap_or(0);
+            if cols + ch_cols > max_cols {
+                break;
+            }
+            cols += ch_cols;
+            cut = idx + ch.len_utf8();
+            if ch.is_whitespace() {
+                last_space = Some(idx);
+            }
+        }
+
+        if cut == 0 {
+            lines.push(truncate_right(rest, max_cols));
+            break;
+        }
+
+        let line_end = last_space.unwrap_or(cut);
+        lines.push(rest[..line_end].trim_end().to_string());
+        rest = rest[line_end..].trim_start();
+    }
+    lines
 }
 
 fn tone_icon(tone: Option<MetadataTone>) -> &'static str {
@@ -2611,7 +2862,7 @@ const WHITE: Rgb = Rgb::new(255, 255, 255);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, KillTarget, Modal};
     use crate::generated::protocol::{AgentEvent, ServerState, SessionData};
 
     fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
@@ -2622,6 +2873,7 @@ mod tests {
             ts: 0,
             thread_id: None,
             thread_name: thread_name.map(str::to_string),
+            last_user_prompt: None,
             unseen: None,
             pane_id: None,
             liveness: None,
@@ -2659,7 +2911,9 @@ mod tests {
             current_session: Some("opensessions".to_string()),
             theme: None,
             session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
+            detail_panel_height: 10,
             initializing: false,
             init_label: None,
             collapsed_worktree_groups: Vec::new(),
@@ -2719,12 +2973,38 @@ mod tests {
             current_session: Some("opensessions".to_string()),
             theme: None,
             session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
+            detail_panel_height: 10,
             initializing: false,
             init_label: None,
             collapsed_worktree_groups: Vec::new(),
             ts: 0,
         })
+    }
+
+    #[test]
+    fn kill_confirm_overlay_truncates_long_session_name_to_fit_narrow_sidebar() {
+        let mut app = app_from_sessions(vec![session(
+            "plane-page-title-duplication-command-fix",
+            "/tmp/plane-ee-wt/page-title-duplication-command-fix",
+            "page-title-duplication-command-fix",
+        )]);
+        app.modal = Modal::KillConfirm {
+            target: KillTarget::Session("plane-page-title-duplication-command-fix".to_string()),
+        };
+
+        let lines = render_text(&app, 33, 50);
+
+        assert_has_line(&lines, " ╭─────────────────────────────╮");
+        assert_has_line(&lines, " │        Kill session?        │");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("plane-page-title-duplication") && line.contains('…')),
+            "long kill target should be visibly truncated inside narrow modal\n{}",
+            lines.join("\n")
+        );
     }
 
     #[test]
@@ -2765,9 +3045,9 @@ mod tests {
             "chore-docs",
         );
         unseen.unseen = true;
-        unseen
-            .agents
-            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+        let mut unseen_done = agent("amp", AgentStatus::Done, Some("Review PR"));
+        unseen_done.unseen = Some(true);
+        unseen.agents.push(unseen_done);
         let mut tool = session("opensessions", "/tmp/opensessions", "ratatui-migration");
         tool.agents
             .push(agent("amp", AgentStatus::ToolRunning, Some("Query tmux")));
@@ -2776,11 +3056,34 @@ mod tests {
         let lines = render_text(&app, 40, 32);
 
         assert_has_line(&lines, " sessions                       ⚡2 ●1 5");
-        assert_has_line(&lines, "› 01 ○ learning");
-        assert_has_line(&lines, "  02 ⠹ background-export");
-        assert_has_line(&lines, "  03 ● pdf-word-formatting");
-        assert_has_line(&lines, "▌ 04 ⚙ opensessions");
-        assert_has_line(&lines, "  05 ○ effect-ts");
+        assert_has_line(&lines, "› 01 learning                          ✓");
+        assert_has_line(&lines, "  02 background-export                ⚡");
+        assert_has_line(&lines, "  03 pdf-word-formatting               ●");
+        assert_has_line(&lines, "▌ 04 opensessions                     ⚡");
+        assert_has_line(&lines, "  05 effect-ts");
+    }
+
+    #[test]
+    fn session_name_row_right_aligns_mixed_agent_badges_and_truncates_name() {
+        let mut mixed = session(
+            "very-long-opensessions-agent-pane-session-name",
+            "/tmp/opensessions",
+            "main",
+        );
+        mixed
+            .agents
+            .push(agent("amp", AgentStatus::Waiting, Some("Approval")));
+        let mut unseen_done = agent("codex", AgentStatus::Done, Some("Done elsewhere"));
+        unseen_done.unseen = Some(true);
+        mixed.agents.push(unseen_done);
+        mixed
+            .agents
+            .push(agent("claude", AgentStatus::Done, Some("Seen done")));
+        let app = app_from_sessions(vec![mixed]);
+
+        let lines = render_text(&app, 36, 24);
+
+        assert_has_line(&lines, "› 01 very-long-opensessions-age… ◉●✓");
     }
 
     #[test]
@@ -2804,9 +3107,9 @@ mod tests {
         );
         third.is_worktree = true;
         third.unseen = true;
-        third
-            .agents
-            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+        let mut unseen_done = agent("amp", AgentStatus::Done, Some("Review PR"));
+        unseen_done.unseen = Some(true);
+        third.agents.push(unseen_done);
 
         let mut app = app_from_sessions(vec![first, second, third]);
         app.current_session = Some("background-export".to_string());
@@ -2814,11 +3117,11 @@ mod tests {
 
         assert_has_line(&lines, "  ▾    ● plane-wt        3wt ⚡1 ●");
         assert_has_line(&lines, "  │");
-        assert_has_line(&lines, "  │ 01 ○ edit-pages");
+        assert_has_line(&lines, "  │ 01 edit-pages                      ✓");
         assert_has_line(&lines, "  │      feat/edit-pages");
-        assert_has_line(&lines, "▌ │ 02 ⠹ background-export");
+        assert_has_line(&lines, "▌ │ 02 background-export              ⚡");
         assert_has_line(&lines, "  │      feat-background-exports");
-        assert_has_line(&lines, "  ╰ 03 ● pdf-word-formatting");
+        assert_has_line(&lines, "  ╰ 03 pdf-word-formatting             ●");
         assert_has_line(&lines, "         chore-relation-pqls");
         assert!(
             !lines
@@ -2850,7 +3153,9 @@ mod tests {
             current_session: None,
             theme: None,
             session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
+            detail_panel_height: 10,
             initializing: false,
             init_label: None,
             collapsed_worktree_groups: vec!["/tmp/plane-wt".to_string()],
@@ -2879,9 +3184,9 @@ mod tests {
         ));
         let mut other = session("plane", "/tmp/plane", "feature");
         other.unseen = true;
-        other
-            .agents
-            .push(agent("amp", AgentStatus::Done, Some("Review PR")));
+        let mut unseen_agent = agent("amp", AgentStatus::Done, Some("Review PR"));
+        unseen_agent.unseen = Some(true);
+        other.agents.push(unseen_agent);
         let mut app = app_from_sessions(vec![current, other]);
         app.set_focused_session("opensessions");
 
@@ -2898,6 +3203,74 @@ mod tests {
     }
 
     #[test]
+    fn agent_panel_uses_agent_unseen_not_session_unseen_for_done_rows() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        current.unseen = true;
+        let mut seen_done = agent("amp", AgentStatus::Done, Some("Already reviewed"));
+        seen_done.unseen = None;
+        let mut unseen_done = agent("codex", AgentStatus::Done, Some("Needs review"));
+        unseen_done.unseen = Some(true);
+        current.agents.push(seen_done);
+        current.agents.push(unseen_done);
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "  ✓ Already reviewed");
+        assert_has_line(&lines, "  ● Needs review");
+    }
+
+    #[test]
+    fn overflowing_agent_panel_exposes_scrollbar_model() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        for idx in 0..12 {
+            current.agents.push(agent(
+                "amp",
+                AgentStatus::Done,
+                Some(&format!("Finished task {idx}")),
+            ));
+        }
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let model = build_model(&app, 40, 24);
+        let scrollbar = model
+            .agent_scrollbar
+            .expect("overflowing agent list should render a scrollbar");
+
+        assert!(scrollbar.content_length > scrollbar.viewport_length);
+        assert_eq!(scrollbar.position, 0);
+    }
+
+    #[test]
+    fn agent_detail_panel_shows_last_user_prompt_without_polluting_session_rows() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        let mut active_agent = agent("codex", AgentStatus::Running, Some("Sidebar polish"));
+        active_agent.last_user_prompt = Some(
+            "Make the grouped session tree tighter and keep the focused marker stable without letting a very long prompt consume the entire agent panel or shift the session rows"
+                .to_string(),
+        );
+        current.agents.push(active_agent);
+        let mut app = app_from_sessions(vec![current]);
+        app.set_focused_session("opensessions");
+
+        let lines = render_text(&app, 44, 24);
+
+        assert_has_line(&lines, "▌ 01 opensessions                         ⚡");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Make the grouped") && line.starts_with('▌')),
+            "session row should not include prompt text\n{}",
+            lines.join("\n")
+        );
+        assert_has_line(&lines, "    “Make the grouped session tree tighter");
+        assert_has_line(&lines, "     and keep the focused marker stable");
+        assert_has_line(&lines, "     without letting a very long prompt co…”");
+    }
+
+    #[test]
     fn initializing_loader_keeps_spinner_and_detail_copy() {
         let app = App::from_state(ServerState {
             sessions: Vec::new(),
@@ -2905,7 +3278,9 @@ mod tests {
             current_session: None,
             theme: None,
             session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
             sidebar_width: 40,
+            detail_panel_height: 10,
             initializing: true,
             init_label: Some("warming up…".to_string()),
             collapsed_worktree_groups: Vec::new(),

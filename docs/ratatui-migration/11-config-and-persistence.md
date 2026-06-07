@@ -15,13 +15,14 @@ interface OpensessionsConfig {
   sidebarWidth?: number;
   sidebarPosition?: "left" | "right";
   keybinding?: string;
-  detailPanelHeights?: Record<string, number>;
+  detailPanelHeight?: number;
   sessionFilter?: SessionFilterMode;
 }
 ```
 
 The TUI client today reads/writes it directly (`loadConfig` / `saveConfig`).
-27 panes contend for the same file on every detail-panel resize.
+The Rust TUI keeps detail-panel height server-owned so every sidebar sees the
+same height and only the server writes `detailPanelHeight`.
 
 ## Target: server-mediated config (recommended)
 
@@ -40,7 +41,7 @@ interface ConfigBroadcast {
 ```
 
 The server already writes config when it changes the theme; extending it for
-detail-panel-heights is a small change. Server becomes single-writer.
+detail-panel height is a small change. Server becomes single-writer.
 
 ### Rust client side
 
@@ -56,8 +57,7 @@ pub struct OpensessionsConfig {
     pub sidebar_width: Option<u16>,
     pub sidebar_position: Option<SidebarPosition>,
     pub keybinding: Option<String>,
-    #[serde(default)]
-    pub detail_panel_heights: HashMap<String, u16>,
+    pub detail_panel_height: Option<u16>,
     pub session_filter: Option<SessionFilterMode>,
 }
 
@@ -70,7 +70,7 @@ On each `ConfigBroadcast`, the client updates its in-memory copy. To mutate:
 
 ```rust
 self.send(ClientCommand::SetConfigKey {
-    path: format!("detailPanelHeights.{}", session_name),
+    path: "detailPanelHeight".to_string(),
     value: serde_json::Value::Number(height.into()),
 });
 ```
@@ -131,33 +131,14 @@ fn merge(dst: &mut serde_json::Value, src: &serde_json::Value) {
 
 ## Detail-panel height persistence
 
-The TS code persists per-session height in `detailPanelHeights`:
-
-```ts
-function persistDetailPanelHeight(sessionName: string, height: number) {
-  saveConfig({ detailPanelHeights: { ...existing, [sessionName]: height } });
-}
-```
-
-In Rust (server-mediated path):
+The Rust server persists one shared height in `detailPanelHeight`:
 
 ```rust
-fn persist_detail_panel_height(&self, session: &str, height: u16) {
-    self.send(ClientCommand::SetConfigKey {
-        path: format!("detailPanelHeights.{}", escape_json_path(session)),
-        value: serde_json::json!(height),
-    });
-}
-```
-
-Local-direct path:
-
-```rust
-fn persist_detail_panel_height_local(session: &str, height: u16) -> std::io::Result<()> {
-    let updates = serde_json::json!({
-        "detailPanelHeights": { session: height }
-    });
-    save_partial(updates)
+fn persist_detail_panel_height(&self, height: u16) {
+    save_config_to_home(&home, OpensessionsConfig {
+        detail_panel_height: Some(height),
+        ..OpensessionsConfig::default()
+    })
 }
 ```
 

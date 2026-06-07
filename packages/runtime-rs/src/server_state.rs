@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::git_info::GitInfo;
 use crate::mux::MuxProvider;
 use crate::portless::{PortlessState, build_local_links};
-use crate::protocol::{AgentEvent, ServerState, SessionData, SessionFilterMode, SessionMetadata};
+use crate::protocol::{
+    AgentEvent, AgentPanelScope, ServerState, SessionData, SessionFilterMode, SessionMetadata,
+};
 
 pub struct ReadOnlyStateInput<'a> {
     pub providers: Vec<&'a dyn MuxProvider>,
@@ -20,8 +22,10 @@ pub struct ReadOnlyStateInput<'a> {
     pub current_session_override: Option<String>,
     pub theme: Option<String>,
     pub session_filter: Option<SessionFilterMode>,
+    pub agent_panel_scope: AgentPanelScope,
     pub collapsed_worktree_groups: Vec<String>,
     pub sidebar_width: u32,
+    pub detail_panel_height: u32,
     pub initializing: bool,
     pub init_label: Option<String>,
     pub now_ms: u64,
@@ -141,7 +145,9 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
         current_session,
         theme: input.theme,
         session_filter: input.session_filter,
+        agent_panel_scope: input.agent_panel_scope,
         sidebar_width: input.sidebar_width,
+        detail_panel_height: input.detail_panel_height,
         initializing: input.initializing,
         init_label: input.init_label,
         collapsed_worktree_groups: input.collapsed_worktree_groups,

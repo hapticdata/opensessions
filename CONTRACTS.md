@@ -65,18 +65,20 @@ interface AgentEvent {
   ts: number;
   threadId?: string;
   threadName?: string;
+  lastUserPrompt?: string;
   unseen?: boolean;
 }
 ```
 
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `agent` | `string` | yes | Stable watcher identifier such as `amp`, `claude-code`, `codex`, or `opencode` |
+| `agent` | `string` | yes | Stable watcher identifier such as `amp`, `claude-code`, `codex`, `opencode`, `pi`, or `droid` |
 | `session` | `string` | yes | Resolved mux session name |
 | `status` | `AgentStatus` | yes | Current agent state |
 | `ts` | `number` | yes | Millisecond timestamp |
 | `threadId` | `string` | no | Instance key used to track multiple threads in one session |
 | `threadName` | `string` | no | Human-readable label shown in the detail panel |
+| `lastUserPrompt` | `string` | no | Latest real user prompt/intent, shown only in agent detail UI when available |
 | `unseen` | `boolean` | no | Added by the tracker when serializing to the TUI |
 
 ### Tracker Semantics

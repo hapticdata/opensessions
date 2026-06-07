@@ -24,14 +24,16 @@ The sidebar uses terminal-native spacing, not bordered cards:
 
   ⚙ Query tmux for open sessions
     working · amp
+    “make the grouped session tree tighter”
 ```
 
 Rules:
 
 - Section headers are lowercase with one leading cell: ` sessions`, ` agents`.
 - Session entries are two rows plus one spacer row.
-- The detail panel keeps two-line agent entries with one spacer row between
-  agents.
+- The detail panel keeps two-line agent entries by default, with an optional
+  third intent line for the latest user prompt. There is still one spacer row
+  between agents.
 - Separators are single horizontal rules. No card borders.
 
 ## Top-level session columns
@@ -143,7 +145,12 @@ thread/task name when available:
 
   ⚙ Query tmux for open sessions
     working · amp
+    “make the grouped session tree tighter”
 ```
+
+The optional prompt line is deliberately detail-panel-only. Session rows keep a
+stable two-row shape so a new prompt does not shift the session list. Prompt
+text comes from `AgentEvent.lastUserPrompt` and is truncated on the right.
 
 In `all` scope, rows start with the tmux session so users can jump by where the
 work lives:
@@ -172,4 +179,5 @@ unit tests that build the real render model:
 - `expanded_worktree_groups_render_a_continuous_tree_with_child_spacing`
 - `collapsed_worktree_groups_keep_the_highest_priority_agent_signal`
 - `agent_panel_uses_clean_current_and_all_scope_labels`
+- `agent_detail_panel_shows_last_user_prompt_without_polluting_session_rows`
 - `initializing_loader_keeps_spinner_and_detail_copy`

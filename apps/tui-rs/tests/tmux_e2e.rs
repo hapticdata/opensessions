@@ -35,7 +35,11 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     sleep(Duration::from_millis(250));
 
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
-    assert_eq!(lab.active_pane(), source, "sidebar pane must be active before keyboard shortcut");
+    assert_eq!(
+        lab.active_pane(),
+        source,
+        "sidebar pane must be active before keyboard shortcut"
+    );
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "4"]);
     lab.wait_for_client_session("os-demo-feat-agent-panel");
     lab.wait_for_capture("os-demo-feat-agent-panel", |text| {
@@ -101,6 +105,94 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
 }
 
 #[test]
+fn tmux_sidebar_x_on_expanded_worktree_child_opens_child_kill_confirm() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-worktree-child-kill");
+
+    let source = lab.sidebar_pane("os-demo-feat-agent-panel");
+    lab.tmux_ok(["switch-client", "-t", "os-demo-feat-agent-panel"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_client_session("os-demo-feat-agent-panel");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some()
+    });
+
+    lab.send_sidebar_key(&source, "Up");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("▾"))
+    });
+
+    lab.send_sidebar_key(&source, "j");
+    lab.send_sidebar_key(&source, "j");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-preview").is_some_and(|row| row.contains("›"))
+    });
+
+    lab.send_sidebar_key(&source, "x");
+    lab.wait_for_capture_pane(&source, |text| {
+        text.contains("Kill session?") && text.contains("os-demo-preview")
+    });
+
+    lab.send_sidebar_key(&source, "y");
+    lab.wait_for_session_absent("os-demo-preview");
+}
+
+#[test]
+fn tmux_sidebar_x_on_active_worktree_child_kills_that_child_after_confirm() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-active-worktree-child-kill");
+
+    let source = lab.sidebar_pane("os-demo-feat-agent-panel");
+    lab.tmux_ok(["switch-client", "-t", "os-demo-feat-agent-panel"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_client_session("os-demo-feat-agent-panel");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-feat-agent-panel").is_some_and(|row| row.contains("▌"))
+    });
+
+    lab.send_sidebar_key(&source, "x");
+    lab.wait_for_capture_pane(&source, |text| {
+        text.contains("Kill session?") && text.contains("os-demo-feat-agent-panel")
+    });
+
+    lab.send_sidebar_key(&source, "y");
+    lab.wait_for_session_absent("os-demo-feat-agent-panel");
+}
+
+#[test]
+fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-reorder-worktree-group");
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some()
+    });
+
+    lab.click_session_row(&source, "os-demo-worktrees");
+    lab.send_sidebar_key(&source, "M-Up");
+    lab.wait_for_session_order(|names| {
+        position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
+            position(names, "os-demo-preview").is_some_and(|second| {
+                position(names, "opensessions")
+                    .is_some_and(|opensessions| first + 1 == second && second < opensessions)
+            })
+        })
+    });
+
+    lab.send_sidebar_key(&source, "M-Down");
+    lab.wait_for_session_order(|names| {
+        position(names, "opensessions").is_some_and(|opensessions| {
+            position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
+                position(names, "os-demo-preview")
+                    .is_some_and(|second| opensessions < first && first + 1 == second)
+            })
+        })
+    });
+}
+
+#[test]
 fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-reorder-worktree-boundary");
@@ -121,25 +213,32 @@ fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
     let source = lab.sidebar_pane("opensessions");
     lab.tmux_ok(["switch-client", "-t", "opensessions"]);
     lab.tmux_ok(["select-pane", "-t", source.as_str()]);
-    assert_eq!(lab.active_pane(), source, "sidebar pane must be active before reorder focus setup");
+    assert_eq!(
+        lab.active_pane(),
+        source,
+        "sidebar pane must be active before reorder focus setup"
+    );
     lab.wait_for_session_order(|names| {
-        position(names, "os-demo-preview")
-            .is_some_and(|preview| position(names, "z-normal").is_some_and(|normal| normal > preview))
+        position(names, "os-demo-preview").is_some_and(|preview| {
+            position(names, "z-normal").is_some_and(|normal| normal > preview)
+        })
     });
 
     lab.reorder_session("z-normal", -1);
 
     lab.wait_for_session_order(|names| {
         position(names, "z-normal").is_some_and(|normal| {
-            position(names, "os-demo-feat-agent-panel").is_some_and(|first_worktree| normal < first_worktree)
+            position(names, "os-demo-feat-agent-panel")
+                .is_some_and(|first_worktree| normal < first_worktree)
         })
     });
 
     lab.reorder_session("z-normal", 1);
 
     lab.wait_for_session_order(|names| {
-        position(names, "os-demo-preview")
-            .is_some_and(|preview| position(names, "z-normal").is_some_and(|normal| normal > preview))
+        position(names, "os-demo-preview").is_some_and(|preview| {
+            position(names, "z-normal").is_some_and(|normal| normal > preview)
+        })
     });
 }
 
@@ -192,6 +291,44 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
     lab.wait_for_capture_pane(&second, |text| {
         row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
             && !has_non_active_focus_marker(text, "opensessions")
+    });
+}
+
+#[test]
+fn tmux_sidebar_tracks_agent_state_per_focused_pane() {
+    let _guard = e2e_serial_guard();
+    let mut lab = started_lab("opensessions-e2e-agent-pane-state");
+
+    let seen_pane = lab.spawn_agent_pane("opensessions", "Seen - amp - focused");
+    let unseen_pane = lab.spawn_agent_pane("opensessions", "Unseen - amp - background");
+    let waiting_pane = lab.spawn_agent_pane("opensessions", "Approval - amp - waiting");
+    assert_ne!(seen_pane, unseen_pane, "seen/background panes must differ");
+    assert_ne!(seen_pane, waiting_pane, "seen/waiting panes must differ");
+    assert_ne!(
+        unseen_pane, waiting_pane,
+        "background/waiting panes must differ"
+    );
+    sleep(Duration::from_millis(500));
+    lab.restart_server();
+    let sidebar = lab.sidebar_pane("opensessions");
+
+    lab.post_agent_event("opensessions", "amp", "done", "seen-thread", &seen_pane);
+    lab.post_agent_event("opensessions", "amp", "done", "unseen-thread", &unseen_pane);
+    lab.post_agent_event(
+        "opensessions",
+        "amp",
+        "waiting",
+        "waiting-thread",
+        &waiting_pane,
+    );
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", seen_pane.as_str()]);
+    sleep(Duration::from_millis(100));
+    lab.focus_agent_pane("opensessions", "amp", "seen-thread", &seen_pane);
+
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("◉●✓"))
     });
 }
 
@@ -598,6 +735,23 @@ fn post_hook(port: u16, path: &str) {
     let _ = stream.read(&mut response);
 }
 
+fn post_body(port: u16, path: &str, content_type: &str, body: &str) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect post body");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write post body");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.1 204"),
+        "unexpected response for {path}: {response}"
+    );
+}
+
 fn assert_active_row(capture: &str, session: &str) {
     assert!(
         row_with(capture, session).is_some_and(|row| row.contains("▌")),
@@ -905,6 +1059,78 @@ time.sleep(300)
         window_index
     }
 
+    fn spawn_agent_pane(&self, session: &str, title: &str) -> String {
+        let command = format!(
+            "sh -c 'printf \"\\033]2;{}\\033\\\\\"; while :; do sleep 60; done'",
+            title.replace('"', "")
+        );
+        let pane = self.tmux([
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session,
+            &command,
+        ]);
+        pane
+    }
+
+    fn post_agent_event(
+        &self,
+        session: &str,
+        agent: &str,
+        status: &str,
+        thread_id: &str,
+        pane_id: &str,
+    ) {
+        let body = serde_json::json!({
+            "agent": agent,
+            "status": status,
+            "tmuxSession": session,
+            "threadId": thread_id,
+            "threadName": thread_id,
+            "paneId": pane_id,
+            "ts": 1,
+        })
+        .to_string();
+        post_body(self.port, "/api/agent-event", "application/json", &body);
+    }
+
+    fn focus_agent_pane(&self, session: &str, agent: &str, thread_id: &str, pane_id: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect focus-agent ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let _ = ws
+                .next()
+                .await
+                .expect("read ws initial state")
+                .expect("ws initial state");
+            let command = serde_json::json!({
+                "type": "focus-agent-pane",
+                "session": session,
+                "agent": agent,
+                "threadId": thread_id,
+                "paneId": pane_id,
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send focus-agent-pane command");
+            ws.close().await.expect("close focus-agent ws client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+    }
+
     fn wait_for_text(&self, session: &str, text: &str) {
         self.wait_for_capture(session, |capture| capture.contains(text));
     }
@@ -1063,6 +1289,22 @@ time.sleep(300)
         );
     }
 
+    fn wait_for_session_absent(&self, session: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = Vec::new();
+        while Instant::now() < deadline {
+            last = self.session_names();
+            if !last.iter().any(|name| name == session) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for session {session} to disappear; last={last:?}\nlogs:\n{}",
+            self.logs(),
+        );
+    }
+
     fn move_focus_off_active(&self, pane: &str, active_session: &str) {
         for _ in 0..6 {
             self.tmux_ok(["send-keys", "-t", pane, "Down"]);
@@ -1071,6 +1313,12 @@ time.sleep(300)
                 return;
             }
         }
+    }
+
+    fn send_sidebar_key(&self, pane: &str, key: &str) {
+        self.tmux_ok(["select-pane", "-t", pane]);
+        self.tmux_ok(["send-keys", "-t", pane, key]);
+        sleep(Duration::from_millis(100));
     }
 
     fn click_session_row(&self, pane: &str, session: &str) {
@@ -1153,7 +1401,10 @@ time.sleep(300)
             }
             sleep(Duration::from_millis(100));
         }
-        panic!("timed out waiting for session order; last={last:?}\nlogs:\n{}", self.logs());
+        panic!(
+            "timed out waiting for session order; last={last:?}\nlogs:\n{}",
+            self.logs()
+        );
     }
 
     fn session_names(&self) -> Vec<String> {
@@ -1262,7 +1513,7 @@ time.sleep(300)
                 let title = parts.next()?;
                 (pane_session == session
                     && (title == "opensessions-sidebar" || command.starts_with("opensessions")))
-                    .then(|| pane.to_string())
+                .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {session}; panes:\n{output}"))
     }

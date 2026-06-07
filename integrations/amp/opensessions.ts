@@ -51,6 +51,7 @@ interface EventPayload {
   status: Status;
   threadId?: string;
   threadName?: string;
+  lastUserPrompt?: string;
   tmuxSession?: string;
   paneId?: string;
   projectDir: string;
@@ -326,6 +327,7 @@ export default function (amp: PluginAPI) {
    * ctx.thread.id gives us otherwise.
    */
   const threadByToolUseID = new Map<string, string>();
+  const lastPromptByThread = new Map<string, string>();
   let lastKnownThreadId: string | undefined;
 
   // Title cache. On first encounter of a thread we fire an async cloud fetch
@@ -359,14 +361,16 @@ export default function (amp: PluginAPI) {
     if (threadId) lastKnownThreadId = threadId;
   };
 
-  const send = async (status: Status, threadId: string | undefined): Promise<void> => {
+  const send = async (status: Status, threadId: string | undefined, lastUserPrompt?: string): Promise<void> => {
     rememberThreadId(threadId);
     const tid = threadId ?? lastKnownThreadId;
+    if (tid && lastUserPrompt) lastPromptByThread.set(tid, lastUserPrompt);
     await post({
       agent: "amp",
       status,
       threadId: tid,
       threadName: resolveTitle(tid),
+      lastUserPrompt: lastUserPrompt ?? (tid ? lastPromptByThread.get(tid) : undefined),
       tmuxSession: tmuxSession ?? undefined,
       paneId: paneId ?? undefined,
       projectDir,
@@ -380,8 +384,8 @@ export default function (amp: PluginAPI) {
     await send("idle", event.thread?.id ?? ctx.thread?.id);
   });
 
-  amp.on("agent.start", async (_event, ctx) => {
-    await send("running", ctx.thread?.id);
+  amp.on("agent.start", async (event, ctx) => {
+    await send("running", ctx.thread?.id, event.message);
     return {};
   });
 
@@ -390,7 +394,7 @@ export default function (amp: PluginAPI) {
       event.status === "done" ? "done" :
       event.status === "error" ? "error" :
       "interrupted";
-    await send(status, ctx.thread?.id);
+    await send(status, ctx.thread?.id, event.message);
   });
 
   amp.on("tool.call", async (event, ctx) => {

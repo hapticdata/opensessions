@@ -468,17 +468,10 @@ impl MuxProvider for TmuxProvider {
         };
         let repair_sidebar_width = r#"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"#;
 
-        let focus_cmd = hook(
-            "/focus",
-            Some("#{client_tty}|#{session_name}|#{window_id}"),
-            true,
-        );
+        let hook_context = "#{client_tty}|#{session_name}|#{window_id}|#{pane_id}|#{pane_active}";
+        let focus_cmd = hook("/focus", Some(hook_context), true);
         let refresh_cmd = hook("/refresh", None, true);
-        let ensure_cmd = hook(
-            "/ensure-sidebar",
-            Some("#{client_tty}|#{session_name}|#{window_id}"),
-            true,
-        );
+        let ensure_cmd = hook("/ensure-sidebar", Some(hook_context), true);
         // Pane death is the one tmux layout mutation where the sidebar can
         // visibly inherit a sibling pane's width before the user does anything.
         // Run this repair hook in the foreground so `kill-pane`/process exit
@@ -501,6 +494,7 @@ impl MuxProvider for TmuxProvider {
             "client-session-changed",
             &format!("{focus_cmd} ; {ensure_cmd}"),
         );
+        self.client.set_global_hook("after-select-pane", &focus_cmd);
         self.client.set_global_hook("session-created", &refresh_cmd);
         self.client.set_global_hook("session-closed", &refresh_cmd);
         self.client
@@ -520,6 +514,7 @@ impl MuxProvider for TmuxProvider {
     fn cleanup_hooks(&self) {
         for hook in [
             "client-session-changed",
+            "after-select-pane",
             "session-created",
             "session-closed",
             "after-select-window",

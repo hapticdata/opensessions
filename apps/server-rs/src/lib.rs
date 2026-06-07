@@ -14,7 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
     AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
-    opencode_snapshot_from_row, parse_codex_session_index,
+    droid_snapshot_from_jsonl, opencode_snapshot_from_row, parse_codex_session_index,
+    pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
     OpensessionsConfig, load_config_from_home, save_config_to_home,
@@ -28,14 +29,15 @@ use opensessions_runtime::project_dir_session::{
     build_dir_session_map, resolve_session_for_project_dir,
 };
 use opensessions_runtime::protocol::{
-    AgentEvent, AgentLiveness, AgentStatus, MetadataTone, ServerMessage, SessionFilterMode,
+    AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
+    SessionFilterMode,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
-use opensessions_runtime::tracker::AgentTracker;
+use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -65,6 +67,9 @@ const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
+const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
+const MIN_DETAIL_PANEL_HEIGHT: u16 = 4;
+const MAX_DETAIL_PANEL_HEIGHT: u16 = 60;
 
 #[derive(Debug, Default)]
 struct ShutdownAnnouncement {
@@ -346,7 +351,10 @@ pub struct ReadOnlyMuxStateSource {
     // `getSidebarWidth()` always reads from the XState coordinator — there is no
     // separate mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
+    detail_panel_height: Mutex<u16>,
+    agent_panel_scope: Mutex<AgentPanelScope>,
     focused_session: Mutex<Option<String>>,
+    focused_pane_by_session: Mutex<HashMap<String, String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
@@ -363,11 +371,14 @@ pub fn default_state_source_from_env(
     if env("TMUX").is_some() {
         let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
         let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
-        let config_width = env("HOME")
+        let config = env("HOME")
             .map(PathBuf::from)
-            .and_then(|home| load_config_from_home(&home).sidebar_width);
-        if let Some(width) = config_width {
+            .map(|home| load_config_from_home(&home));
+        if let Some(width) = config.as_ref().and_then(|config| config.sidebar_width) {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
+        }
+        if let Some(height) = config.and_then(|config| config.detail_panel_height) {
+            source = source.with_detail_panel_height(height);
         }
         return Some(source);
     }
@@ -384,7 +395,10 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
+            detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
+            agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
+            focused_pane_by_session: Mutex::new(HashMap::new()),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
@@ -398,6 +412,11 @@ impl ReadOnlyMuxStateSource {
 
     pub fn with_sidebar_width(mut self, sidebar_width: u32) -> Self {
         self.sidebar_coordinator = Mutex::new(SidebarCoordinator::new(sidebar_width));
+        self
+    }
+
+    pub fn with_detail_panel_height(mut self, height: u16) -> Self {
+        self.detail_panel_height = Mutex::new(clamp_detail_panel_height(height));
         self
     }
 
@@ -434,6 +453,24 @@ impl ReadOnlyMuxStateSource {
         }
     }
 
+    fn persist_detail_panel_height(&self, height: u16) {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            debug_log("set-detail-panel-height: skipped config save because HOME is unset");
+            return;
+        };
+        if let Err(err) = save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                detail_panel_height: Some(height),
+                ..OpensessionsConfig::default()
+            },
+        ) {
+            debug_log(format!(
+                "set-detail-panel-height: failed to save detailPanelHeight={height}: {err}"
+            ));
+        }
+    }
+
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
         self.now_ms = Arc::new(now_ms);
         self
@@ -447,6 +484,72 @@ impl ReadOnlyMuxStateSource {
     pub fn with_git_command_runner(mut self, runner: Arc<dyn GitCommandRunner>) -> Self {
         self.git_command_runner = runner;
         self
+    }
+
+    fn sync_agent_pane_presence(&self) -> bool {
+        let mut presence_by_session = Vec::new();
+        for provider in &self.providers {
+            for session in provider.list_sessions() {
+                let pane_agents = provider
+                    .list_agent_panes(&session.name)
+                    .into_iter()
+                    .map(|pane| PanePresenceInput {
+                        agent: pane.agent,
+                        pane_id: pane.pane_id,
+                        thread_id: pane.thread_id,
+                        thread_name: pane.thread_name,
+                    })
+                    .collect::<Vec<_>>();
+                presence_by_session.push((session.name, pane_agents));
+            }
+        }
+
+        let mut changed = false;
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        for (session, pane_agents) in presence_by_session {
+            changed = tracker.apply_pane_presence(&session, pane_agents) || changed;
+        }
+        changed
+    }
+
+    fn mark_focused_agent_panes_seen(&self) -> bool {
+        let focused = self.focused_pane_by_session.lock().unwrap().clone();
+        if focused.is_empty() {
+            return false;
+        }
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        let mut changed = false;
+        for (session, pane_id) in focused {
+            changed = tracker.mark_pane_seen(&session, &pane_id) || changed;
+        }
+        changed
+    }
+
+    fn remember_focused_pane(&self, context: &HttpContext) -> bool {
+        if context.pane_active == Some(false) {
+            return false;
+        }
+        let Some(pane_id) = context
+            .pane_id
+            .as_deref()
+            .filter(|pane_id| !pane_id.is_empty())
+        else {
+            return false;
+        };
+        self.focused_pane_by_session
+            .lock()
+            .unwrap()
+            .insert(context.session.clone(), pane_id.to_string());
+        let changed = self
+            .agent_tracker
+            .lock()
+            .unwrap()
+            .mark_pane_seen(&context.session, pane_id);
+        debug_log(format!(
+            "focus-pane session={} pane={} changed={changed}",
+            context.session, pane_id,
+        ));
+        changed
     }
 }
 
@@ -486,6 +589,9 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn snapshot_json(&self) -> String {
+        self.sync_agent_pane_presence();
+        self.mark_focused_agent_panes_seen();
+
         let providers = self
             .providers
             .iter()
@@ -550,6 +656,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             current_session_override: None,
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
+            agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
             collapsed_worktree_groups: self
                 .collapsed_worktree_groups
                 .lock()
@@ -558,6 +665,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 .cloned()
                 .collect(),
             sidebar_width: sidebar_state.width,
+            detail_panel_height: u32::from(*self.detail_panel_height.lock().unwrap()),
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
@@ -596,10 +704,6 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
                 provider.switch_session(name, client_tty);
-                // Visiting a session clears its unseen agents (turns ● back
-                // into ✓). Mirrors `tracker.handleFocus` in
-                // `packages/runtime/src/server/index.ts:1964`.
-                self.agent_tracker.lock().unwrap().handle_focus(name);
                 None
             }
             "switch-index" => {
@@ -636,6 +740,14 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 Some(self.snapshot_json())
             }
+            "reorder-worktree-group" => {
+                let key = command.get("key")?.as_str()?;
+                let delta = command.get("delta")?.as_i64()? as i8;
+                if let Some(names) = self.sidebar_reordered_worktree_group_names(key, delta) {
+                    self.session_order.lock().unwrap().set_visible_order(names);
+                }
+                Some(self.snapshot_json())
+            }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
                 *self.theme.lock().unwrap() = Some(theme);
@@ -653,6 +765,18 @@ impl StateSource for ReadOnlyMuxStateSource {
                     provider.set_sidebar_width_hint(width);
                 }
                 self.enforce_sidebar_width(width);
+                Some(self.snapshot_json())
+            }
+            "set-detail-panel-height" => {
+                let height = command.get("height")?.as_u64()?.min(u16::MAX as u64) as u16;
+                let height = clamp_detail_panel_height(height);
+                *self.detail_panel_height.lock().unwrap() = height;
+                self.persist_detail_panel_height(height);
+                Some(self.snapshot_json())
+            }
+            "set-agent-panel-scope" => {
+                let scope = parse_agent_panel_scope(command.get("scope")?.as_str()?)?;
+                *self.agent_panel_scope.lock().unwrap() = scope;
                 Some(self.snapshot_json())
             }
             "repair-width" => {
@@ -689,12 +813,23 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let thread_id = command.get("threadId").and_then(Value::as_str);
                 let thread_name = command.get("threadName").and_then(Value::as_str);
                 let pane_id = command.get("paneId").and_then(Value::as_str);
+                let mut seen_changed = self
+                    .agent_tracker
+                    .lock()
+                    .unwrap()
+                    .mark_agent_seen(session, agent, thread_id, pane_id);
                 if let Some((provider, pane_id)) =
                     self.resolve_agent_pane(session, agent, thread_id, thread_name, pane_id)
                 {
+                    seen_changed = self.agent_tracker.lock().unwrap().mark_agent_seen(
+                        session,
+                        agent,
+                        thread_id,
+                        Some(&pane_id),
+                    ) || seen_changed;
                     provider.focus_pane(&pane_id);
                 }
-                None
+                seen_changed.then(|| self.snapshot_json())
             }
             "kill-agent-pane" => {
                 let session = command.get("session")?.as_str()?;
@@ -854,13 +989,10 @@ impl StateSource for ReadOnlyMuxStateSource {
         if path != "/focus" {
             return None;
         }
-        let name = parse_context_session(body)?;
+        let context = parse_context(body)?;
+        let name = context.session.clone();
         *self.focused_session.lock().unwrap() = Some(name.clone());
-        // Visiting (focusing) a session clears its unseen agents — `●`
-        // (notification) becomes `✓` (done). Mirrors `handleFocus` in
-        // `packages/runtime/src/server/index.ts`.
-        let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(&name);
-        if had_unseen {
+        if self.remember_focused_pane(&context) {
             return Some(self.snapshot_json());
         }
         None
@@ -926,6 +1058,8 @@ impl ReadOnlyMuxStateSource {
             .get("paneId")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let event_pane_id = pane_id.clone();
+        let event_session = session.clone();
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
             session,
@@ -939,10 +1073,32 @@ impl ReadOnlyMuxStateSource {
                 .get("threadName")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
+            last_user_prompt: body
+                .get("lastUserPrompt")
+                .or_else(|| body.get("last_user_prompt"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
             unseen: None,
             liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
             pane_id,
         });
+        if let Some(pane_id) = event_pane_id
+            && self
+                .focused_pane_by_session
+                .lock()
+                .unwrap()
+                .get(&event_session)
+                .is_some_and(|focused_pane| focused_pane == &pane_id)
+        {
+            debug_log(format!(
+                "agent-event-focused-pane session={} pane={} -> mark seen",
+                event_session, pane_id,
+            ));
+            self.agent_tracker
+                .lock()
+                .unwrap()
+                .mark_pane_seen(&event_session, &pane_id);
+        }
         Ok(())
     }
 
@@ -960,6 +1116,7 @@ impl ReadOnlyMuxStateSource {
             ts: snapshot.ts,
             thread_id: snapshot.thread_id,
             thread_name: snapshot.thread_name,
+            last_user_prompt: snapshot.last_user_prompt,
             unseen: None,
             pane_id: None,
             liveness: None,
@@ -1026,6 +1183,7 @@ impl ReadOnlyMuxStateSource {
         if let Some(pane_id) = pane_id {
             return Some((provider, pane_id.to_string()));
         }
+        self.sync_agent_pane_presence();
         if let Some(pane_id) = self.resolve_tracked_agent_pane(session, agent, thread_id) {
             return Some((provider, pane_id));
         }
@@ -1341,7 +1499,6 @@ impl ReadOnlyMuxStateSource {
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
         provider.switch_session(&name, client_tty);
-        self.agent_tracker.lock().unwrap().handle_focus(&name);
         None
     }
 
@@ -1370,6 +1527,10 @@ impl ReadOnlyMuxStateSource {
 
     fn sidebar_reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
         app_from_state_json(&self.snapshot_json())?.reordered_session_names(name, delta)
+    }
+
+    fn sidebar_reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
+        app_from_state_json(&self.snapshot_json())?.reordered_worktree_group_names(key, delta)
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
@@ -1455,37 +1616,12 @@ async fn run_tmux_state_poll_loop(
         strip_ts_field(&source.snapshot_json()).hash(&mut hasher);
         hasher.finish()
     };
-    // Track the last observed current session so we can clear unseen-agent
-    // flags whenever the user moves into a different tmux session externally
-    // (e.g. via `tmux switch-client`). This complements the inline
-    // `handle_focus` calls in switch-session / `/focus`
-    // command handlers.
-    let mut last_current_session: Option<String> = source
-        .providers
-        .first()
-        .and_then(|provider| provider.get_current_session());
-
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
                 // Hooks correct tmux layout churn immediately; this slower poll
                 // is only a backstop for missed external tmux changes.
-
-                // Visiting (= becoming the current tmux session) clears the
-                // unseen-agents notification dot for that session, so `●`
-                // turns back into `✓`. Mirrors `tracker.handleFocus` in TS
-                // (`packages/runtime/src/server/index.ts`).
-                let current_session = source
-                    .providers
-                    .first()
-                    .and_then(|provider| provider.get_current_session());
-                if current_session != last_current_session {
-                    if let Some(name) = current_session.as_deref() {
-                        source.agent_tracker.lock().unwrap().handle_focus(name);
-                    }
-                    last_current_session = current_session;
-                }
 
                 let snapshot = source.snapshot_json();
                 // Hash the snapshot ignoring the per-tick `ts` field so that
@@ -1603,6 +1739,7 @@ async fn run_agent_watcher_loop(
 struct AgentWatcherFingerprint {
     status: AgentStatus,
     thread_name: Option<String>,
+    last_user_prompt: Option<String>,
     project_dir: Option<String>,
 }
 
@@ -1611,6 +1748,7 @@ impl From<&AgentWatcherSnapshot> for AgentWatcherFingerprint {
         Self {
             status: snapshot.status,
             thread_name: snapshot.thread_name.clone(),
+            last_user_prompt: snapshot.last_user_prompt.clone(),
             project_dir: snapshot.project_dir.clone(),
         }
     }
@@ -1638,6 +1776,8 @@ fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
     scan_claude_code_projects(&home, now_ms, &mut snapshots);
     scan_codex_sessions(&home, now_ms, &mut snapshots);
     scan_opencode_sessions(&home, now_ms, &mut snapshots);
+    scan_pi_sessions(&home, now_ms, &mut snapshots);
+    scan_droid_sessions(&home, now_ms, &mut snapshots);
     snapshots
 }
 
@@ -1751,6 +1891,7 @@ fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatche
 
 fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
     let db_path = std::env::var_os("OPENCODE_DB_PATH")
+        .or_else(|| std::env::var_os("OPENCODE_DB"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     if !db_path.exists() {
@@ -1759,22 +1900,38 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
 
     let stale_threshold = now_ms.saturating_sub(AGENT_WATCHER_RECENT_MS);
     let query = format!(
-        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),''), ifnull((SELECT sm.data FROM session_message sm WHERE sm.session_id = r.id AND sm.type = 'user' ORDER BY sm.seq DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
     );
-    let mut command = process::Command::new("sqlite3");
-    command
-        .arg("-readonly")
-        .arg("-separator")
-        .arg(OPENCODE_SQL_SEP.to_string())
-        .arg(&db_path)
-        .arg(query);
-    let Some(output) =
+    let run_query = |query: String| {
+        let mut command = process::Command::new("sqlite3");
+        command
+            .arg("-readonly")
+            .arg("-separator")
+            .arg(OPENCODE_SQL_SEP.to_string())
+            .arg(&db_path)
+            .arg(query);
         run_process_with_timeout(command, Duration::from_millis(OPENCODE_SQL_TIMEOUT_MS))
-    else {
+    };
+    let output = run_query(query).or_else(|| {
+        let legacy_query = format!(
+            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+        );
+        run_query(legacy_query)
+    });
+    let Some(mut output) = output else {
         return;
     };
     if !output.status.success() {
-        return;
+        let legacy_query = format!(
+            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+        );
+        let Some(legacy_output) = run_query(legacy_query) else {
+            return;
+        };
+        if !legacy_output.status.success() {
+            return;
+        }
+        output = legacy_output;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1790,8 +1947,62 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
             parts[2],
             time_updated,
             parts[4],
+            parts.get(5).copied().filter(|value| !value.is_empty()),
             now_ms,
         ) {
+            snapshots.push(snapshot);
+        }
+    }
+}
+
+fn scan_pi_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+    let sessions_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .map(|dir| dir.join("sessions"))
+        })
+        .unwrap_or_else(|| home.join(".pi/agent/sessions"));
+
+    for path in collect_jsonl_files(&sessions_dir) {
+        let Some(mtime_ms) = file_mtime_ms(&path) else {
+            continue;
+        };
+        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
+            continue;
+        }
+        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(snapshot) = pi_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
+            snapshots.push(snapshot);
+        }
+    }
+}
+
+fn scan_droid_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+    let projects_dir = std::env::var_os("FACTORY_PROJECTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".factory/projects"));
+
+    for path in collect_jsonl_files(&projects_dir) {
+        let Some(mtime_ms) = file_mtime_ms(&path) else {
+            continue;
+        };
+        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
+            continue;
+        }
+        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(snapshot) = droid_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
             snapshots.push(snapshot);
         }
     }
@@ -1902,6 +2113,14 @@ fn parse_agent_status(value: &str) -> Option<AgentStatus> {
     }
 }
 
+fn parse_agent_panel_scope(value: &str) -> Option<AgentPanelScope> {
+    match value {
+        "current" => Some(AgentPanelScope::Current),
+        "all" => Some(AgentPanelScope::All),
+        _ => None,
+    }
+}
+
 fn parse_process_row(line: &str) -> Option<(u32, u32)> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse::<u32>().ok()?;
@@ -1913,16 +2132,38 @@ struct HttpContext {
     client_tty: Option<String>,
     session: String,
     window_id: String,
+    pane_id: Option<String>,
+    pane_active: Option<bool>,
 }
 
 fn parse_context(body: &str) -> Option<HttpContext> {
     let trimmed = trim_context_quotes(body);
     let pipe_parts = trimmed.split('|').collect::<Vec<_>>();
+    if pipe_parts.len() == 5 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
+        return Some(HttpContext {
+            client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
+            session: pipe_parts[1].to_string(),
+            window_id: pipe_parts[2].to_string(),
+            pane_id: Some(pipe_parts[3].to_string()),
+            pane_active: Some(pipe_parts[4] == "1"),
+        });
+    }
+    if pipe_parts.len() == 4 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
+        return Some(HttpContext {
+            client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
+            session: pipe_parts[1].to_string(),
+            window_id: pipe_parts[2].to_string(),
+            pane_id: Some(pipe_parts[3].to_string()),
+            pane_active: None,
+        });
+    }
     if pipe_parts.len() == 3 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
         return Some(HttpContext {
             client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
             session: pipe_parts[1].to_string(),
             window_id: pipe_parts[2].to_string(),
+            pane_id: None,
+            pane_active: None,
         });
     }
 
@@ -1936,6 +2177,8 @@ fn parse_context(body: &str) -> Option<HttpContext> {
         client_tty: None,
         session: session.to_string(),
         window_id: window_id.to_string(),
+        pane_id: None,
+        pane_active: None,
     })
 }
 
@@ -2670,6 +2913,10 @@ fn switch_session_target(command: &Value) -> Option<String> {
 
 fn is_immediate_server_message(payload: &str) -> bool {
     payload.contains(r#""type":"activate-session""#)
+}
+
+fn clamp_detail_panel_height(height: u16) -> u16 {
+    height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT)
 }
 
 fn parse_command(message: &Message) -> Option<Value> {

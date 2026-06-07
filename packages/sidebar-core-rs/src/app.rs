@@ -4,25 +4,21 @@ use std::time::{Duration, Instant};
 use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 
 use crate::generated::protocol::{
-    AgentEvent, AgentStatus, ClientCommand, ServerMessage, ServerState, SessionData,
-    SessionFilterMode,
+    AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, ClientCommand, ServerMessage,
+    ServerState, SessionData, SessionFilterMode,
 };
 use crate::renderer::HitTarget;
 pub use crate::session_display::DisplaySessionEntry;
 use crate::session_display::{session_display_entries, worktree_group_key};
 
 pub const SESSION_CARD_HEIGHT: usize = 2;
+const MIN_DETAIL_PANEL_HEIGHT: usize = 4;
+const MAX_DETAIL_PANEL_HEIGHT: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelFocus {
     Sessions,
     Agents,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentPanelScope {
-    Current,
-    All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +61,13 @@ impl SidebarFocus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillTarget {
+    Session(String),
+    WorktreeGroup(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     None,
     ThemePicker {
@@ -77,7 +79,7 @@ pub enum Modal {
         draft_width: u16,
     },
     KillConfirm {
-        session_name: String,
+        target: KillTarget,
     },
 }
 
@@ -113,9 +115,12 @@ pub struct App {
     pub pending_switch_session: Option<String>,
     group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
+    last_activated_session: Option<String>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
     pending_sidebar_width_intent: Option<u16>,
+    pending_detail_panel_height_intent: Option<usize>,
+    pending_agent_panel_scope_intent: Option<AgentPanelScope>,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -142,23 +147,28 @@ impl App {
             spinner_now: 0,
             session_filter: state.session_filter.unwrap_or_default(),
             panel_focus: PanelFocus::Sessions,
-            agent_panel_scope: AgentPanelScope::Current,
+            agent_panel_scope: state.agent_panel_scope,
             focused_agent_idx: 0,
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
             hover_target: None,
             modal: Modal::None,
-            detail_panel_height: 10,
+            detail_panel_height: state
+                .detail_panel_height
+                .max(MIN_DETAIL_PANEL_HEIGHT as u32) as usize,
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
             pending_switch_session: None,
             group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
+            last_activated_session: None,
             terminal_width: None,
             pane_identity: None,
             pending_sidebar_width_intent: None,
+            pending_detail_panel_height_intent: None,
+            pending_agent_panel_scope_intent: None,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -218,6 +228,9 @@ impl App {
     fn confirm_local_session(&mut self, session_name: String, update_focus: bool) {
         self.my_session = Some(session_name.clone());
         self.current_session = Some(session_name.clone());
+        if self.last_activated_session.is_none() {
+            self.last_activated_session = Some(session_name.clone());
+        }
         if self.pending_switch_session.as_deref() == Some(session_name.as_str()) {
             self.pending_switch_session = None;
         }
@@ -245,6 +258,8 @@ impl App {
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
+                self.apply_server_agent_panel_scope(state.agent_panel_scope);
+                self.apply_server_detail_panel_height(state.detail_panel_height as usize);
                 self.collapsed_worktree_groups =
                     state.collapsed_worktree_groups.into_iter().collect();
                 self.clear_missing_pending_switch();
@@ -265,6 +280,7 @@ impl App {
                 name,
                 source_pane_id,
             } => {
+                let previous_activated = self.last_activated_session.replace(name.clone());
                 let from_this_pane = self
                     .pane_identity
                     .as_ref()
@@ -274,7 +290,10 @@ impl App {
                             .map(|source| source == &identity.pane_id)
                     })
                     .unwrap_or(false);
-                if !from_this_pane && self.confirmed_local_session_name() == Some(name.as_str()) {
+                if !from_this_pane
+                    && self.confirmed_local_session_name() == Some(name.as_str())
+                    && previous_activated.as_deref() != Some(name.as_str())
+                {
                     self.confirm_local_session(name, true);
                 }
             }
@@ -409,6 +428,27 @@ impl App {
         Some(names)
     }
 
+    pub fn reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
+        let mut blocks = self.session_order_blocks();
+        let current = blocks
+            .iter()
+            .position(|block| block.group_key.as_deref() == Some(key))?;
+        let target =
+            (current as isize + delta as isize).clamp(0, blocks.len() as isize - 1) as usize;
+        if current == target {
+            return None;
+        }
+
+        let block = blocks.remove(current);
+        blocks.insert(target, block);
+        Some(
+            blocks
+                .into_iter()
+                .flat_map(|block| block.names)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn focused_session_name(&self) -> Option<&str> {
         self.sidebar_focus.as_ref()?.session_name()
     }
@@ -495,9 +535,11 @@ impl App {
             }
             'x' => {
                 if self.panel_focus == PanelFocus::Agents {
-                    self.kill_focused_agent_pane();
-                } else if let Some(name) = self.focused_session_name().map(str::to_string) {
-                    self.modal = Modal::KillConfirm { session_name: name };
+                    if !self.kill_focused_agent_pane() {
+                        self.open_kill_confirm_for_focus();
+                    }
+                } else {
+                    self.open_kill_confirm_for_focus();
                 }
             }
             'l' => self.pending_launches.push(LaunchTarget::LazydiffTmux {
@@ -619,6 +661,10 @@ impl App {
             AgentPanelScope::Current => AgentPanelScope::All,
             AgentPanelScope::All => AgentPanelScope::Current,
         };
+        self.pending_agent_panel_scope_intent = Some(self.agent_panel_scope);
+        self.commands.push(ClientCommand::SetAgentPanelScope {
+            scope: self.agent_panel_scope,
+        });
         self.focused_agent_idx = self
             .focused_agent_idx
             .min(self.focused_agents_len().saturating_sub(1));
@@ -769,6 +815,37 @@ impl App {
         };
     }
 
+    pub fn open_kill_confirm_for_focus(&mut self) {
+        let Some(target) = self.focused_kill_target() else {
+            return;
+        };
+        self.modal = Modal::KillConfirm { target };
+    }
+
+    pub fn confirm_kill_target(&mut self) {
+        let Modal::KillConfirm { target } = self.modal.clone() else {
+            return;
+        };
+        self.modal = Modal::None;
+        for name in self.kill_target_session_names(&target) {
+            self.commands.push(ClientCommand::KillSession { name });
+        }
+    }
+
+    pub fn kill_confirm_copy(&self, target: &KillTarget) -> (String, String) {
+        match target {
+            KillTarget::Session(name) => ("Kill session?".to_string(), name.clone()),
+            KillTarget::WorktreeGroup(key) => {
+                let count = self.kill_target_session_names(target).len();
+                let label = worktree_group_display_label(key);
+                (
+                    "Kill worktree?".to_string(),
+                    format!("{count} sessions in {label}"),
+                )
+            }
+        }
+    }
+
     pub fn adjust_width_slider(&mut self, delta: i16) {
         if let Modal::WidthSlider { draft_width, .. } = &mut self.modal {
             let next = (*draft_width as i16 + delta)
@@ -807,8 +884,23 @@ impl App {
     }
 
     pub fn resize_detail_panel(&mut self, delta: i8) {
-        let new_height = (self.detail_panel_height as i16 + delta as i16).max(4) as usize;
-        self.detail_panel_height = new_height;
+        let new_height = (self.detail_panel_height as i16 + delta as i16).clamp(
+            MIN_DETAIL_PANEL_HEIGHT as i16,
+            MAX_DETAIL_PANEL_HEIGHT as i16,
+        ) as usize;
+        self.set_detail_panel_height(new_height);
+    }
+
+    pub fn set_detail_panel_height(&mut self, height: usize) {
+        let height = height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT);
+        if height == self.detail_panel_height {
+            return;
+        }
+        self.detail_panel_height = height;
+        self.pending_detail_panel_height_intent = Some(height);
+        self.commands.push(ClientCommand::SetDetailPanelHeight {
+            height: height.min(u32::MAX as usize) as u32,
+        });
     }
 
     fn apply_server_sidebar_width(&mut self, server_width: u16) {
@@ -826,6 +918,37 @@ impl App {
         self.sidebar_width = server_width;
         if let Modal::WidthSlider { draft_width } = &mut self.modal {
             *draft_width = server_width;
+        }
+    }
+
+    fn apply_server_detail_panel_height(&mut self, server_height: usize) {
+        let server_height = server_height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT);
+        if let Some(intent) = self.pending_detail_panel_height_intent {
+            if server_height == intent {
+                self.pending_detail_panel_height_intent = None;
+                self.detail_panel_height = server_height;
+            }
+            return;
+        }
+
+        self.detail_panel_height = server_height;
+    }
+
+    fn apply_server_agent_panel_scope(&mut self, server_scope: AgentPanelScope) {
+        if let Some(intent) = self.pending_agent_panel_scope_intent {
+            if server_scope == intent {
+                self.pending_agent_panel_scope_intent = None;
+                self.agent_panel_scope = server_scope;
+            }
+            return;
+        }
+
+        self.agent_panel_scope = server_scope;
+        self.focused_agent_idx = self
+            .focused_agent_idx
+            .min(self.focused_agents_len().saturating_sub(1));
+        if self.focused_agents_len() == 0 {
+            self.panel_focus = PanelFocus::Sessions;
         }
     }
 
@@ -870,13 +993,16 @@ impl App {
         }
     }
 
-    pub fn kill_focused_agent_pane(&mut self) {
+    pub fn kill_focused_agent_pane(&mut self) -> bool {
         let Some((session, agent)) = self
             .focused_agent()
             .map(|(session, agent)| (session.name.clone(), agent.clone()))
         else {
-            return;
+            return false;
         };
+        if agent.pane_id.is_none() && agent.liveness != Some(AgentLiveness::Alive) {
+            return false;
+        }
         self.commands.push(ClientCommand::KillAgentPane {
             session,
             agent: agent.agent,
@@ -884,12 +1010,20 @@ impl App {
             thread_name: agent.thread_name,
             pane_id: agent.pane_id,
         });
+        true
     }
 
     pub fn reorder_focused_session(&mut self, delta: i8) {
-        if let Some(name) = self.focused_session_name().map(str::to_string) {
-            self.commands
-                .push(ClientCommand::ReorderSession { name, delta });
+        match self.sidebar_focus.clone() {
+            Some(SidebarFocus::Session(name)) => {
+                self.commands
+                    .push(ClientCommand::ReorderSession { name, delta });
+            }
+            Some(SidebarFocus::WorktreeGroup(key)) => {
+                self.commands
+                    .push(ClientCommand::ReorderWorktreeGroup { key, delta });
+            }
+            None => {}
         }
     }
 
@@ -1066,6 +1200,56 @@ impl App {
         self.sessions.iter().find(|session| session.name == focused)
     }
 
+    fn focused_kill_target(&self) -> Option<KillTarget> {
+        match self.sidebar_focus.as_ref()? {
+            SidebarFocus::Session(name) => Some(KillTarget::Session(name.clone())),
+            SidebarFocus::WorktreeGroup(key) => {
+                (!self.worktree_group_session_names(key).is_empty())
+                    .then(|| KillTarget::WorktreeGroup(key.clone()))
+            }
+        }
+    }
+
+    fn kill_target_session_names(&self, target: &KillTarget) -> Vec<String> {
+        match target {
+            KillTarget::Session(name) => vec![name.clone()],
+            KillTarget::WorktreeGroup(key) => self.worktree_group_session_names(key),
+        }
+    }
+
+    fn worktree_group_session_names(&self, key: &str) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|session| worktree_group_key(session).as_deref() == Some(key))
+            .map(|session| session.name.clone())
+            .collect()
+    }
+
+    fn session_order_blocks(&self) -> Vec<SessionOrderBlock> {
+        let mut blocks = Vec::new();
+        for entry in self.display_session_entries() {
+            match entry {
+                DisplaySessionEntry::Group { key, .. } => {
+                    blocks.push(SessionOrderBlock {
+                        group_key: Some(key.clone()),
+                        names: self.worktree_group_session_names(&key),
+                    });
+                }
+                DisplaySessionEntry::Session {
+                    session, indented, ..
+                } => {
+                    if !indented {
+                        blocks.push(SessionOrderBlock {
+                            group_key: None,
+                            names: vec![session.name.clone()],
+                        });
+                    }
+                }
+            }
+        }
+        blocks
+    }
+
     fn focused_agents_len(&self) -> usize {
         match self.agent_panel_scope {
             AgentPanelScope::Current => self
@@ -1124,5 +1308,325 @@ fn entry_focus(entry: &DisplaySessionEntry<'_>) -> SidebarFocus {
     match entry {
         DisplaySessionEntry::Session { session, .. } => SidebarFocus::Session(session.name.clone()),
         DisplaySessionEntry::Group { key, .. } => SidebarFocus::WorktreeGroup(key.clone()),
+    }
+}
+
+fn worktree_group_display_label(key: &str) -> String {
+    key.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(key)
+        .to_string()
+}
+
+struct SessionOrderBlock {
+    group_key: Option<String>,
+    names: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_state(detail_panel_height: u32) -> ServerState {
+        ServerState {
+            sessions: Vec::new(),
+            focused_session: None,
+            current_session: None,
+            theme: None,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            sidebar_width: 40,
+            detail_panel_height,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        }
+    }
+
+    fn session(name: &str, dir: &str, is_worktree: bool) -> SessionData {
+        SessionData {
+            name: name.to_string(),
+            created_at: 0,
+            dir: dir.to_string(),
+            branch: String::new(),
+            dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
+            is_worktree,
+            unseen: false,
+            panes: 1,
+            ports: Vec::new(),
+            local_links: Vec::new(),
+            windows: 1,
+            uptime: String::new(),
+            agent_state: None,
+            agents: Vec::new(),
+            event_timestamps: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    fn agent_without_pane(agent: &str, status: AgentStatus) -> AgentEvent {
+        AgentEvent {
+            agent: agent.to_string(),
+            session: String::new(),
+            status,
+            ts: 0,
+            thread_id: None,
+            thread_name: None,
+            last_user_prompt: None,
+            unseen: None,
+            pane_id: None,
+            liveness: None,
+        }
+    }
+
+    #[test]
+    fn detail_panel_height_comes_from_server_state() {
+        let mut app = App::from_state(empty_state(14));
+
+        assert_eq!(app.detail_panel_height, 14);
+
+        app.apply_server_message(ServerMessage::State(empty_state(7)));
+        assert_eq!(app.detail_panel_height, 7);
+    }
+
+    #[test]
+    fn pending_detail_panel_height_ignores_stale_server_echoes_until_ack() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.set_detail_panel_height(14);
+        app.apply_server_message(ServerMessage::State(empty_state(11)));
+
+        assert_eq!(app.detail_panel_height, 14);
+
+        app.apply_server_message(ServerMessage::State(empty_state(14)));
+        assert_eq!(app.detail_panel_height, 14);
+
+        app.apply_server_message(ServerMessage::State(empty_state(9)));
+        assert_eq!(app.detail_panel_height, 9);
+    }
+
+    #[test]
+    fn agent_panel_scope_comes_from_server_state_and_toggle_emits_command() {
+        let mut state = empty_state(10);
+        state.agent_panel_scope = AgentPanelScope::All;
+        let mut app = App::from_state(state);
+
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+
+        app.toggle_agent_panel_scope();
+
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::Current);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetAgentPanelScope {
+                scope: AgentPanelScope::Current,
+            }]
+        );
+    }
+
+    #[test]
+    fn pending_agent_panel_scope_ignores_stale_server_echoes_until_ack() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.toggle_agent_panel_scope();
+        app.apply_server_message(ServerMessage::State(empty_state(10)));
+
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+
+        let mut acknowledged = empty_state(10);
+        acknowledged.agent_panel_scope = AgentPanelScope::All;
+        app.apply_server_message(ServerMessage::State(acknowledged));
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+
+        let mut later = empty_state(10);
+        later.agent_panel_scope = AgentPanelScope::Current;
+        app.apply_server_message(ServerMessage::State(later));
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::Current);
+    }
+
+    #[test]
+    fn resizing_detail_panel_emits_shared_height_command() {
+        let mut app = App::from_state(empty_state(10));
+
+        app.resize_detail_panel(2);
+
+        assert_eq!(app.detail_panel_height, 12);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetDetailPanelHeight { height: 12 }]
+        );
+    }
+
+    #[test]
+    fn x_on_worktree_group_opens_group_kill_confirmation() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+
+        app.handle_key_char('x');
+
+        assert_eq!(
+            app.modal,
+            Modal::KillConfirm {
+                target: KillTarget::WorktreeGroup("/repo/worktrees".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn x_on_worktree_child_session_opens_session_kill_confirmation() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+        app.set_focused_session("feature-a");
+
+        app.handle_key_char('x');
+
+        assert_eq!(
+            app.modal,
+            Modal::KillConfirm {
+                target: KillTarget::Session("feature-a".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn x_on_worktree_child_session_falls_back_from_empty_agent_panel() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+        app.set_focused_session("feature-a");
+        app.panel_focus = PanelFocus::Agents;
+
+        app.handle_key_char('x');
+
+        assert_eq!(
+            app.modal,
+            Modal::KillConfirm {
+                target: KillTarget::Session("feature-a".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn x_on_worktree_child_session_falls_back_from_agent_without_live_pane() {
+        let mut state = empty_state(10);
+        let mut feature = session("feature-a", "/repo/worktrees/feature-a", true);
+        feature
+            .agents
+            .push(agent_without_pane("amp", AgentStatus::Done));
+        state.sessions = vec![
+            feature,
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+        app.set_focused_session("feature-a");
+        app.panel_focus = PanelFocus::Agents;
+
+        app.handle_key_char('x');
+
+        assert_eq!(
+            app.modal,
+            Modal::KillConfirm {
+                target: KillTarget::Session("feature-a".to_string())
+            }
+        );
+        assert!(app.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn confirming_worktree_group_kill_resolves_current_group_members() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("main", "/repo/main", false),
+        ];
+        let mut app = App::from_state(state);
+
+        app.handle_key_char('x');
+        app.sessions
+            .push(session("feature-c", "/repo/worktrees/feature-c", true));
+        app.confirm_kill_target();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::KillSession {
+                    name: "feature-a".to_string()
+                },
+                ClientCommand::KillSession {
+                    name: "feature-b".to_string()
+                },
+                ClientCommand::KillSession {
+                    name: "feature-c".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reordering_worktree_group_moves_all_members_as_a_block() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("main", "/repo/main", false),
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("docs", "/repo/docs", false),
+        ];
+        let app = App::from_state(state);
+
+        assert_eq!(
+            app.reordered_worktree_group_names("/repo/worktrees", 1),
+            Some(vec![
+                "main".to_string(),
+                "docs".to_string(),
+                "feature-a".to_string(),
+                "feature-b".to_string(),
+            ])
+        );
+        assert_eq!(
+            app.reordered_worktree_group_names("/repo/worktrees", -1),
+            Some(vec![
+                "feature-a".to_string(),
+                "feature-b".to_string(),
+                "main".to_string(),
+                "docs".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn alt_reorder_on_worktree_group_emits_group_reorder_command() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state);
+
+        app.reorder_focused_session(1);
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::ReorderWorktreeGroup {
+                key: "/repo/worktrees".to_string(),
+                delta: 1,
+            }]
+        );
     }
 }

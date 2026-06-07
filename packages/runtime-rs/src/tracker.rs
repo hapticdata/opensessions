@@ -262,11 +262,96 @@ impl AgentTracker {
     pub fn handle_focus(&mut self, session: &str) -> bool {
         self.active.clear();
         self.active.insert(session.to_string());
-        let had_unseen = self.is_unseen(session);
-        if had_unseen {
-            self.mark_seen(session);
+        if self.unseen_instance_count(session) == 1 {
+            return self.mark_single_unseen_seen(session);
         }
-        had_unseen
+        false
+    }
+
+    pub fn mark_agent_seen(
+        &mut self,
+        session: &str,
+        agent: &str,
+        thread_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> bool {
+        let Some(session_instances) = self.instances.get(session) else {
+            return false;
+        };
+
+        let mut keys = Vec::new();
+        if let Some(thread_id) = thread_id {
+            let exact_key = instance_key(agent, Some(thread_id));
+            if session_instances.contains_key(&exact_key) {
+                keys.push(exact_key);
+            }
+        }
+        if let Some(pane_id) = pane_id {
+            keys.extend(
+                session_instances
+                    .iter()
+                    .filter(|(_, event)| {
+                        event.agent == agent && event.pane_id.as_deref() == Some(pane_id)
+                    })
+                    .map(|(key, _)| key.clone()),
+            );
+        }
+        if keys.is_empty() && thread_id.is_none() {
+            let generic_key = instance_key(agent, None);
+            if session_instances.contains_key(&generic_key) {
+                keys.push(generic_key);
+            }
+        }
+
+        keys.sort();
+        keys.dedup();
+
+        let mut changed = false;
+        for key in keys {
+            if let Some(event) = self
+                .instances
+                .get_mut(session)
+                .and_then(|instances| instances.get_mut(&key))
+                && event.unseen == Some(true)
+            {
+                event.unseen = None;
+                changed = true;
+            }
+            changed = self
+                .unseen_instances
+                .remove(&self.unseen_key(session, &key))
+                || changed;
+        }
+        changed
+    }
+
+    pub fn mark_pane_seen(&mut self, session: &str, pane_id: &str) -> bool {
+        let Some(session_instances) = self.instances.get(session) else {
+            return false;
+        };
+        let keys = session_instances
+            .iter()
+            .filter(|(_, event)| event.pane_id.as_deref() == Some(pane_id))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+
+        let mut changed = false;
+        for key in keys {
+            if let Some(event) = self
+                .instances
+                .get_mut(session)
+                .and_then(|instances| instances.get_mut(&key))
+                && event.unseen == Some(true)
+            {
+                event.unseen = None;
+                changed = true;
+            }
+            changed = self
+                .unseen_instances
+                .remove(&self.unseen_key(session, &key))
+                || changed;
+        }
+        changed
     }
 
     pub fn set_active_sessions(&mut self, sessions: impl IntoIterator<Item = String>) {
@@ -390,6 +475,7 @@ impl AgentTracker {
                     ts: now_ms(),
                     thread_id: Some(thread_id.to_string()),
                     thread_name: pane.thread_name,
+                    last_user_prompt: None,
                     unseen: None,
                     pane_id: Some(pane.pane_id),
                     liveness: Some(AgentLiveness::Alive),
@@ -509,6 +595,7 @@ impl AgentTracker {
                             ts: now_ms(),
                             thread_id: None,
                             thread_name: pane.thread_name,
+                            last_user_prompt: None,
                             unseen: None,
                             pane_id: Some(pane.pane_id),
                             liveness: Some(AgentLiveness::Alive),
@@ -521,9 +608,14 @@ impl AgentTracker {
         changed
     }
 
-    fn apply_event_with_options(&mut self, event: &mut AgentEvent, seed: bool) {
+    fn apply_event_with_options(&mut self, event: &mut AgentEvent, _seed: bool) {
         let key = instance_key(&event.agent, event.thread_id.as_deref());
         let mut removed_unseen_keys = Vec::new();
+        if is_terminal_status(event.status) {
+            event.unseen = Some(true);
+        } else {
+            event.unseen = None;
+        }
 
         {
             let session_instances = self.instances.entry(event.session.clone()).or_default();
@@ -538,6 +630,9 @@ impl AgentTracker {
                 }
                 if prev.thread_name.is_some() && event.thread_name.is_none() {
                     event.thread_name = prev.thread_name.clone();
+                }
+                if prev.last_user_prompt.is_some() && event.last_user_prompt.is_none() {
+                    event.last_user_prompt = prev.last_user_prompt.clone();
                 }
             }
             if event.thread_id.is_some()
@@ -587,12 +682,49 @@ impl AgentTracker {
 
         let unseen_key = self.unseen_key(&event.session, &key);
         if is_terminal_status(event.status) {
-            if seed || !self.active.contains(&event.session) {
-                self.unseen_instances.insert(unseen_key);
-            }
+            self.unseen_instances.insert(unseen_key);
         } else {
             self.unseen_instances.remove(&unseen_key);
         }
+    }
+
+    fn unseen_instance_count(&self, session: &str) -> usize {
+        let Some(session_instances) = self.instances.get(session) else {
+            return 0;
+        };
+        session_instances
+            .keys()
+            .filter(|key| {
+                self.unseen_instances
+                    .contains(&self.unseen_key(session, key))
+            })
+            .count()
+    }
+
+    fn mark_single_unseen_seen(&mut self, session: &str) -> bool {
+        let Some(session_instances) = self.instances.get(session) else {
+            return false;
+        };
+        let unseen_keys = session_instances
+            .keys()
+            .filter(|key| {
+                self.unseen_instances
+                    .contains(&self.unseen_key(session, key))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if unseen_keys.len() != 1 {
+            return false;
+        }
+        if let Some(event) = self
+            .instances
+            .get_mut(session)
+            .and_then(|instances| instances.get_mut(&unseen_keys[0]))
+        {
+            event.unseen = None;
+        }
+        self.unseen_instances
+            .remove(&self.unseen_key(session, &unseen_keys[0]))
     }
 
     fn merge_matching_synthetic(&mut self, session: &str, key: &str, event: &mut AgentEvent) {
@@ -729,4 +861,268 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(
+        agent: &str,
+        session: &str,
+        thread_id: Option<&str>,
+        thread_name: Option<&str>,
+    ) -> AgentEvent {
+        AgentEvent {
+            agent: agent.to_string(),
+            session: session.to_string(),
+            status: AgentStatus::Running,
+            ts: 1,
+            thread_id: thread_id.map(str::to_string),
+            thread_name: thread_name.map(str::to_string),
+            last_user_prompt: None,
+            unseen: None,
+            pane_id: None,
+            liveness: None,
+        }
+    }
+
+    fn terminal_event(
+        agent: &str,
+        session: &str,
+        thread_id: Option<&str>,
+        thread_name: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> AgentEvent {
+        let mut event = event(agent, session, thread_id, thread_name);
+        event.status = AgentStatus::Done;
+        event.pane_id = pane_id.map(str::to_string);
+        event.liveness = pane_id.map(|_| AgentLiveness::Alive);
+        event
+    }
+
+    #[test]
+    fn pane_presence_attaches_exact_pane_to_threaded_agent_event() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(event("amp", "work", Some("T-1"), Some("Fix focus")));
+
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%7".to_string(),
+                thread_id: Some("T-1".to_string()),
+                thread_name: Some("Fix focus".to_string()),
+            }],
+        );
+
+        let agent = tracker
+            .get_agents("work")
+            .into_iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("T-1"))
+            .expect("tracked agent");
+        assert_eq!(agent.pane_id.as_deref(), Some("%7"));
+        assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn pane_presence_uses_thread_name_to_attach_pane_when_thread_id_is_missing() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(event("amp", "work", Some("T-2"), Some("Review PR")));
+
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%9".to_string(),
+                thread_id: None,
+                thread_name: Some("Review PR".to_string()),
+            }],
+        );
+
+        let agent = tracker
+            .get_agents("work")
+            .into_iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("T-2"))
+            .expect("tracked agent");
+        assert_eq!(agent.pane_id.as_deref(), Some("%9"));
+        assert_eq!(agent.liveness, Some(AgentLiveness::Alive));
+    }
+
+    #[test]
+    fn focusing_session_clears_single_unseen_agent() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("T-1"),
+            Some("Fix focus"),
+            Some("%7"),
+        ));
+
+        assert!(tracker.is_unseen("work"));
+        assert!(tracker.handle_focus("work"));
+
+        assert!(!tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, None);
+    }
+
+    #[test]
+    fn focusing_session_preserves_multiple_unseen_agents_for_agent_level_review() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("T-1"),
+            Some("Fix focus"),
+            Some("%7"),
+        ));
+        tracker.apply_event(terminal_event(
+            "codex",
+            "work",
+            Some("C-1"),
+            Some("Polish UI"),
+            Some("%8"),
+        ));
+
+        assert!(!tracker.handle_focus("work"));
+
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().all(|agent| agent.unseen == Some(true)));
+    }
+
+    #[test]
+    fn focusing_agent_pane_clears_only_matching_unseen_agent() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("T-1"),
+            Some("Fix focus"),
+            Some("%7"),
+        ));
+        tracker.apply_event(terminal_event(
+            "codex",
+            "work",
+            Some("C-1"),
+            Some("Polish UI"),
+            Some("%8"),
+        ));
+
+        assert!(tracker.mark_agent_seen("work", "amp", Some("T-1"), Some("%7")));
+
+        let agents = tracker.get_agents("work");
+        let amp = agents
+            .iter()
+            .find(|agent| agent.agent == "amp")
+            .expect("amp agent");
+        let codex = agents
+            .iter()
+            .find(|agent| agent.agent == "codex")
+            .expect("codex agent");
+        assert_eq!(amp.unseen, None);
+        assert_eq!(codex.unseen, Some(true));
+        assert!(tracker.is_unseen("work"));
+    }
+
+    #[test]
+    fn focusing_one_pane_preserves_unseen_for_other_threads_of_same_agent() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("seen-thread"),
+            Some("Seen"),
+            Some("%7"),
+        ));
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("unseen-thread"),
+            Some("Unseen"),
+            Some("%8"),
+        ));
+
+        assert!(tracker.mark_agent_seen("work", "amp", Some("seen-thread"), Some("%7")));
+
+        let agents = tracker.get_agents("work");
+        let seen = agents
+            .iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("seen-thread"))
+            .expect("seen thread");
+        let unseen = agents
+            .iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("unseen-thread"))
+            .expect("unseen thread");
+        assert_eq!(seen.unseen, None);
+        assert_eq!(unseen.unseen, Some(true));
+    }
+
+    #[test]
+    fn focusing_one_pane_preserves_unseen_for_other_threads_after_pane_presence() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_pane_presence(
+            "work",
+            vec![
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%7".to_string(),
+                    thread_id: None,
+                    thread_name: Some("Seen - amp - focused".to_string()),
+                },
+                PanePresenceInput {
+                    agent: "amp".to_string(),
+                    pane_id: "%8".to_string(),
+                    thread_id: None,
+                    thread_name: Some("Unseen - amp - background".to_string()),
+                },
+            ],
+        );
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("seen-thread"),
+            Some("seen-thread"),
+            Some("%7"),
+        ));
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("unseen-thread"),
+            Some("unseen-thread"),
+            Some("%8"),
+        ));
+
+        assert!(tracker.mark_agent_seen("work", "amp", Some("seen-thread"), Some("%7")));
+
+        let agents = tracker.get_agents("work");
+        let seen = agents
+            .iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("seen-thread"))
+            .expect("seen thread");
+        let unseen = agents
+            .iter()
+            .find(|agent| agent.thread_id.as_deref() == Some("unseen-thread"))
+            .expect("unseen thread");
+        assert_eq!(seen.unseen, None);
+        assert_eq!(unseen.unseen, Some(true));
+    }
+
+    #[test]
+    fn terminal_event_in_active_session_still_becomes_unseen_until_agent_is_focused() {
+        let mut tracker = AgentTracker::new();
+        tracker.handle_focus("work");
+
+        tracker.apply_event(terminal_event(
+            "amp",
+            "work",
+            Some("T-1"),
+            Some("Fix focus"),
+            Some("%7"),
+        ));
+
+        assert!(tracker.is_unseen("work"));
+        assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
 }
