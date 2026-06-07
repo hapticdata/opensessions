@@ -39,10 +39,6 @@ jobs:
             target: x86_64-apple-darwin
             artifact: opensessions-sidebar-x86_64-apple-darwin.tar.gz
             lazydiff_flags: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: opensessions-sidebar-x86_64-pc-windows-msvc.tar.gz
-            lazydiff_flags: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -92,9 +88,6 @@ jobs:
           set -euo pipefail
           mkdir -p package dist
           exe=""
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            exe=".exe"
-          fi
 
           cp "target/${{ matrix.target }}/release/opensessions-sidebar${exe}" "package/opensessions-sidebar${exe}"
           cp "target/${{ matrix.target }}/release/opensessions-server${exe}" "package/opensessions-server${exe}"

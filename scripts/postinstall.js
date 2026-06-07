@@ -11,7 +11,6 @@ function targetTriple(platform = os.platform(), arch = os.arch()) {
   if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
   if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
   if (platform === "linux" && arch === "arm64") return "aarch64-unknown-linux-gnu";
-  if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
   throw new Error(`Unsupported platform: ${platform}-${arch}`);
 }
 
@@ -53,9 +52,9 @@ async function main() {
   const triple = targetTriple();
   const binDir = path.join(__dirname, "..", "bin");
   const executableNames = [
-    process.platform === "win32" ? "opensessions-sidebar.exe" : "opensessions-sidebar",
-    process.platform === "win32" ? "opensessions-server.exe" : "opensessions-server",
-    process.platform === "win32" ? "lazydiff.exe" : "lazydiff",
+    "opensessions-sidebar",
+    "opensessions-server",
+    "lazydiff",
   ];
   const tarball = path.join(binDir, "opensessions-sidebar.tmp.tar.gz");
 

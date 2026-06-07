@@ -49,9 +49,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
 
-pub const SERVER_VERSION: &str = "0.2.0-alpha.11";
+pub const SERVER_VERSION: &str = "0.2.0-alpha.12";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.11"}"#;
+pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.12"}"#;
 pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
