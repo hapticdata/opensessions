@@ -405,16 +405,26 @@ fn render_sessions(
         row_index_for_entry(&rows, app.session_scroll_offset().min(max_first_visible))
     };
 
+    // When the list overflows, the vertical scrollbar is drawn over the
+    // rightmost column. Inset row content by one column so right-aligned agent
+    // badges aren't overwritten by the scrollbar track/thumb.
+    let has_scrollbar = total_rows > available;
+    let content_width = if has_scrollbar {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+
     let body_capacity = available;
     for row in rows.iter().skip(first_visible).take(body_capacity) {
-        lines.push(row.render(app, palette, width));
+        lines.push(row.render(app, palette, content_width));
     }
 
     while lines.len() - start_offset < available {
         lines.push(rail_blank(palette));
     }
 
-    if total_rows > available {
+    if has_scrollbar {
         Some(ScrollbarSpec {
             area: Rect::new(0, start_offset as u16, width as u16, available as u16),
             content_length: total_rows,
@@ -3090,6 +3100,60 @@ mod tests {
         assert_has_line(&lines, "  03 pdf-word-formatting               ●");
         assert_has_line(&lines, "▌ 04 opensessions                      ⚙");
         assert_has_line(&lines, "  05 effect-ts");
+    }
+
+    #[test]
+    fn scrollbar_does_not_overwrite_session_agent_badges() {
+        // Enough sessions to overflow the list and force a vertical scrollbar.
+        let mut sessions = Vec::new();
+        for i in 0..12 {
+            let mut s = session(&format!("s{i:02}"), &format!("/tmp/s{i}"), "main");
+            if i == 0 {
+                s.agents
+                    .push(agent("amp", AgentStatus::Running, Some("Work")));
+            }
+            sessions.push(s);
+        }
+        let app = app_from_sessions(sessions);
+        let width = 26;
+        let model = build_model(&app, width, 24);
+
+        // Overflow => the scrollbar occupies the rightmost column.
+        assert!(
+            model.session_scrollbar.is_some(),
+            "expected a session scrollbar when the list overflows",
+        );
+
+        // The session row carrying the running badge must be inset to width - 1
+        // so the right-aligned spinner is not overwritten by the scrollbar
+        // column. Match the row by session name to avoid matching the header,
+        // which also renders a running spinner but spans the full width.
+        let badge_line = model
+            .lines
+            .iter()
+            .find(|line| {
+                let text = line
+                    .parts
+                    .iter()
+                    .map(|part| part.text.as_str())
+                    .collect::<String>();
+                text.contains("01 s00")
+            })
+            .expect("expected the s00 session name row");
+        let badge_text = badge_line
+            .parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<String>();
+        assert!(
+            badge_text.contains('⠹'),
+            "s00 row should carry the running spinner badge, got: {badge_text:?}",
+        );
+        assert_eq!(
+            badge_line.width(),
+            width - 1,
+            "badge row should reserve the scrollbar column (width - 1)",
+        );
     }
 
     #[test]
